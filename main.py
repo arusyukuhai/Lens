@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-Minimal replacement-rule genetic programming core (v51 len1-word-prefix v50 len1-direct v45 match-bitset v38 literal-3gram-bloom v55 rule-pack-memo v56 recode-pack-memo v33 dual-anchor-bloom v31 narrow-state wc1-inplace fused-hash v30 wc1-general-fast v28 inplace-literal anchor-guided score-reuse direct-diff variable-length GPU-index incremental-candidate rolling-HoF rolling-evaluation bounded-workload compacting-GC precise-mutation/nonexpanding cooperative MPS), ported from
+Replacement-rule genetic programming core (v57 bounded-HoF / plateau-aware selection).
+
+v57: random HoF budget with case-identity-safe reuse; long-window plateau
+pressure; epsilon-lexicase parent lane; smaller tournaments; zero-column exact
+ridge optimization; latest-champion export; less frequent rendering.
+CPU path can run without PyTorch. Metal rewrite kernels are unchanged.
+
+Original engine lineage (v51 len1-word-prefix v50 len1-direct v45 match-bitset v38 literal-3gram-bloom v55 rule-pack-memo v56 recode-pack-memo v33 dual-anchor-bloom v31 narrow-state wc1-inplace fused-hash v30 wc1-general-fast v28 inplace-literal anchor-guided score-reuse direct-diff variable-length GPU-index incremental-candidate rolling-HoF rolling-evaluation bounded-workload compacting-GC precise-mutation/nonexpanding cooperative MPS), ported from
 at_jev(20261002-082442).nim.
 
 v19 keeps the v18 Nim-style mutation geometry (local/balanced/explore row budgets,
@@ -17,8 +24,8 @@ Kept on purpose:
   * ordered rewrite rules with wildcard captures / transforms
   * repeated sweeps until fixed point, cycle, overflow, or ceil(2*sqrt(LEN))
   * per-rule firing counts as linear-regression features
-  * ridge readout fitted on 1/3 of each trajectory
-  * held-out Spearman correlation against cleanliness (= 1 - noise rate)
+  * sparse pairwise rank-ridge readout fitted on all trajectories
+  * in-sample per-case Spearman correlation against cleanliness (= 1 - noise rate)
   * elite selection, tournament selection, two-point crossover, mutation,
     random immigrants
   * per-genome learned 256-byte -> 512-token injective embedding
@@ -73,10 +80,18 @@ from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
-import torch
+try:
+    import torch
+except ModuleNotFoundError as exc:
+    if exc.name != "torch":
+        raise
+    torch = None  # The reference CPU trainer needs only NumPy.
 
 try:
-    import gpu_replace_persistent as gpu_replace
+    if torch is not None:
+        import gpu_replace_persistent as gpu_replace
+    else:
+        gpu_replace = None
 except ImportError as e:
     raise SystemExit(
         "gpu_replace_persistent.py must be in the same directory / PYTHONPATH"
@@ -92,7 +107,8 @@ MAX_WILDCARDS = 16
 MAX_RULE_TOKENS = 64
 MAX_OUTPUT = 32768
 RIDGE_LAMBDA = 4.0
-TRAIN_MOD = 3
+TRAIN_MOD = 3  # legacy-holdout only
+PAIRWISE_RANK_MAX_FEATURES = 256
 INPUT_BYTE_COUNT = 256
 EMBEDDING_ENTRY_COUNT = 256
 EMBEDDING_OOV = VOCAB
@@ -151,6 +167,14 @@ class Genome:
     # v29: evaluator-local immutable host-pack cache. Offspring inherit these
     # arrays by reference and mark only structurally touched rows dirty. This
     # avoids rescanning ~1500 Python Rule objects for every new child each gen.
+    _eval_case_serials: tuple = ()
+    # v58 runtime-only provenance for delayed operator credit assignment.
+    # The normal next-generation evaluation supplies the reward; no auxiliary
+    # model evaluations are required.
+    _origin_operator: str = ""
+    _parent_case_scores: tuple = ()
+    _parent_case_serials: tuple = ()
+    _mix_rows: int = 0
     _pack_owner: int = 0
     _pack_rule_ids: object | None = None
     _pack_anchors: object | None = None
@@ -200,6 +224,7 @@ def clone_genome_shallow(g: Genome) -> Genome:
         fitness=float(g.fitness),
         case_scores=list(g.case_scores),
         readout_weights=list(g.readout_weights),
+        _eval_case_serials=g._eval_case_serials,
     )
     return _inherit_genome_pack_cache(g, out)
 
@@ -217,6 +242,7 @@ def clone_genome_deep(g: Genome) -> Genome:
         fitness=float(g.fitness),
         case_scores=list(g.case_scores),
         readout_weights=list(g.readout_weights),
+        _eval_case_serials=g._eval_case_serials,
     )
     return _inherit_genome_pack_cache(g, out)
 
@@ -351,7 +377,8 @@ def update_hall_of_fame(
             incumbent = archive[nearest]
             # For the same lineage, require a genuinely better current test score.
             # Historical cache belongs to the old structure and must not be copied.
-            if cand.current_fitness > incumbent.current_fitness + 1.0e-12:
+            common = sorted(set(cand.score_cache) & set(incumbent.score_cache))
+            if common and statistics.fmean(cand.score_cache[k] - incumbent.score_cache[k] for k in common) > 1.0e-12:
                 archive[nearest] = cand
                 replaced += 1
         else:
@@ -600,9 +627,9 @@ def load_local_corpus(path: str, limit: int, min_len: int, max_len: int) -> List
         parts = raw.splitlines()
     for part in parts:
         part = part.strip(b"\r\n")
-        if len(part) < min_len:
+        if len(part) < min_len or len(part) >= max_len:
             continue
-        if len(part) > max_len:
+        if max_len > 0 and len(part) > max_len:
             start = random.randrange(0, len(part) - max_len + 1)
             part = part[start : start + max_len]
         chunks.append(bytes(part))
@@ -632,9 +659,9 @@ def stream_github_code(limit: int, min_len: int, max_len: int) -> List[bytes]:
         if not isinstance(text, str):
             continue
         b = text.encode("utf-8", errors="ignore")
-        if len(b) < min_len:
+        if len(b) < min_len or len(part) >= max_len:
             continue
-        if len(b) > max_len:
+        if max_len > 0 and len(b) > max_len:
             start = random.randrange(0, len(b) - max_len + 1)
             b = b[start : start + max_len]
         chunks.append(b)
@@ -1509,6 +1536,371 @@ def crossover(
     return child
 
 
+# ---------------------------------------------------------------------------
+# v58: budget-neutral linkage learning / quality diversity / operator learning
+# ---------------------------------------------------------------------------
+
+
+def _clear_evaluation_state(g: Genome) -> None:
+    """Invalidate only score/readout state after a structural edit."""
+    g.fitness = float("-inf")
+    g.case_scores = []
+    g.readout_weights = []
+    g._eval_case_serials = ()
+
+
+def mark_offspring_origin(child: Genome, parent: Genome, operator: str, mix_rows: int = 0) -> None:
+    """Store a comparable parent baseline for delayed, zero-cost credit assignment."""
+    child._origin_operator = str(operator)
+    child._parent_case_scores = tuple(map(float, parent.case_scores))
+    child._parent_case_serials = tuple(parent._eval_case_serials)
+    child._mix_rows = int(mix_rows)
+
+
+def offspring_overlap_reward(g: Genome) -> float | None:
+    """Child-parent fitness delta on case serials that are literally identical."""
+    if not g._origin_operator or not g._parent_case_serials or not g._eval_case_serials:
+        return None
+    parent_by_serial = {
+        int(serial): float(score)
+        for serial, score in zip(g._parent_case_serials, g._parent_case_scores)
+        if math.isfinite(float(score))
+    }
+    diffs = []
+    for serial, score in zip(g._eval_case_serials, g.case_scores):
+        old = parent_by_serial.get(int(serial))
+        if old is not None and math.isfinite(float(score)):
+            diffs.append(float(score) - old)
+    return float(statistics.fmean(diffs)) if diffs else None
+
+
+class AdaptiveOperatorBandit:
+    """Small non-stationary UCB scheduler using already-paid-for evaluations."""
+    def __init__(self, arms: Sequence[str], exploration: float = 3.0e-4, epsilon: float = 0.04):
+        self.arms = tuple(map(str, arms))
+        self.exploration = max(0.0, float(exploration))
+        self.epsilon = min(1.0, max(0.0, float(epsilon)))
+        self.counts = {a: 0 for a in self.arms}
+        self.mean = {a: 0.0 for a in self.arms}
+        self.success = {a: 0 for a in self.arms}
+
+    def restore_from_history(self, history: Sequence[dict]) -> None:
+        if not history:
+            return
+        row = history[-1]
+        for arm in self.arms:
+            try:
+                self.counts[arm] = max(0, int(float(row.get(f"op_count_{arm}", 0) or 0)))
+                self.mean[arm] = float(row.get(f"op_reward_{arm}", 0.0) or 0.0)
+                self.success[arm] = max(0, int(float(row.get(f"op_success_{arm}", 0) or 0)))
+            except (TypeError, ValueError):
+                pass
+
+    def choose(self) -> str:
+        if random.random() < self.epsilon:
+            return random.choice(self.arms)
+        unseen = [a for a in self.arms if self.counts[a] == 0]
+        if unseen:
+            return random.choice(unseen)
+        total = max(1, sum(self.counts.values()))
+        log_total = math.log(total + 1.0)
+        best_arm = self.arms[0]
+        best_score = float("-inf")
+        for arm in self.arms:
+            bonus = self.exploration * math.sqrt(log_total / float(self.counts[arm]))
+            score = self.mean[arm] + bonus
+            if score > best_score:
+                best_score = score
+                best_arm = arm
+        return best_arm
+
+    def observe(self, arm: str, reward: float) -> None:
+        if arm not in self.counts or not math.isfinite(float(reward)):
+            return
+        r = max(-0.05, min(0.05, float(reward)))
+        self.counts[arm] += 1
+        if r > 0.0:
+            self.success[arm] += 1
+        # Keep adapting after thousands of generations instead of converging to a
+        # frozen lifetime average; the useful operator changes near saturation.
+        alpha = max(0.06, 1.0 / min(16.0, float(self.counts[arm])))
+        self.mean[arm] = (1.0 - alpha) * self.mean[arm] + alpha * r
+
+    def observe_population(self, population: Sequence[Genome]) -> tuple[int, float]:
+        updates = 0
+        rewards = []
+        for g in population:
+            r = offspring_overlap_reward(g)
+            if r is None:
+                continue
+            self.observe(g._origin_operator, r)
+            updates += 1
+            rewards.append(r)
+        return updates, (float(statistics.fmean(rewards)) if rewards else float("nan"))
+
+    def add_history(self, row: dict) -> None:
+        for arm in self.arms:
+            row[f"op_count_{arm}"] = self.counts[arm]
+            row[f"op_reward_{arm}"] = self.mean[arm]
+            row[f"op_success_{arm}"] = self.success[arm]
+
+
+class SparseLinkageModel:
+    """Bounded linkage family inferred from elite readout activity."""
+    def __init__(self):
+        self.modules: List[tuple[int, ...]] = []
+        self.module_scores: List[float] = []
+        self.generation = -1
+        self.loci = 0
+
+    def refresh(
+        self,
+        population: Sequence[Genome],
+        generation: int,
+        refresh_every: int,
+        elite_count: int,
+        max_loci: int,
+        max_modules: int,
+        max_module_size: int,
+    ) -> None:
+        if int(max_loci) <= 0 or int(max_modules) <= 0:
+            self.modules = []
+            self.module_scores = []
+            self.loci = 0
+            self.generation = int(generation)
+            return
+        if self.modules and (int(generation) - self.generation) < max(1, int(refresh_every)):
+            return
+        if not population or not population[0].rules:
+            self.modules = []
+            self.module_scores = []
+            self.generation = int(generation)
+            return
+        n_rules = len(population[0].rules)
+        valid = [g for g in population[:max(2, int(elite_count))] if len(g.readout_weights) == n_rules]
+        if len(valid) < 2:
+            self.modules = []
+            self.module_scores = []
+            self.generation = int(generation)
+            return
+
+        # At defaults this is only 96x1500 and the correlation matrix is 128x128.
+        w = np.abs(np.asarray([g.readout_weights for g in valid], dtype=np.float32))
+        importance = np.mean(w, axis=0, dtype=np.float64)
+        k = min(n_rules, max(8, int(max_loci)))
+        loci = np.argpartition(importance, -k)[-k:] if k < n_rules else np.arange(n_rules)
+        loci = loci[np.argsort(importance[loci])[::-1]]
+        self.loci = int(len(loci))
+
+        z = np.log1p(w[:, loci].astype(np.float64, copy=False))
+        z -= z.mean(axis=0, keepdims=True)
+        norms = np.sqrt(np.sum(z * z, axis=0))
+        nz = norms > 1.0e-12
+        z[:, nz] /= norms[nz]
+        corr = np.abs(z.T @ z)
+        np.fill_diagonal(corr, 0.0)
+        locus_to_sub = {int(v): i for i, v in enumerate(loci)}
+
+        sizes = [x for x in (2, 4, 8, 16, 32) if x <= max(2, int(max_module_size)) and x <= len(loci)]
+        if not sizes:
+            sizes = [min(2, len(loci))]
+        seed_count = min(len(loci), max(8, int(max_modules) // max(1, len(sizes))))
+        candidates: dict[tuple[int, ...], float] = {}
+        for si in range(seed_count):
+            seed = int(loci[si])
+            order = np.argsort(corr[si])[::-1]
+            for size in sizes:
+                chosen = [seed]
+                for j in order:
+                    locus = int(loci[int(j)])
+                    if locus != seed:
+                        chosen.append(locus)
+                    if len(chosen) >= size:
+                        break
+                module = tuple(sorted(set(chosen)))
+                if len(module) < 2:
+                    continue
+                idx = [locus_to_sub[q] for q in module]
+                c = corr[np.ix_(idx, idx)]
+                dep = float(c.sum() / max(1, len(module) * (len(module) - 1)))
+                imp = float(np.mean(importance[list(module)]))
+                candidates[module] = max(candidates.get(module, -1.0), dep * (imp + 1.0e-12))
+
+            # Retain a small ordered-program prior in addition to data-driven
+            # non-contiguous modules.
+            span = min(max(2, int(max_module_size)), 8, n_rules)
+            lo = max(0, min(n_rules - span, seed - span // 2))
+            contiguous = tuple(range(lo, lo + span))
+            candidates[contiguous] = max(candidates.get(contiguous, -1.0), float(importance[seed]) * 0.25)
+
+        ranked = sorted(candidates.items(), key=lambda kv: kv[1], reverse=True)[:max(1, int(max_modules))]
+        self.modules = [m for m, _ in ranked]
+        self.module_scores = [float(v) for _, v in ranked]
+        self.generation = int(generation)
+
+    def choose_module(self) -> tuple[int, ...]:
+        if not self.modules:
+            return ()
+        head = min(len(self.modules), max(8, len(self.modules) // 2))
+        return random.choice(self.modules[:head] if random.random() < 0.85 else self.modules)
+
+    def choose_module_for(self, base: Genome, donor: Genome, tries: int = 6) -> tuple[int, ...]:
+        """Cheap surrogate-optimal module choice using already fitted readout mass."""
+        if not self.modules:
+            return ()
+        if len(base.readout_weights) != len(base.rules) or len(donor.readout_weights) != len(donor.rules):
+            return self.choose_module()
+        head = min(len(self.modules), max(8, len(self.modules) // 2))
+        best_module = ()
+        best_gain = float("-inf")
+        for _ in range(max(1, int(tries))):
+            idx = random.randrange(head) if random.random() < 0.85 else random.randrange(len(self.modules))
+            module = self.modules[idx]
+            donor_mass = sum(abs(float(donor.readout_weights[j])) for j in module)
+            base_mass = sum(abs(float(base.readout_weights[j])) for j in module)
+            # Linkage score is only a tiny tie-breaker; donor-vs-base evidence
+            # controls the zero-cost proposal.  Actual merit is learned next gen.
+            gain = donor_mass - base_mass + 1.0e-6 * self.module_scores[idx]
+            if gain > best_gain:
+                best_gain = gain
+                best_module = module
+        return best_module or self.choose_module()
+
+
+def linkage_mix(base: Genome, donor: Genome, model: SparseLinkageModel, module_count: int = 1) -> tuple[Genome, int]:
+    """Transplant learned modules with copy-on-write and no extra evaluation."""
+    child = clone_genome_shallow(base)
+    if not model.modules or len(base.rules) != len(donor.rules):
+        return child, 0
+    changed_rows: set[int] = set()
+    same_coords = donor.embedding == base.embedding
+    translation = None if same_coords else embedding_translation(donor.embedding, base.embedding)
+    attempts = max(2, int(module_count) * 3)
+    used = 0
+    for _ in range(attempts):
+        if used >= max(1, int(module_count)):
+            break
+        module = model.choose_module_for(base, donor)
+        if not module:
+            continue
+        local_changed = []
+        for idx in module:
+            if not (0 <= idx < len(child.rules)):
+                continue
+            src = donor.rules[idx]
+            dst = child.rules[idx]
+            if src.pattern == dst.pattern and src.replacement == dst.replacement:
+                continue
+            child.rules[idx] = src if same_coords else recode_rule(src, translation)
+            local_changed.append(idx)
+        if local_changed:
+            changed_rows.update(local_changed)
+            used += 1
+    if changed_rows:
+        _mark_genome_pack_rows(child, changed_rows)
+        _clear_evaluation_state(child)
+    return child, len(changed_rows)
+
+
+def qd_descriptor(g: Genome, bins: int = 6) -> tuple[int, ...]:
+    """MAP-Elites descriptor from cheap but behaviorally useful genome statistics.
+
+    The axes deliberately separate sparse/dense readouts, embedding geometry and
+    the structure of the rules that actually matter to the ridge readout.  Only a
+    tiny top-k rule sample is inspected, keeping this host-side work negligible.
+    """
+    bins = max(2, int(bins))
+    n = max(1, len(g.rules))
+    if len(g.readout_weights) == len(g.rules):
+        absw = np.abs(np.asarray(g.readout_weights, dtype=np.float64))
+        active = int(np.count_nonzero(absw > 1.0e-12))
+        k = min(12, active if active > 0 else n)
+        if k > 0:
+            if k < n:
+                top_ids = np.argpartition(absw, -k)[-k:]
+            else:
+                top_ids = np.arange(n)
+            pat_len = float(np.mean([len(g.rules[int(i)].pattern) for i in top_ids]))
+            wc_frac = float(np.mean([
+                sum(int(t) < 0 for t in g.rules[int(i)].pattern) / max(1, len(g.rules[int(i)].pattern))
+                for i in top_ids
+            ]))
+        else:
+            pat_len = 0.0
+            wc_frac = 0.0
+    else:
+        active = 0
+        pat_len = 0.0
+        wc_frac = 0.0
+
+    # Active counts in successful runs tend to live far below 1500, so a 256-rule
+    # soft cap gives the sparse end useful resolution instead of collapsing it.
+    active_scale = math.sqrt(min(active, 256) / 256.0)
+    active_bin = min(bins - 1, int(active_scale * bins))
+    latent = sum(int(v) >= INPUT_BYTE_COUNT for v in g.embedding)
+    moved = sum(int(v) != i for i, v in enumerate(g.embedding))
+    latent_bin = min(bins - 1, int(math.sqrt(latent / float(EMBEDDING_ENTRY_COUNT)) * bins))
+    moved_bin = min(bins - 1, int((moved / float(EMBEDDING_ENTRY_COUNT)) * bins))
+    # Most evolved useful rules are short; resolve 0..12 tokens finely and saturate.
+    pat_bin = min(bins - 1, int((min(12.0, pat_len) / 12.0) * bins))
+    wildcard_bin = min(bins - 1, int(min(1.0, wc_frac) * bins))
+    specialist = int(np.argmax(np.asarray(g.case_scores, dtype=np.float64))) if g.case_scores else 0
+    return active_bin, latent_bin, moved_bin, pat_bin, wildcard_bin, specialist
+
+
+def build_qd_grid(population: Sequence[Genome], bins: int = 6) -> dict[tuple[int, ...], Genome]:
+    grid: dict[tuple[int, ...], Genome] = {}
+    for g in population:
+        if not math.isfinite(float(g.fitness)):
+            continue
+        key = qd_descriptor(g, bins)
+        old = grid.get(key)
+        if old is None or g.fitness > old.fitness:
+            grid[key] = g
+    return grid
+
+
+class PlateauTracker:
+    """Long-window signal; rolling difficulty remains noise, not proof of convergence."""
+    def __init__(self, window: int, min_gain: float):
+        from collections import deque
+        self.window = max(2, int(window))
+        self.values = deque(maxlen=2 * self.window)
+        self.min_gain = max(0.0, float(min_gain))
+        self.stalled = 0
+
+    def update(self, fitness: float):
+        if not math.isfinite(fitness):
+            return self.stalled, float("nan")
+        self.values.append(fitness)
+        if len(self.values) < 2 * self.window:
+            return 0, float("nan")
+        values = list(self.values)
+        gain = statistics.fmean(values[self.window:]) - statistics.fmean(values[:self.window])
+        self.stalled = self.stalled + 1 if gain <= self.min_gain else 0
+        return self.stalled, gain
+
+
+class CaseSelector:
+    """MAD epsilon-lexicase keeps specialists that mean-only tournaments lose."""
+    def __init__(self, population):
+        self.population = population
+        self.scores = np.asarray([g.case_scores for g in population], dtype=np.float64)
+        self.epsilon = np.maximum(1e-12, np.median(
+            np.abs(self.scores - np.median(self.scores, axis=0)), axis=0))
+
+    def pick(self):
+        candidates = np.arange(len(self.population))
+        order = list(range(self.scores.shape[1]))
+        random.shuffle(order)
+        for case in order:
+            scores = self.scores[candidates, case]
+            candidates = candidates[scores >= scores.max() - self.epsilon[case]]
+            if len(candidates) <= 1:
+                break
+        return self.population[int(random.choice(candidates))]
+
+
 def tournament(pop: Sequence[Genome], k: int) -> Genome:
     ids = random.sample(range(len(pop)), k=min(k, len(pop)))
     return max((pop[i] for i in ids), key=lambda g: g.fitness)
@@ -1703,7 +2095,7 @@ _GP_MAX_RULES = 2048
 _GP_RULE_WORDS = (_GP_MAX_RULES + 31) // 32
 _GP_INDEX_TOKENS = VOCAB + 1  # 0..511 plus OOV=512
 
-_MPS_TRAJECTORY_SOURCE = gpu_replace._MPS_FUSED_SOURCE + r'''
+_MPS_TRAJECTORY_SOURCE = (gpu_replace._MPS_FUSED_SOURCE if gpu_replace is not None else "") + r'''
 constant int GP_TG_SIZE = 64;
 constant int GP_MAX_RULES = 2048;
 typedef short gp_token_t;
@@ -4816,7 +5208,7 @@ class MpsPopulationEvaluator:
 
 
 # ---------------------------------------------------------------------------
-# Ridge readout + Spearman fitness
+# Rank-aware readout + Spearman fitness
 # ---------------------------------------------------------------------------
 
 
@@ -4825,14 +5217,12 @@ def average_ranks(x: np.ndarray) -> np.ndarray:
     n = len(x)
     order = np.argsort(x, kind="mergesort")
     ranks = np.empty(n, dtype=np.float64)
-    i = 0
-    while i < n:
-        j = i + 1
-        while j < n and x[order[j]] == x[order[i]]:
-            j += 1
-        rank = 0.5 * ((i + 1) + j)
-        ranks[order[i:j]] = rank
-        i = j
+    if n == 0:
+        return ranks
+    values = x[order]
+    starts = np.r_[0, np.flatnonzero(values[1:] != values[:-1]) + 1]
+    ends = np.r_[starts[1:], n]
+    ranks[order] = np.repeat((starts + ends + 1) * 0.5, ends - starts)
     return ranks
 
 
@@ -4851,7 +5241,7 @@ def spearman(x: Sequence[float], y: Sequence[float]) -> float:
 
 
 def fit_dual_ridge(x: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
-    """Nim v44+ style exact dual ridge with RMS-normalized columns."""
+    """Exact dual ridge retained for legacy/A-B readout mode and tests."""
     n, p = x.shape
     w = np.zeros(p, dtype=np.float64)
     if n < 2 or p == 0:
@@ -4861,17 +5251,109 @@ def fit_dual_ridge(x: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
     active = ss > 1e-12
     if not np.any(active):
         return w
-    scale = np.zeros(p, dtype=np.float64)
-    scale[active] = n / ss[active]  # invRMS^2
-    # K = X diag(scale) X^T
+    xd = xd[:, active]
+    scale = n / ss[active]  # invRMS^2; inactive columns are exactly zero
     k = (xd * scale[None, :]) @ xd.T
     k.flat[:: n + 1] += lam
     try:
-        alpha = np.linalg.solve(k, y)
+        # K is SPD for lam>0.  Cholesky is both cheaper and more stable than
+        # a generic LU solve, while preserving the exact legacy objective.
+        chol = np.linalg.cholesky(k)
+        alpha = np.linalg.solve(chol.T, np.linalg.solve(chol, y))
     except np.linalg.LinAlgError:
         alpha = np.linalg.lstsq(k, y, rcond=None)[0]
-    w = scale * (xd.T @ alpha)
+    w[active] = scale * (xd.T @ alpha)
     np.clip(w, -1e6, 1e6, out=w)
+    return w
+
+
+def case_adjacent_rank_pairs(
+    cleanliness: np.ndarray,
+    case_ids: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build a sparse all-sample rank graph inside each case.
+
+    For a case with m trajectories, sort all m by target rank and connect the
+    chain with m-1 adjacent constraints.  Thus every trajectory participates in
+    pairwise fitting, but we use O(m), not O(m^2), pairs.  Ties receive average
+    ranks and therefore a zero desired margin when adjacent within the tie.
+
+    Returns (higher_rank_index, lower_rank_index, normalized_rank_margin).
+    """
+    cleanliness = np.asarray(cleanliness, dtype=np.float64)
+    case_ids = np.asarray(case_ids, dtype=np.int32)
+    hi_all: List[int] = []
+    lo_all: List[int] = []
+    margin_all: List[float] = []
+    for ci in np.unique(case_ids):
+        ids = np.flatnonzero(case_ids == ci)
+        m = int(ids.size)
+        if m < 2:
+            continue
+        vals = cleanliness[ids]
+        ranks = average_ranks(vals)
+        order = np.argsort(ranks, kind="mergesort")
+        norm_rank = (ranks - 1.0) / max(1.0, float(m - 1))
+        lo_local = order[:-1]
+        hi_local = order[1:]
+        lo_ids = ids[lo_local]
+        hi_ids = ids[hi_local]
+        margins = norm_rank[hi_local] - norm_rank[lo_local]
+        hi_all.extend(map(int, hi_ids))
+        lo_all.extend(map(int, lo_ids))
+        margin_all.extend(map(float, margins))
+    return (
+        np.asarray(hi_all, dtype=np.int32),
+        np.asarray(lo_all, dtype=np.int32),
+        np.asarray(margin_all, dtype=np.float64),
+    )
+
+
+def fit_pairwise_rank_ridge_all(
+    x: np.ndarray,
+    baseline: np.ndarray,
+    cleanliness: np.ndarray,
+    case_ids: np.ndarray,
+    ridge_lambda: float,
+    max_features: int = PAIRWISE_RANK_MAX_FEATURES,
+) -> np.ndarray:
+    """Fit sparse pairwise Rank Ridge from *all* trajectories.
+
+    Every trajectory participates in the case-local adjacent-pair graph.  To keep
+    host time close to the former 36-row readout, score all rule columns once by
+    normalized pairwise covariance and solve the exact dual ridge only on the
+    strongest ``max_features`` columns.  This is supervised sure-independence
+    screening: it changes feature sparsity, not which trajectories participate.
+    """
+    hi, lo, margin = case_adjacent_rank_pairs(cleanliness, case_ids)
+    p = int(x.shape[1])
+    if hi.size == 0 or p == 0:
+        return np.zeros(p, dtype=np.float64)
+
+    # pred = baseline + Xw. For each rank edge hi>lo fit
+    #   (X_hi-X_lo)w ~= desired_rank_margin - (b_hi-b_lo).
+    pair_x = x[hi].astype(np.float32, copy=False) - x[lo].astype(np.float32, copy=False)
+    pair_y = margin - (baseline[hi].astype(np.float64) - baseline[lo].astype(np.float64))
+
+    pd = pair_x.astype(np.float64, copy=False)
+    ss = np.sum(pd * pd, axis=0)
+    usable = np.flatnonzero(ss > 1.0e-12)
+    if usable.size == 0:
+        return np.zeros(p, dtype=np.float64)
+
+    cap = max(1, int(max_features))
+    if usable.size > cap:
+        # Scale-free univariate rank relevance.  All 105 default pair rows
+        # contribute to this score before any feature is dropped.
+        rel = np.abs(pd[:, usable].T @ pair_y) / np.sqrt(ss[usable])
+        keep_local = np.argpartition(rel, -cap)[-cap:]
+        selected = usable[keep_local]
+    else:
+        selected = usable
+
+    selected_w = fit_dual_ridge(pd[:, selected], pair_y, ridge_lambda)
+    w = np.zeros(p, dtype=np.float64)
+    w[selected] = selected_w
     return w
 
 
@@ -4883,21 +5365,45 @@ def score_genome_features(
     case_ids: np.ndarray,
     sample_ids: np.ndarray,
     ridge_lambda: float,
+    readout_mode: str = "pairwise-all",
+    rank_max_features: int = PAIRWISE_RANK_MAX_FEATURES,
 ) -> float:
-    train = (sample_ids % TRAIN_MOD) == 0
-    if int(train.sum()) < 2:
-        train[:] = True
-    residual = cleanliness[train] - baseline[train]
-    w = fit_dual_ridge(x[train], residual, ridge_lambda)
-    # Keep readout weights on the genome, not on shared structural Rule objects.
-    genome.readout_weights = w.astype(np.float64, copy=False).tolist()
+    """Fit the readout and score per-case Spearman.
 
-    pred = baseline + x.astype(np.float64) @ w
+    pairwise-all (default): all trajectories participate in case-local adjacent
+    pairwise rank fitting, and those same trajectories are all used for the
+    per-case Spearman fitness requested for v59.
+
+    legacy-holdout: the previous 1/3 raw-target ridge + 2/3 held-out Spearman,
+    kept only for controlled A/B comparisons and checkpoint compatibility.
+    """
+    if readout_mode == "legacy-holdout":
+        train = (sample_ids % TRAIN_MOD) == 0
+        if int(train.sum()) < 2:
+            train[:] = True
+        residual = cleanliness[train] - baseline[train]
+        w = fit_dual_ridge(x[train], residual, ridge_lambda)
+    else:
+        w = fit_pairwise_rank_ridge_all(
+            x, baseline, cleanliness, case_ids, ridge_lambda, rank_max_features
+        )
+
+    genome.readout_weights = w.astype(np.float64, copy=False).tolist()
+    active = np.flatnonzero(w)
+    pred = baseline.astype(np.float64, copy=True)
+    if active.size:
+        pred += x[:, active].astype(np.float64, copy=False) @ w[active]
+
     scores: List[float] = []
     for ci in np.unique(case_ids):
-        hold = (case_ids == ci) & ((sample_ids % TRAIN_MOD) != 0)
-        if int(hold.sum()) >= 2:
-            scores.append(spearman(pred[hold], cleanliness[hold]))
+        if readout_mode == "legacy-holdout":
+            use = (case_ids == ci) & ((sample_ids % TRAIN_MOD) != 0)
+        else:
+            # v59: every one of the 36 default trajectories per case contributes
+            # to Spearman, including every trajectory used by pairwise fitting.
+            use = case_ids == ci
+        if int(use.sum()) >= 2:
+            scores.append(spearman(pred[use], cleanliness[use]))
     fitness = float(np.mean(scores)) if scores else 0.0
     if not math.isfinite(fitness):
         fitness = -1.0
@@ -4915,6 +5421,8 @@ def evaluate_genome(
     backend: str,
     ridge_lambda: float,
     max_output: int,
+    readout_mode: str = "pairwise-all",
+    rank_max_features: int = PAIRWISE_RANK_MAX_FEATURES,
 ) -> float:
     if backend == "mps":
         # Compatibility path. evolve() uses one persistent evaluator for the
@@ -4928,7 +5436,7 @@ def evaluate_genome(
     else:
         x, baseline, _, _ = trajectory_features_cpu(inputs, genome, max_output)
     return score_genome_features(
-        genome, x, baseline, cleanliness, case_ids, sample_ids, ridge_lambda
+        genome, x, baseline, cleanliness, case_ids, sample_ids, ridge_lambda, readout_mode, rank_max_features
     )
 
 
@@ -5053,7 +5561,8 @@ def save_checkpoint(path: str, next_generation: int, population: Sequence[Genome
         "history": _bytes_array(list(history)),
         "py_rng": _bytes_array(random.getstate()),
         "np_rng": _bytes_array(np.random.get_state()),
-        "torch_rng": torch.get_rng_state().cpu().numpy().astype(np.uint8, copy=False),
+        "torch_rng": (torch.get_rng_state().cpu().numpy().astype(np.uint8, copy=False)
+                      if torch is not None else np.empty(0, dtype=np.uint8)),
         "sampler_ngrams": _bytes_array(sampler.ngrams),
         "sampler_byte_buffer": np.asarray(sampler._byte_buffer, dtype=np.uint16),
         "sampler_byte_pos": np.asarray([sampler._byte_pos], dtype=np.int64),
@@ -5098,14 +5607,15 @@ def load_checkpoint(path: str, sampler: CorpusSampler):
         history = list(_array_object(z["history"]))
         py_rng = _array_object(z["py_rng"])
         np_rng = _array_object(z["np_rng"])
-        torch_rng = torch.from_numpy(np.asarray(z["torch_rng"], dtype=np.uint8).copy())
+        torch_rng = np.asarray(z["torch_rng"], dtype=np.uint8).copy()
         sampler.ngrams = list(_array_object(z["sampler_ngrams"]))
         sampler._byte_buffer = np.asarray(z["sampler_byte_buffer"], dtype=np.uint16).copy()
         sampler._byte_pos = int(z["sampler_byte_pos"][0])
         config = dict(_array_object(z["config"]))
     random.setstate(py_rng)
     np.random.set_state(np_rng)
-    torch.set_rng_state(torch_rng)
+    if torch is not None and torch_rng.size:
+        torch.set_rng_state(torch.from_numpy(torch_rng))
     return next_generation, population, best_ever, history, config, hof_group
 
 
@@ -5143,7 +5653,7 @@ def append_history_csv(path: str, row: dict) -> None:
         with p.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             old_fields = list(reader.fieldnames or [])
-            if old_fields != fields:
+            if any(k not in old_fields for k in fields):
                 old_rows = list(reader)
                 merged = old_fields + [k for k in fields if k not in old_fields]
                 tmp = p.with_suffix(p.suffix + ".tmp")
@@ -5209,14 +5719,14 @@ def write_plots(history: List[dict], prefix: str, ma_window: int) -> None:
         return -np.log2(np.maximum(1e-9, 1.0 - np.minimum(v, 1.0 - 1e-9)))
     fig = plt.figure(figsize=(11, 6))
     ax = fig.add_subplot(111)
-    ax.plot(gen, sat(best), label="best")
+    ax.plot(gen, sat(best), label="best", color="lightgray")
     ax.plot(gen, sat(best_ever), label="best-ever")
     ax.plot(gen, sat(np.where(np.isfinite(ma), ma, best)), label=f"best MA({ma_window})")
     ax.set_xlabel("generation")
     ax.set_ylabel("-log2(1 - fitness)")
     ax.grid(True, alpha=0.25)
     ax.legend()
-    ax.set_title("Fitness near saturation")
+    ax.set_title("Fitness near saturation | - log2( 1 - spearman )")
     fig.tight_layout()
     tmp = base + "_saturation.tmp.png"
     out = base + "_saturation.png"
@@ -5275,10 +5785,11 @@ def write_plots(history: List[dict], prefix: str, ma_window: int) -> None:
 def evolve(args) -> Genome:
     random.seed(args.seed)
     np.random.seed(args.seed & 0xFFFFFFFF)
-    torch.manual_seed(args.seed)
+    if torch is not None:
+        torch.manual_seed(args.seed)
 
     if args.backend == "mps":
-        if not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+        if not (torch is not None and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
             raise RuntimeError("MPS requested but torch.backends.mps.is_available() is false")
 
     corpus = load_corpus(args)
@@ -5351,10 +5862,26 @@ def evolve(args) -> Genome:
 
     # Persistent rolling elite-of-elites.  Structures survive checkpoints; their
     # case-score history restarts because the rolling evaluation serials restart.
+    args.hof_size = max(args.hof_size, len(loaded_hof_genomes))
     hof_archive: List[HallOfFameEntry] = [
         HallOfFameEntry(clone_genome_deep(g), born_generation=start_generation - 1)
         for g in loaded_hof_genomes[:max(0, int(args.hof_size))]
     ]
+
+    for entry in hof_archive:
+        entry.archive_score = float(entry.genome.fitness)
+    plateau = PlateauTracker(args.plateau_window, args.plateau_min_gain)
+    for row in history[-2 * args.plateau_window:]:
+        plateau.update(float(row["best"]))
+
+    # v58 controllers are runtime-only so v57 checkpoints remain directly
+    # loadable. Bandit cumulative statistics are restored from the last history
+    # row, while the sparse linkage model is relearned from the first evaluated
+    # population after resume.
+    operator_arms = ("mix_local", "mix_balanced", "local", "balanced", "explore", "legacy")
+    op_bandit = AdaptiveOperatorBandit(operator_arms, args.operator_ucb, args.operator_epsilon)
+    op_bandit.restore_from_history(history)
+    linkage_model = SparseLinkageModel()
 
     mps_evaluator = None
     if args.backend == "mps":
@@ -5410,7 +5937,8 @@ def evolve(args) -> Genome:
                     )
         inputs, target, case_ids, sample_ids = rolling_dataset.flatten()
         current_case_serials = rolling_dataset.serials
-        hof_genomes = [e.genome for e in hof_archive]
+        evaluated_hof = random.sample(hof_archive, min(len(hof_archive), max(0, args.hof_eval)))
+        hof_genomes = [e.genome for e in evaluated_hof]
         eval_genomes = list(population) + hof_genomes
         if args.progress:
             lens = np.asarray([len(x) for x in inputs], dtype=np.int32)
@@ -5432,16 +5960,14 @@ def evolve(args) -> Genome:
             if dataset_changed:
                 mps_evaluator.set_inputs(inputs)
 
-            # Exact stable-dataset reuse. Every finite unmodified survivor/HoF
-            # genome carries scores and fitted readout from the immediately
-            # preceding generation. When no rolling case changed, those values
-            # are already the exact answer and must not pay another GPU pass.
+            # A sampled archive entry can be many epochs old: only an exact
+            # match of case identities permits reuse, even on non-rotation steps.
             reusable: List[int] = []
             pending: List[int] = []
             expected_cases = rolling_dataset.case_count if rolling_dataset is not None else 0
             for i, g in enumerate(eval_genomes):
                 can_reuse = (
-                    (not dataset_changed)
+                    g._eval_case_serials == tuple(current_case_serials)
                     and math.isfinite(g.fitness)
                     and len(g.case_scores) == expected_cases
                     and len(g.readout_weights) == len(g.rules)
@@ -5483,7 +6009,7 @@ def evolve(args) -> Genome:
             if unique_pending:
                 eval_batch = [eval_genomes[i] for i in unique_pending]
                 all_features = mps_evaluator.evaluate_population(
-                    eval_batch, pool_live_genomes=eval_genomes
+                    eval_batch, pool_live_genomes=list(population) + [e.genome for e in hof_archive]
                 )
                 mps_kernel_seconds = time.perf_counter() - tb
                 mps_pack_seconds = mps_evaluator.last_pack_seconds
@@ -5493,7 +6019,9 @@ def evolve(args) -> Genome:
                     genome = eval_genomes[idx]
                     score_genome_features(
                         genome, x, baseline, target, case_ids, sample_ids, args.ridge_lambda,
+                        args.readout_mode, args.rank_max_features,
                     )
+                    genome._eval_case_serials = tuple(current_case_serials)
                     if args.progress and ((pos + 1) % max(1, total_eval // 20) == 0 or pos + 1 == total_eval):
                         print(f"  readout {pos+1}/{total_eval}", end="\r", flush=True)
                 readout_seconds = time.perf_counter() - tr
@@ -5519,35 +6047,51 @@ def evolve(args) -> Genome:
                 dst.fitness = float(src.fitness)
                 dst.case_scores = list(src.case_scores)
                 dst.readout_weights = list(src.readout_weights)
+                dst._eval_case_serials = src._eval_case_serials
         else:
             total_eval = len(eval_genomes)
             eval_tick = max(1, total_eval // 20)
             for i, genome in enumerate(eval_genomes):
                 evaluate_genome(
                     genome, inputs, target, case_ids, sample_ids,
-                    args.backend, args.ridge_lambda, args.max_output,
+                    args.backend, args.ridge_lambda, args.max_output, args.readout_mode,
+                    args.rank_max_features,
                 )
+                genome._eval_case_serials = tuple(current_case_serials)
                 if args.progress and ((i + 1) % eval_tick == 0 or i + 1 == total_eval):
                     print(f"  eval {i+1}/{total_eval}", end="\r", flush=True)
         if args.progress:
             print(" " * 56, end="\r")
 
-        # Existing HoF entries are always rescored against the same rolling set as
-        # the population, then retain old per-case Spearman scores as historical
-        # evidence after those cases rotate out.
-        for entry in hof_archive:
+        # Only sampled entries have current observations. Never attach a fresh
+        # case serial to an unobserved stale score.
+        for entry in evaluated_hof:
             refresh_hof_entry(
                 entry, current_case_serials, args.hof_history_cases, args.hof_current_weight
             )
 
+        # Learn operator utility from the evaluation we already paid for. Reward
+        # comparison is restricted to unchanged rolling-case serials.
+        operator_updates, operator_reward_mean = op_bandit.observe_population(population)
+
         population.sort(key=lambda g: g.fitness, reverse=True)
+        search_model_t0 = time.perf_counter()
+        linkage_model.refresh(
+            population, generation, args.linkage_refresh, args.linkage_elites,
+            args.linkage_loci, args.linkage_modules, args.linkage_max_module,
+        )
+        qd_grid = build_qd_grid(population, args.qd_bins)
+        qd_elites = sorted(qd_grid.values(), key=lambda g: g.fitness, reverse=True)
+        search_model_seconds = time.perf_counter() - search_model_t0
+
         hof_candidate_n = max(0, min(int(args.hof_candidates), len(population)))
         hof_admitted, hof_replaced = update_hall_of_fame(
             hof_archive, population[:hof_candidate_n], current_case_serials, generation,
             args.hof_size, args.hof_history_cases, args.hof_current_weight, args.hof_min_distance,
         )
         hof_best_score = hof_archive[0].archive_score if hof_archive else float("nan")
-        hof_best_current = hof_archive[0].current_fitness if hof_archive else float("nan")
+        current_hof = [e for e in hof_archive if e.genome._eval_case_serials == tuple(current_case_serials)]
+        hof_best_current = max((e.current_fitness for e in current_hof), default=float("nan"))
         champion = population[0]
         expanding_rules = sum(1 for r in champion.rules if not is_rule_nonexpanding(r))
         if expanding_rules:
@@ -5564,6 +6108,7 @@ def evolve(args) -> Genome:
         # in both adjacent generations. On a rotation generation this excludes
         # the one fresh slot (7/8 overlap by default); on the second generation
         # of a pair all 8/8 slots are comparable.
+        stagnation = short_stagnation if generation > start_generation else 0
         current_case_scores = list(map(float, champion.case_scores))
         overlap_delta = float("nan")
         overlap_cases = 0
@@ -5588,6 +6133,9 @@ def evolve(args) -> Genome:
                 stagnation = 0
         else:
             stagnation = 0
+        short_stagnation = stagnation
+        long_stagnation, plateau_gain = plateau.update(champion.fitness)
+        stagnation = max(short_stagnation, long_stagnation)
         previous_case_scores = current_case_scores
         previous_case_serials = current_case_serials
 
@@ -5607,6 +6155,8 @@ def evolve(args) -> Genome:
             "active_rules": active,
             "expanding_rules": expanding_rules,
             "mutation_stagnation": stagnation,
+            "plateau_gain": plateau_gain,
+            "hof_evaluated": len(evaluated_hof),
             "dataset_epoch": dataset_epoch,
             "rolling_rotated_slot": rotated_slot,
             "rolling_overlap_cases": overlap_cases,
@@ -5616,6 +6166,12 @@ def evolve(args) -> Genome:
             "hof_best_current": hof_best_current,
             "hof_admitted": hof_admitted,
             "hof_replaced": hof_replaced,
+            "qd_cells": len(qd_grid),
+            "linkage_modules": len(linkage_model.modules),
+            "linkage_loci": linkage_model.loci,
+            "operator_updates": operator_updates,
+            "operator_reward_mean": operator_reward_mean,
+            "search_model_seconds": search_model_seconds,
             "trajectory_min_len": min(map(len, inputs)) if inputs else 0,
             "trajectory_max_len": max(map(len, inputs)) if inputs else 0,
             "embedding_moved": moved,
@@ -5661,6 +6217,7 @@ def evolve(args) -> Genome:
             "eval_reused": eval_reused if args.backend == "mps" else 0,
             "eval_deduped": eval_deduped if args.backend == "mps" else 0,
         }
+        op_bandit.add_history(row)
         history.append(row)
         append_history_csv(args.history_csv, row)
         if not args.no_plot and (generation % max(1, args.plot_every) == 0):
@@ -5672,13 +6229,14 @@ def evolve(args) -> Genome:
             f"stag={stagnation} roll={dataset_epoch} overlap={overlap_cases}/{len(current_case_serials)} "
             f"d={overlap_delta:+.3e} hof={len(hof_archive)}/{args.hof_size} "
             f"hofScore={hof_best_score:+.6f} hofNow={hof_best_current:+.6f} "
+            f"link={len(linkage_model.modules)} qd={len(qd_grid)} search={search_model_seconds:.3f}s "
             f"embed_moved={moved} latent={latent} seconds={elapsed:.2f}"
             + (f" mps={mps_kernel_seconds:.2f} pack={mps_pack_seconds:.2f} packRows={mps_evaluator.last_pack_rebuilt_rows}/{mps_evaluator.last_pack_cache_rows + mps_evaluator.last_pack_rebuilt_rows} ruleMemo={mps_evaluator.last_rule_pack_memo_hits}/{mps_evaluator.last_rule_pack_memo_hits + mps_evaluator.last_rule_pack_memo_misses} dispatch={mps_evaluator.last_dispatch_seconds:.2f} "
                f"pool={len(mps_evaluator._pool_meta_host)}(+{mps_evaluator.last_pool_new_rules}) "
                f"upload={mps_evaluator.last_pool_upload_seconds:.3f} "
                + (f"gc={mps_evaluator.last_pool_gc_rules_before}->{mps_evaluator.last_pool_gc_rules_after}/"
                   f"{mps_evaluator.last_pool_gc_seconds:.2f}s " if mps_evaluator.last_pool_gc_triggered else "")
-               + f"ridge={readout_seconds:.2f} "
+               + f"readout={readout_seconds:.2f} "
                + f"eval={eval_unique}/{len(eval_genomes)} reuse={eval_reused} dedupe={eval_deduped} "
                + f"inputs={mps_evaluator.unique_input_count}/{mps_evaluator.sample_count}"
                if args.backend == "mps" and mps_evaluator is not None else "")
@@ -5714,72 +6272,165 @@ def evolve(args) -> Genome:
         elite_n = max(1, min(args.elites, args.population))
         next_pop = [clone_genome_shallow(g) for g in population[:elite_n]]
 
-        # Preserve a tiny number of archive champions exactly.  Skip an exact
-        # structural duplicate if the same lineage is already among current elites.
+        # MAP-Elites-style survivor grid: every injected genome was already
+        # evaluated in this generation.  Diversity therefore consumes population
+        # slots, never additional Metal evaluations.
+        qd_injected = 0
+        for g in qd_elites:
+            if qd_injected >= max(0, int(args.qd_inject)) or len(next_pop) >= args.population:
+                break
+            if any(same_genome_structure(g, x) for x in next_pop):
+                continue
+            next_pop.append(clone_genome_shallow(g))
+            qd_injected += 1
+
+        # Preserve only a small number of archive champions.  HoF remains large
+        # for memory/diversity, but large injection would crowd out new search.
         hof_injected = 0
-        for entry in hof_archive:
+        for entry in sorted(current_hof, key=lambda e: e.current_fitness, reverse=True):
             if hof_injected >= max(0, int(args.hof_inject)) or len(next_pop) >= args.population:
                 break
-            if any(genome_structural_distance(entry.genome, g) <= 1.0e-15 for g in next_pop):
+            if any(same_genome_structure(entry.genome, g) for g in next_pop):
                 continue
             next_pop.append(clone_genome_deep(entry.genome))
             hof_injected += 1
 
         mutation_regime_counts = {"local": 0, "balanced": 0, "explore": 0}
+        operator_counts = {a: 0 for a in operator_arms}
         mutation_rows_changed = 0
+        mixed_rows = 0
         hof_parent_uses = 0
+        qd_parent_uses = 0
         breed_tick = max(1, args.population // 10)
 
+        specialist = CaseSelector(population)
+        exploration_pressure = min(1.0, stagnation / 36.0)
+        immigrant_rate = min(
+            1.0,
+            max(0.0, args.immigrant_rate) + args.plateau_immigrants * exploration_pressure,
+        )
+
         def pick_parent():
-            nonlocal hof_parent_uses
-            if hof_archive and random.random() < max(0.0, min(1.0, float(args.hof_parent_rate))):
+            nonlocal hof_parent_uses, qd_parent_uses
+            if current_hof and random.random() < max(0.0, min(1.0, float(args.hof_parent_rate))):
                 hof_parent_uses += 1
-                return tournament_hof(hof_archive, args.tournament).genome, True
+                return tournament_hof(current_hof, args.tournament).genome, True
+            if qd_elites and random.random() < max(0.0, min(1.0, float(args.qd_parent_rate))):
+                qd_parent_uses += 1
+                return random.choice(qd_elites), False
+            if random.random() < args.specialist_rate:
+                return specialist.pick(), False
             return tournament(population, args.tournament), False
 
+        def safe_base_clone(parent: Genome, from_hof: bool) -> Genome:
+            return clone_genome_deep(parent) if from_hof else clone_genome_shallow(parent)
+
         while len(next_pop) < args.population:
-            if random.random() < args.immigrant_rate:
-                next_pop.append(random_genome(args.rules, sampler, not args.no_embedding))
+            if random.random() < immigrant_rate:
+                child = random_genome(args.rules, sampler, not args.no_embedding)
+                child._origin_operator = ""
+                next_pop.append(child)
             else:
                 p1, p1_hof = pick_parent()
-                if random.random() < args.crossover_rate:
-                    p2, p2_hof = pick_parent()
-                    # crossover shares the first parent's untouched rules.  Never
-                    # let a child share those objects with the persistent archive.
-                    if p1_hof and not p2_hof:
-                        child = crossover(p2, p1, 0.0 if args.no_embedding else args.embedding_crossover_rate)
-                    elif p1_hof and p2_hof:
-                        child = crossover(clone_genome_deep(p1), p2, 0.0 if args.no_embedding else args.embedding_crossover_rate)
-                    else:
-                        child = crossover(p1, p2, 0.0 if args.no_embedding else args.embedding_crossover_rate)
-                else:
-                    child = clone_genome_deep(p1) if p1_hof else clone_genome_shallow(p1)
-                if random.random() < args.mutation_rate:
-                    regime = choose_mutation_regime(stagnation)
+                credit_parent = p1
+                arm = op_bandit.choose()
+                if arm.startswith("mix_") and not linkage_model.modules:
+                    arm = "legacy"
+                operator_counts[arm] += 1
+                changed_mix = 0
+
+                if arm.startswith("mix_"):
+                    p2, _ = pick_parent()
+                    # Under a serious plateau occasionally compose two learned
+                    # modules before the single normal offspring evaluation.
+                    mix_n = 1 + int(exploration_pressure > 0.55 and random.random() < 0.35)
+                    child, changed_mix = linkage_mix(p1, p2, linkage_model, mix_n)
+                    if p1_hof:
+                        # Detach untouched archive Rule objects. Same-embedding
+                        # donor rows remain immutable/shareable inside normal pop,
+                        # but a persistent HoF lineage must stay isolated.
+                        child = clone_genome_deep(child)
+                    regime = "local" if arm == "mix_local" else "balanced"
                     mutation_regime_counts[regime] += 1
                     mutation_rows_changed += mutate_genome(
-                        child, sampler,
+                        child,
+                        sampler,
                         0.0 if args.no_embedding else args.embedding_mutation_rate,
                         regime=regime,
                     )
+                    mixed_rows += changed_mix
+
+                elif arm in ("local", "balanced", "explore"):
+                    child = safe_base_clone(p1, p1_hof)
+                    mutation_regime_counts[arm] += 1
+                    mutation_rows_changed += mutate_genome(
+                        child,
+                        sampler,
+                        0.0 if args.no_embedding else args.embedding_mutation_rate,
+                        regime=arm,
+                    )
+
+                else:
+                    # Mature v57 lane retained as a safety net. The bandit learns
+                    # whether old two-point crossover still deserves budget.
+                    if random.random() < args.crossover_rate:
+                        p2, p2_hof = pick_parent()
+                        if p1_hof and not p2_hof:
+                            child = crossover(
+                                p2, p1,
+                                0.0 if args.no_embedding else args.embedding_crossover_rate,
+                            )
+                            credit_parent = p2
+                        elif p1_hof and p2_hof:
+                            child = crossover(
+                                clone_genome_deep(p1), p2,
+                                0.0 if args.no_embedding else args.embedding_crossover_rate,
+                            )
+                        else:
+                            child = crossover(
+                                p1, p2,
+                                0.0 if args.no_embedding else args.embedding_crossover_rate,
+                            )
+                    else:
+                        child = safe_base_clone(p1, p1_hof)
+                    if random.random() < args.mutation_rate:
+                        regime = choose_mutation_regime(stagnation)
+                        mutation_regime_counts[regime] += 1
+                        mutation_rows_changed += mutate_genome(
+                            child,
+                            sampler,
+                            0.0 if args.no_embedding else args.embedding_mutation_rate,
+                            regime=regime,
+                        )
+
+                mark_offspring_origin(child, credit_parent, arm, changed_mix)
                 next_pop.append(child)
+
             if args.progress and (len(next_pop) % breed_tick == 0 or len(next_pop) == args.population):
                 print(f"  breed {len(next_pop)}/{args.population}", end="\r", flush=True)
+
         breed_seconds = time.perf_counter() - tb
         if args.progress:
-            print(" " * 48, end="\r")
+            print(" " * 72, end="\r")
+        op_summary = "/".join(f"{a}:{operator_counts[a]}" for a in operator_arms)
         print(
             f"gen={generation}: breed={breed_seconds:.2f}s "
             f"mut(local/bal/explore)={mutation_regime_counts['local']}/"
             f"{mutation_regime_counts['balanced']}/{mutation_regime_counts['explore']} "
-            f"rows_changed={mutation_rows_changed} hof_inject={hof_injected} "
-            f"hof_parent_uses={hof_parent_uses} hof_admit={hof_admitted} hof_replace={hof_replaced}", flush=True,
+            f"rows_changed={mutation_rows_changed} mix_rows={mixed_rows} "
+            f"link={len(linkage_model.modules)} qd={len(qd_grid)} qd_inject={qd_injected} "
+            f"hof_inject={hof_injected} hof_parent_uses={hof_parent_uses} "
+            f"qd_parent_uses={qd_parent_uses} ops[{op_summary}] "
+            f"hof_admit={hof_admitted} hof_replace={hof_replaced}",
+            flush=True,
         )
 
         if args.checkpoint and args.checkpoint_every > 0 and (
             (generation + 1) % args.checkpoint_every == 0
         ):
             tc = time.perf_counter()
+            if args.current_save:
+                save_genome(args.current_save, champion, generation)
             save_checkpoint(
                 args.checkpoint, generation + 1, next_pop, best_ever,
                 history, sampler, args, hof_archive,
@@ -5787,6 +6438,8 @@ def evolve(args) -> Genome:
             print(f"checkpoint: saved {args.checkpoint} ({time.perf_counter()-tc:.2f}s)", flush=True)
         population = next_pop
 
+    if args.current_save and args.generations > start_generation:
+        save_genome(args.current_save, champion, args.generations - 1)
     if args.checkpoint:
         save_checkpoint(args.checkpoint, args.generations, population, best_ever, history, sampler, args, hof_archive)
     if history and not args.no_plot:
@@ -5847,7 +6500,7 @@ def self_test() -> None:
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=("cpu", "mps"), default="mps" if torch.backends.mps.is_available() else "cpu")
+    ap.add_argument("--backend", choices=("cpu", "mps"), default="mps" if torch is not None and torch.backends.mps.is_available() else "cpu")
     ap.add_argument("--local-corpus", default="github-code.txt")
     ap.add_argument("--corpus-chunks", type=int, default=65536*4)
     ap.add_argument("--min-chunk", type=int, default=96)
@@ -5865,19 +6518,34 @@ def parse_args():
         help="minimum mean Spearman gain on overlapping case slots that resets stagnation",
     )
     ap.add_argument("--cases", type=int, default=4)
-    ap.add_argument("--samples", type=int, default=40)
+    ap.add_argument("--samples", type=int, default=50)
     ap.add_argument("--max-noise", type=float, default=0.35)
     ap.add_argument("--population", type=int, default=450)
     ap.add_argument("--rules", type=int, default=1500)
     ap.add_argument("--elites", type=int, default=40)
-    ap.add_argument("--hof-size", type=int, default=24, help="rolling elite-of-elites archive capacity")
-    ap.add_argument("--hof-candidates", type=int, default=8, help="top current genomes considered for HoF admission each generation")
-    ap.add_argument("--hof-inject", type=int, default=2, help="exact archived champions injected into each next population")
+    ap.add_argument("--hof-size", type=int, default=16384, help="rolling elite-of-elites archive capacity")
+    ap.add_argument("--hof-eval", type=int, default=128, help="random archive evaluation budget per generation; 0 disables archive evaluation")
+    ap.add_argument("--hof-candidates", type=int, default=1, help="top current genomes considered for HoF admission each generation")
+    ap.add_argument("--hof-inject", type=int, default=4, help="freshly evaluated archived champions injected into each next population")
     ap.add_argument("--hof-parent-rate", type=float, default=0.12, help="probability each selected parent comes from the HoF")
-    ap.add_argument("--hof-history-cases", type=int, default=32, help="maximum rolling case scores retained per HoF entry")
+    ap.add_argument("--hof-history-cases", type=int, default=128, help="maximum rolling case scores retained per HoF entry")
     ap.add_argument("--hof-current-weight", type=float, default=0.70, help="weight of current rolling-set fitness in HoF ranking")
     ap.add_argument("--hof-min-distance", type=float, default=0.015, help="minimum structural distance for a distinct HoF lineage")
-    ap.add_argument("--tournament", type=int, default=16)
+    ap.add_argument("--plateau-window", type=int, default=100, help="compare two adjacent windows of champion fitness")
+    ap.add_argument("--plateau-min-gain", type=float, default=0.0002, help="minimum long-window mean Spearman gain")
+    ap.add_argument("--plateau-immigrants", type=float, default=0.04, help="maximum additional immigrant fraction under stagnation")
+    ap.add_argument("--specialist-rate", type=float, default=0.25, help="parent selection probability using case-wise epsilon lexicase; 0 disables")
+    ap.add_argument("--qd-bins", type=int, default=6, help="bins per MAP-Elites-style descriptor axis")
+    ap.add_argument("--qd-inject", type=int, default=24, help="diverse evaluated QD cells preserved into the next population")
+    ap.add_argument("--qd-parent-rate", type=float, default=0.08, help="probability of selecting a parent directly from a populated QD cell")
+    ap.add_argument("--linkage-refresh", type=int, default=8, help="relearn sparse rule linkage every N generations")
+    ap.add_argument("--linkage-elites", type=int, default=96, help="top evaluated genomes used to learn linkage")
+    ap.add_argument("--linkage-loci", type=int, default=128, help="maximum important rule positions considered by linkage learning")
+    ap.add_argument("--linkage-modules", type=int, default=96, help="maximum learned linkage modules kept")
+    ap.add_argument("--linkage-max-module", type=int, default=16, help="maximum rules transplanted by one learned module")
+    ap.add_argument("--operator-ucb", type=float, default=3.0e-4, help="UCB exploration scale for adaptive reproduction operators")
+    ap.add_argument("--operator-epsilon", type=float, default=0.04, help="uniform exploration probability for adaptive reproduction operators")
+    ap.add_argument("--tournament", type=int, default=8)
     ap.add_argument("--crossover-rate", type=float, default=0.45)
     ap.add_argument("--mutation-rate", type=float, default=0.90)
     ap.add_argument("--immigrant-rate", type=float, default=0.01)
@@ -5885,6 +6553,14 @@ def parse_args():
     ap.add_argument("--embedding-crossover-rate", type=float, default=EMBEDDING_CROSSOVER_RATE)
     ap.add_argument("--no-embedding", action="store_true")
     ap.add_argument("--ridge-lambda", type=float, default=RIDGE_LAMBDA)
+    ap.add_argument(
+        "--readout-mode", choices=("pairwise-all", "legacy-holdout"), default="pairwise-all",
+        help="pairwise-all uses every trajectory for sparse rank-ridge and Spearman; legacy-holdout restores the old 1/3-vs-2/3 split",
+    )
+    ap.add_argument(
+        "--rank-max-features", type=int, default=PAIRWISE_RANK_MAX_FEATURES,
+        help="maximum rule columns kept by pairwise rank screening before the exact dual solve",
+    )
     ap.add_argument("--max-output", type=int, default=MAX_OUTPUT)
     ap.add_argument(
         "--mps-genome-batch", type=int, default=512,
@@ -5916,6 +6592,7 @@ def parse_args():
     )
     ap.add_argument("--generations", type=int, default=1_000_000)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--current-save", default="latest_minimal_gp.json", help="latest evaluated champion, independent of the best-observed record")
     ap.add_argument("--save", default="best_minimal_gp.json", help="best-ever genome JSON")
     ap.add_argument("--checkpoint", default="minimal_gp_checkpoint.npz", help="full resumable population checkpoint")
     ap.add_argument("--checkpoint-every", type=int, default=10, help="save full checkpoint every N generations; 0 disables periodic saves")
@@ -5923,7 +6600,7 @@ def parse_args():
     ap.add_argument("--history-csv", default="fitness_history.csv")
     ap.add_argument("--plot-prefix", default="training")
     ap.add_argument("--plot-every", type=int, default=1)
-    ap.add_argument("--plot-window", type=int, default=75)
+    ap.add_argument("--plot-window", type=int, default=200)
     ap.add_argument("--no-plot", action="store_true")
     ap.set_defaults(progress=True)
     ap.add_argument("--progress", dest="progress", action="store_true", help="show initialization/evaluation progress (default)")
