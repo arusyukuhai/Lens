@@ -1,6 +1,5 @@
-import random, importlib.util
-spec=importlib.util.spec_from_file_location('v56','/mnt/data/minimal_replacer_gp_embedding_plot_v56.py')
-m=importlib.util.module_from_spec(spec); import sys; sys.modules['v56']=m; spec.loader.exec_module(m)
+import random
+import main as m
 B=m._GP_INDEX_TOKENS
 
 def perm():

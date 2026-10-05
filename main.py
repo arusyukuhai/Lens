@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Replacement-rule genetic programming core (v57 bounded-HoF / plateau-aware selection).
+Replacement-rule genetic programming core (v60.2 inference-Pareto, log-uniform string mutation).
 
-v57: random HoF budget with case-identity-safe reuse; long-window plateau
-pressure; epsilon-lexicase parent lane; smaller tournaments; zero-column exact
-ridge optimization; latest-champion export; less frequent rendering.
+v60.2 changes the string-side mutation radius to round(exp(uniform(0, log(k))))
+for k known-corrupted loci. The scheduled focus locus is guaranteed to be included
+without collapsing the radius to one. v60 adds a bounded string-side genetic inference phase. A small shared candidate
+population edits only synthetically corrupted byte positions and is selected by
+the current Replace ensemble. Per-genome final-pool recovery accuracy becomes a
+second NSGA-II-style Pareto objective beside Spearman. The checked revision uses
+ensemble-only inner search + one full-population final scoring pass, reuses MPS
+rule/index packs across inner generations, fixes tie handling/GC roots/corpus edge
+cases, and keeps a conservative inference-work cap well below the requested ~2x
+wall-time envelope. v57/v59 ranking and Metal rewrite kernels are retained.
 CPU path can run without PyTorch. Metal rewrite kernels are unchanged.
 
 Original engine lineage (v51 len1-word-prefix v50 len1-direct v45 match-bitset v38 literal-3gram-bloom v55 rule-pack-memo v56 recode-pack-memo v33 dual-anchor-bloom v31 narrow-state wc1-inplace fused-hash v30 wc1-general-fast v28 inplace-literal anchor-guided score-reuse direct-diff variable-length GPU-index incremental-candidate rolling-HoF rolling-evaluation bounded-workload compacting-GC precise-mutation/nonexpanding cooperative MPS), ported from
@@ -41,7 +48,7 @@ GPU path:
   jointly build the exact candidate bitmap, search match starts, emit replacements,
   compare outputs, and hash states; lane 0 only controls ordered rule execution.
 
-The GPU helper file `gpu_replace_persistent_v2.py` must be beside this script.
+The GPU helper file `gpu_replace_persistent.py` must be beside this script.
 Raw noisy bytes are mapped through each genome's evolved injective embedding before rewrite evaluation.
 
 v19 uses a compacting Global Rule Pool: immutable pattern/replacement structures
@@ -164,6 +171,13 @@ class Genome:
     # shared copy-on-write between offspring; storing fitted weights on Rule
     # would make one genome's evaluation overwrite its siblings/parents.
     readout_weights: List[float] = field(default_factory=list)
+    # v60: second objective. Accuracy is measured only on the bytes deliberately
+    # corrupted for the string-side inference task, so unchanged context cannot
+    # inflate the score. Pareto rank/crowding are runtime selection metadata.
+    inference_accuracy: float = float("nan")
+    inference_full_accuracy: float = float("nan")
+    pareto_rank: int = 2_147_483_647
+    pareto_crowding: float = 0.0
     # v29: evaluator-local immutable host-pack cache. Offspring inherit these
     # arrays by reference and mark only structurally touched rows dirty. This
     # avoids rescanning ~1500 Python Rule objects for every new child each gen.
@@ -224,6 +238,10 @@ def clone_genome_shallow(g: Genome) -> Genome:
         fitness=float(g.fitness),
         case_scores=list(g.case_scores),
         readout_weights=list(g.readout_weights),
+        inference_accuracy=float(g.inference_accuracy),
+        inference_full_accuracy=float(g.inference_full_accuracy),
+        pareto_rank=int(g.pareto_rank),
+        pareto_crowding=float(g.pareto_crowding),
         _eval_case_serials=g._eval_case_serials,
     )
     return _inherit_genome_pack_cache(g, out)
@@ -242,6 +260,10 @@ def clone_genome_deep(g: Genome) -> Genome:
         fitness=float(g.fitness),
         case_scores=list(g.case_scores),
         readout_weights=list(g.readout_weights),
+        inference_accuracy=float(g.inference_accuracy),
+        inference_full_accuracy=float(g.inference_full_accuracy),
+        pareto_rank=int(g.pareto_rank),
+        pareto_crowding=float(g.pareto_crowding),
         _eval_case_serials=g._eval_case_serials,
     )
     return _inherit_genome_pack_cache(g, out)
@@ -627,7 +649,7 @@ def load_local_corpus(path: str, limit: int, min_len: int, max_len: int) -> List
         parts = raw.splitlines()
     for part in parts:
         part = part.strip(b"\r\n")
-        if len(part) < min_len or len(part) >= max_len:
+        if len(part) < min_len:
             continue
         if max_len > 0 and len(part) > max_len:
             start = random.randrange(0, len(part) - max_len + 1)
@@ -659,7 +681,7 @@ def stream_github_code(limit: int, min_len: int, max_len: int) -> List[bytes]:
         if not isinstance(text, str):
             continue
         b = text.encode("utf-8", errors="ignore")
-        if len(b) < min_len or len(part) >= max_len:
+        if len(b) < min_len:
             continue
         if max_len > 0 and len(b) > max_len:
             start = random.randrange(0, len(b) - max_len + 1)
@@ -668,6 +690,22 @@ def stream_github_code(limit: int, min_len: int, max_len: int) -> List[bytes]:
         if len(chunks) >= limit:
             break
     return chunks
+
+
+def effective_trajectory_span(args, corpus: Sequence[bytes]) -> int:
+    """Maximum raw row length the evaluator must be able to hold.
+
+    ``0`` means "unbounded" for --max-chunk / --trajectory-len.  The previous
+    ``min(max_chunk, trajectory_len)`` turned an unbounded max_chunk=0 into a
+    one-token MPS allocation, even when trajectory_len was positive.
+    """
+    max_chunk = int(args.max_chunk)
+    trajectory_len = int(args.trajectory_len)
+    if trajectory_len > 0:
+        return max(1, min(max_chunk, trajectory_len) if max_chunk > 0 else trajectory_len)
+    if max_chunk > 0:
+        return max(1, max_chunk)
+    return max(1, max((len(c) for c in corpus), default=1))
 
 
 def load_corpus(args) -> List[bytes]:
@@ -709,6 +747,16 @@ class CorpusSampler:
                 start = random.randrange(0, len(c) - n + 1)
                 self.ngrams.append(list(c[start : start + n]))
 
+        # v60.1 inference proposal model.  The old string GA proposed replacement
+        # bytes mostly from the global byte histogram.  With ~10 corrupted loci
+        # and only a few dozen inner evaluations this made exact recovery far too
+        # sparse: a correct byte often never entered the candidate pool at all.
+        # Build a tiny 256x256 transition table from the already-sampled n-grams.
+        # This costs ~256 KiB and no corpus rescan, while allowing mutation to ask
+        # "which byte is plausible between these two neighbours?" without ever
+        # consulting the hidden clean target.
+        self._rebuild_context_model()
+
         self._byte_buffer_size = max(4096, int(byte_buffer_size))
         self._byte_buffer = np.empty(0, dtype=np.uint16)
         self._byte_pos = 0
@@ -716,6 +764,17 @@ class CorpusSampler:
         # Cache the 256 unused latent coordinates per embedding instead of
         # rebuilding a set/list for every 3% exploratory literal.
         self._unused_embedding_cache: dict[tuple[int, ...], tuple[int, ...]] = {}
+
+    def _rebuild_context_model(self) -> None:
+        self._context_pairs = np.ones((INPUT_BYTE_COUNT, INPUT_BYTE_COUNT), dtype=np.float64) * 0.25
+        for ng in self.ngrams:
+            if len(ng) < 2:
+                continue
+            a = np.asarray(ng[:-1], dtype=np.int16)
+            b = np.asarray(ng[1:], dtype=np.int16)
+            np.add.at(self._context_pairs, (a, b), 1.0)
+        self._context_row_sum = self._context_pairs.sum(axis=1)
+        self._context_col_sum = self._context_pairs.sum(axis=0)
 
     def _refill_bytes(self) -> None:
         self._byte_buffer = np.random.choice(
@@ -729,6 +788,34 @@ class CorpusSampler:
         v = int(self._byte_buffer[self._byte_pos])
         self._byte_pos += 1
         return v
+
+    def contextual_byte(self, sequence: Sequence[int], pos: int, avoid: int | None = None) -> int:
+        """Sample a corpus-plausible raw byte from immediate left/right context.
+
+        This is a proposal distribution only.  It never sees the clean inference
+        target; the Replacer score still decides which candidate survives.
+        """
+        pos = int(pos)
+        weights = self.byte_prob.astype(np.float64, copy=True)
+        if pos > 0:
+            left = int(sequence[pos - 1])
+            if 0 <= left < INPUT_BYTE_COUNT:
+                weights *= self._context_pairs[left, :] / max(1.0, float(self._context_row_sum[left]))
+        if pos + 1 < len(sequence):
+            right = int(sequence[pos + 1])
+            if 0 <= right < INPUT_BYTE_COUNT:
+                weights *= self._context_pairs[:, right] / max(1.0, float(self._context_col_sum[right]))
+        if avoid is not None and 0 <= int(avoid) < INPUT_BYTE_COUNT:
+            weights[int(avoid)] = 0.0
+        total = float(weights.sum())
+        if not math.isfinite(total) or total <= 1.0e-300:
+            weights = self.byte_prob.astype(np.float64, copy=True)
+            if avoid is not None and 0 <= int(avoid) < INPUT_BYTE_COUNT:
+                weights[int(avoid)] = 0.0
+            total = float(weights.sum())
+        if total <= 0.0:
+            return (int(avoid or 0) + 1) & 255
+        return int(np.random.choice(INPUT_BYTE_COUNT, p=weights / total))
 
     def _unused_codes(self, embedding: Sequence[int]) -> tuple[int, ...]:
         key = tuple(map(int, embedding))
@@ -1158,9 +1245,7 @@ def stabilize_genome_nonexpanding(g: Genome, sampler: CorpusSampler) -> int:
         changed += 1
     if changed:
         _mark_genome_pack_rows(g, changed_rows)
-        g.fitness = float("-inf")
-        g.case_scores = []
-        g.readout_weights = []
+        _clear_evaluation_state(g)
     return changed
 
 
@@ -1421,9 +1506,7 @@ def mutate_genome_global(
     count = log_uniform_mutation_count(n)
     ids = pick_guided_mutation_targets(g, count)
     changed = _mutate_selected_rules(g, ids, sampler)
-    g.fitness = float("-inf")
-    g.case_scores = []
-    g.readout_weights = []
+    _clear_evaluation_state(g)
     return changed
 
 
@@ -1501,9 +1584,7 @@ def mutate_genome(
     if regime == "balanced" and embedding_mutation_rate > 0.0:
         mutate_embedding(g, embedding_mutation_rate)
 
-    g.fitness = float("-inf")
-    g.case_scores = []
-    g.readout_weights = []
+    _clear_evaluation_state(g)
     return changed
 
 
@@ -1542,10 +1623,14 @@ def crossover(
 
 
 def _clear_evaluation_state(g: Genome) -> None:
-    """Invalidate only score/readout state after a structural edit."""
+    """Invalidate score/readout and v60 inference/Pareto state after a structural edit."""
     g.fitness = float("-inf")
     g.case_scores = []
     g.readout_weights = []
+    g.inference_accuracy = float("nan")
+    g.inference_full_accuracy = float("nan")
+    g.pareto_rank = 2_147_483_647
+    g.pareto_crowding = 0.0
     g._eval_case_serials = ()
 
 
@@ -1855,7 +1940,7 @@ def build_qd_grid(population: Sequence[Genome], bins: int = 6) -> dict[tuple[int
             continue
         key = qd_descriptor(g, bins)
         old = grid.get(key)
-        if old is None or g.fitness > old.fitness:
+        if old is None or pareto_better(g, old):
             grid[key] = g
     return grid
 
@@ -1898,12 +1983,17 @@ class CaseSelector:
             candidates = candidates[scores >= scores.max() - self.epsilon[case]]
             if len(candidates) <= 1:
                 break
-        return self.population[int(random.choice(candidates))]
+        # Preserve lexicase's case-specialist pressure, but when several
+        # candidates survive let the second (inference) objective participate in
+        # the tie-break instead of choosing a dominated genome uniformly.
+        if len(candidates) == 1:
+            return self.population[int(candidates[0])]
+        return min((self.population[int(i)] for i in candidates), key=pareto_sort_key)
 
 
 def tournament(pop: Sequence[Genome], k: int) -> Genome:
     ids = random.sample(range(len(pop)), k=min(k, len(pop)))
-    return max((pop[i] for i in ids), key=lambda g: g.fitness)
+    return min((pop[i] for i in ids), key=pareto_sort_key)
 
 
 # ---------------------------------------------------------------------------
@@ -4374,6 +4464,7 @@ class MpsPopulationEvaluator:
         # Exact duplicate-input memoization. Duplicate trajectory rows retain
         # separate regression observations but share one structural GPU result.
         self._sample_alias = np.arange(self.sample_count, dtype=np.int32)
+        self.active_sample_count = self.sample_count
         self.unique_input_count = self.sample_count
         self._lib = _get_mps_trajectory_lib()
         self.last_pack_seconds = 0.0
@@ -4465,14 +4556,18 @@ class MpsPopulationEvaluator:
             print(msg, flush=True)
 
     def set_inputs(self, inputs: Sequence[Sequence[int]]) -> None:
-        if len(inputs) != self.sample_count:
-            raise ValueError(f"expected {self.sample_count} samples, got {len(inputs)}")
+        # v60 permits a smaller active prefix for the bounded inference GA.  The
+        # large training scratch buffers stay allocated, but kernels launch only
+        # active_sample_count trajectories, avoiding padded zero-work threadgroups.
+        active = len(inputs)
+        if active <= 0 or active > self.sample_count:
+            raise ValueError(f"expected 1..{self.sample_count} samples, got {active}")
         host = torch.zeros((self.sample_count, self.raw_stride), dtype=torch.int32)
-        lengths = torch.empty(self.sample_count, dtype=torch.int32)
+        lengths = torch.zeros(self.sample_count, dtype=torch.int32)
         counts = np.ones(INPUT_BYTE_COUNT, dtype=np.float64)
         pair_counts = np.zeros((INPUT_BYTE_COUNT, INPUT_BYTE_COUNT), dtype=np.int64)
         triple_counts: dict[int, int] = {}
-        alias = np.arange(self.sample_count, dtype=np.int32)
+        alias = np.arange(active, dtype=np.int32)
         seen_inputs: dict[tuple[int, ...], int] = {}
         for j, row in enumerate(inputs):
             n = len(row)
@@ -4526,7 +4621,8 @@ class MpsPopulationEvaluator:
         self._raw_pair_counts = pair_counts
         self._raw_triple_counts = triple_counts
         self._sample_alias = alias
-        self.unique_input_count = int(np.sum(alias == np.arange(self.sample_count, dtype=np.int32)))
+        self.active_sample_count = int(active)
+        self.unique_input_count = int(np.sum(alias == np.arange(active, dtype=np.int32)))
 
     @staticmethod
     def _inverse_embedding(embedding: Sequence[int]):
@@ -5099,27 +5195,43 @@ class MpsPopulationEvaluator:
         self,
         genomes: Sequence[Genome],
         pool_live_genomes: Sequence[Genome] | None = None,
+        prepacked=None,
     ):
         total = len(genomes)
         if total <= 0:
             return []
+        # Inner string inference evaluates the exact same model subset for
+        # several candidate generations; only raw inputs change.  Rebuilding and
+        # re-uploading the rule/index pack on every inner round is pure overhead.
+        # A prepacked tuple is safe as long as the genome sequence is unchanged
+        # and no other _pack_population call occurs between uses.
+        if prepacked is None:
+            packed = self._pack_population(genomes, pool_live_genomes=pool_live_genomes)
+        else:
+            packed = prepacked
         (
             tokens_d, meta_d, rule_ids_d, emb_d, head1_d, next1_d,
             pair_keys_d, pair_heads_d, next2_d, always_d, pair_cap,
-        ) = self._pack_population(genomes, pool_live_genomes=pool_live_genomes)
+        ) = packed
         out = []
         profile_chunks = []
         stat_chunks = []
         dispatch_t0 = time.perf_counter()
+        n_samples = int(self.active_sample_count)
 
         for chunk_start in range(0, total, self.result_chunk):
             chunk_count = min(self.result_chunk, total - chunk_start)
-            self.feature_stage[:chunk_count].zero_()
+            # Kernels pack active samples tightly using n_samples as the stride.
+            # Clear/read the matching flat prefix rather than the full training
+            # sample dimension.
+            self.feature_stage.reshape(-1)[:chunk_count * n_samples * self.rule_count].zero_()
+            self.stat_stage.reshape(-1)[:chunk_count * n_samples * 4].zero_()
+            self.profile_stage.reshape(-1)[:chunk_count * n_samples * 15].zero_()
 
             for local_start in range(0, chunk_count, self.genome_batch):
                 gcount = min(self.genome_batch, chunk_count - local_start)
                 global_start = chunk_start + local_start
-                jobs = gcount * self.sample_count
+                jobs = gcount * n_samples
                 self._lib.evaluate_gp_population_v17_i32(
                     self.buffer_a, self.buffer_b,
                     self.raw_inputs, self.raw_lengths,
@@ -5130,7 +5242,7 @@ class MpsPopulationEvaluator:
                     self.feature_stage.reshape(-1), self.stat_stage.reshape(-1),
                     self.profile_stage.reshape(-1), self.seen,
                     int(self.capacity), int(self.max_output), int(self.raw_stride),
-                    int(self.sample_count), int(self.rule_count), int(gcount),
+                    int(n_samples), int(self.rule_count), int(gcount),
                     int(global_start), int(local_start), int(self.max_rounds),
                     int(pair_cap), self.literal_positions, self.wildcard_aux,
                     self._anchors_d[:total].reshape(-1),
@@ -5140,11 +5252,14 @@ class MpsPopulationEvaluator:
 
             # One synchronization per result chunk.  Kernel work before this is
             # queued asynchronously; the copy waits only after many threadgroups.
-            fh = self.feature_stage[:chunk_count].cpu().numpy()
-            sh = self.stat_stage[:chunk_count].cpu().numpy()
-            ph = self.profile_stage[:chunk_count].cpu().numpy()
-            if self.unique_input_count < self.sample_count:
-                dup = np.flatnonzero(self._sample_alias != np.arange(self.sample_count, dtype=np.int32))
+            fh = (self.feature_stage.reshape(-1)[:chunk_count * n_samples * self.rule_count]
+                  .reshape(chunk_count, n_samples, self.rule_count).cpu().numpy())
+            sh = (self.stat_stage.reshape(-1)[:chunk_count * n_samples * 4]
+                  .reshape(chunk_count, n_samples, 4).cpu().numpy())
+            ph = (self.profile_stage.reshape(-1)[:chunk_count * n_samples * 15]
+                  .reshape(chunk_count, n_samples, 15).cpu().numpy())
+            if self.unique_input_count < n_samples:
+                dup = np.flatnonzero(self._sample_alias != np.arange(n_samples, dtype=np.int32))
                 if dup.size:
                     reps = self._sample_alias[dup]
                     fh[:, dup, :] = fh[:, reps, :]
@@ -5441,6 +5556,815 @@ def evaluate_genome(
 
 
 # ---------------------------------------------------------------------------
+# v60 string-side inference objective + Pareto selection
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class InferenceCase:
+    clean: List[int]
+    noisy: List[int]
+    mutable_positions: Tuple[int, ...]
+    source_index: int
+    serial: int
+
+
+class RollingInferenceSet:
+    """Small held-apart corruption set used by the inner string GA.
+
+    Only the positions deliberately corrupted here may be changed by inference.
+    Cases rotate independently from the Spearman trajectories so the second
+    objective cannot merely memorize the current rank-fitting batch.
+    """
+    def __init__(self, corpus: Sequence[bytes], sampler: CorpusSampler,
+                 cases: int, span: int, noise_rate: float,
+                 excluded_sources: Sequence[int] | None = None):
+        if not corpus:
+            raise ValueError("empty corpus")
+        self.corpus = corpus
+        self.sampler = sampler
+        self.case_count = max(1, min(int(cases), len(corpus)))
+        # Respect the evaluator's raw stride even in tiny smoke configurations;
+        # forcing a 16-byte minimum could create inference rows longer than an
+        # explicitly smaller --trajectory-len/--max-chunk MPS allocation.
+        self.span = max(1, int(span))
+        self.noise_rate = min(0.50, max(1.0 / self.span, float(noise_rate)))
+        self._serial = 0
+        excluded = set(map(int, excluded_sources or ()))
+        eligible = [i for i in range(len(corpus)) if i not in excluded]
+        source = eligible if len(eligible) >= self.case_count else list(range(len(corpus)))
+        chosen = random.sample(source, self.case_count)
+        self.slots = [self._make_case(i) for i in chosen]
+
+    def _make_case(self, source_index: int) -> InferenceCase:
+        base = bytes(self.corpus[int(source_index)])
+        if len(base) > self.span:
+            start = random.randrange(0, len(base) - self.span + 1)
+            base = base[start:start + self.span]
+        clean = list(base)
+        n = len(clean)
+        if n <= 0:
+            clean = [0]
+            n = 1
+        k = max(1, min(n, int(round(self.noise_rate * n))))
+        positions = tuple(sorted(random.sample(range(n), k)))
+        noisy = clean.copy()
+        for pos in positions:
+            old = noisy[pos]
+            v = self.sampler.byte()
+            tries = 0
+            while v == old and tries < 16:
+                v = self.sampler.byte()
+                tries += 1
+            if v == old:
+                v = (old + 1) & 255
+            noisy[pos] = int(v)
+        serial = self._serial
+        self._serial += 1
+        return InferenceCase(clean, noisy, positions, int(source_index), int(serial))
+
+    def rotate(self, slot: int, excluded_sources: Sequence[int] | None = None) -> Tuple[int, int]:
+        slot = int(slot) % self.case_count
+        occupied = {c.source_index for i, c in enumerate(self.slots) if i != slot}
+        excluded = set(map(int, excluded_sources or ()))
+        candidates = [i for i in range(len(self.corpus))
+                      if i not in occupied and i not in excluded]
+        if not candidates:
+            candidates = [i for i in range(len(self.corpus)) if i not in occupied]
+        if not candidates:
+            candidates = list(range(len(self.corpus)))
+        old = self.slots[slot].serial
+        self.slots[slot] = self._make_case(random.choice(candidates))
+        return old, self.slots[slot].serial
+
+
+def resolve_inference_budget(sample_count: int, requested_cases: int,
+                             requested_population: int, requested_generations: int,
+                             ratio: float, genome_count: int | None = None,
+                             outer_evaluated_genomes: int | None = None,
+                             ensemble_size: int | None = None) -> Tuple[int, int, int, int]:
+    """Bound inner inference work in *full-population trajectory equivalents*.
+
+    v60 originally budgeted only ``cases * population * generations`` and then
+    evaluated every outer genome on every inner generation.  That understated
+    wall-clock risk when outer score reuse made only a fraction of genomes need
+    normal evaluation.  The checked version searches with only the voting
+    ensemble and performs one full-population scoring pass on the final candidate
+    pool.  Its approximate equivalent work is therefore
+
+        cases * population * (1 + generations * ensemble / genome_count).
+
+    ``outer_evaluated_genomes`` further scales the allowance when the normal
+    evaluator reused many genomes.  The 0.85 hard ratio is retained as a safety
+    ceiling; tiny smoke configurations keep a small floor so inference remains
+    executable at all.  The returned ``work`` is the ceiling of this equivalent
+    trajectory count, not raw model×trajectory jobs.
+    """
+    sample_count = max(1, int(sample_count))
+    n_genomes = max(1, int(genome_count) if genome_count is not None else 1)
+    ensemble = n_genomes if ensemble_size is None else max(1, min(n_genomes, int(ensemble_size)))
+    outer_n = n_genomes if outer_evaluated_genomes is None else max(1, min(n_genomes, int(outer_evaluated_genomes)))
+
+    hard_ratio = min(0.85, max(0.05, float(ratio)))
+    outer_fraction = outer_n / float(n_genomes)
+    budget = max(4.0, sample_count * hard_ratio * outer_fraction)
+
+    # At least two candidate strings are needed for an actual GA population.
+    cases = max(1, min(int(requested_cases), max(1, sample_count // 2)))
+    generations = max(1, int(requested_generations))
+    population = max(2, int(requested_population))
+
+    def equivalent_work(c: int, p: int, g: int) -> float:
+        return float(c * p) * (1.0 + float(g) * ensemble / float(n_genomes))
+
+    # Final all-genome scoring evaluates cases*population strings in one active
+    # prefix, so it must fit in the evaluator's training sample allocation.
+    population = min(population, max(2, sample_count // cases))
+
+    # Prefer preserving several independent cases.  First reduce candidate
+    # population, then inner generations, and only then the number of cases.
+    # Recompute after each structural reduction because the active-sample bound
+    # changes with ``cases``.
+    while equivalent_work(cases, population, generations) > budget:
+        denom = cases * (1.0 + float(generations) * ensemble / float(n_genomes))
+        max_pop = int(math.floor(budget / max(1.0e-12, denom)))
+        if max_pop >= 2 and population > max_pop:
+            population = max(2, max_pop)
+            continue
+        if generations > 1:
+            generations -= 1
+            continue
+        if cases > 1:
+            cases -= 1
+            population = min(population, max(2, sample_count // cases))
+            continue
+        # With an extremely cheap/reused outer generation even 1×2×1 may exceed
+        # the nominal ratio.  Keep the minimal meaningful inference pass.
+        population = 2
+        break
+
+    actual = int(math.ceil(equivalent_work(cases, population, generations)))
+    return cases, population, generations, actual
+
+
+def _inference_recovery_accuracy(candidate: Sequence[int], case: InferenceCase) -> float:
+    pos = case.mutable_positions
+    if not pos:
+        return 1.0
+    return sum(int(candidate[i]) == int(case.clean[i]) for i in pos) / float(len(pos))
+
+
+def _inference_full_accuracy(candidate: Sequence[int], case: InferenceCase) -> float:
+    n = min(len(candidate), len(case.clean))
+    if n <= 0:
+        return 1.0
+    return sum(int(candidate[i]) == int(case.clean[i]) for i in range(n)) / float(n)
+
+
+def _propose_inference_byte(candidate: Sequence[int], pos: int, sampler: CorpusSampler) -> int:
+    """Proposal distribution uses corpus/context only; never the hidden clean byte.
+
+    v60.1 strongly prefers local corpus transitions.  The previous 72% global
+    histogram proposal effectively searched a 256-way alphabet almost blindly,
+    which made the exact-match Pareto objective stay identically zero for long
+    runs even when the scoring code itself was correct.
+    """
+    old = int(candidate[pos])
+    r = random.random()
+    if r < 0.68:
+        v = sampler.contextual_byte(candidate, int(pos), avoid=old)
+    elif r < 0.88:
+        v = sampler.byte()
+    elif r < 0.97 and len(candidate) > 1:
+        lo = max(0, int(pos) - 12)
+        hi = min(len(candidate), int(pos) + 13)
+        pool = [int(candidate[j]) for j in range(lo, hi) if j != pos and int(candidate[j]) != old]
+        v = random.choice(pool) if pool else sampler.byte()
+    else:
+        v = random.randrange(INPUT_BYTE_COUNT)
+    if v == old:
+        # Retry context first, then guarantee a real mutation.
+        v = sampler.contextual_byte(candidate, int(pos), avoid=old)
+        if v == old:
+            v = (old + 1 + random.randrange(255)) & 255
+    return int(v)
+
+
+def sample_inference_mutation_count(item_count: int) -> int:
+    """Log-uniform number of corrupted loci to mutate, in ``[1, item_count]``.
+
+    The draw is exactly the requested geometry before integer rounding::
+
+        exp(uniform(0, log(item_count)))
+
+    This keeps one/few-locus edits common while giving every scale up to a
+    whole-corruption rewrite a non-negligible chance.
+    """
+    n = max(0, int(item_count))
+    if n <= 0:
+        return 0
+    if n == 1:
+        return 1
+    draw = math.exp(random.uniform(0.0, math.log(float(n))))
+    return max(1, min(n, int(round(draw))))
+
+
+def mutate_inference_candidate(candidate: Sequence[int], positions: Sequence[int],
+                               sampler: CorpusSampler, force_changes: int = 0,
+                               focus_position: int | None = None) -> List[int]:
+    out = list(map(int, candidate))
+    if not positions:
+        return out
+    pos_list = list(map(int, positions))
+
+    if force_changes > 0:
+        count = max(1, min(len(pos_list), int(force_changes)))
+    else:
+        count = sample_inference_mutation_count(len(pos_list))
+
+    # ``focus_position`` is an exploration-scheduling hint, not a request to
+    # collapse the mutation radius to one locus.  When present, guarantee that
+    # locus is among the log-uniformly many changed genes and draw the remainder
+    # without replacement from the other known-corrupted positions.
+    focus = int(focus_position) if focus_position is not None else None
+    if focus is not None and focus in pos_list:
+        others = [p for p in pos_list if p != focus]
+        chosen = [focus]
+        if count > 1:
+            chosen.extend(random.sample(others, min(count - 1, len(others))))
+    else:
+        chosen = random.sample(pos_list, count)
+
+    for pos in chosen:
+        out[int(pos)] = _propose_inference_byte(out, int(pos), sampler)
+    return out
+
+
+def crossover_inference_candidates(a: Sequence[int], b: Sequence[int],
+                                   positions: Sequence[int]) -> List[int]:
+    out = list(map(int, a))
+    if not positions:
+        return out
+    # Coordinate-wise uniform crossover is natural because only known corrupted
+    # loci are genes; context bytes are immutable by construction.
+    for pos in positions:
+        if random.random() < 0.35:
+            out[int(pos)] = int(b[int(pos)])
+    return out
+
+
+def _dedupe_inference_genomes(genomes: Sequence[Genome], owner: int | None = None):
+    """Return structural representatives and a row map without changing semantics."""
+    if owner is None:
+        return list(genomes), np.arange(len(genomes), dtype=np.int32)
+    reps: List[Genome] = []
+    row_map = np.empty(len(genomes), dtype=np.int32)
+    buckets: dict[tuple, List[int]] = {}
+    for i, g in enumerate(genomes):
+        sig = genome_eval_signature(g, owner)
+        found = -1
+        for ri in buckets.get(sig, []):
+            if (same_genome_structure(g, reps[ri])
+                    and g.readout_weights == reps[ri].readout_weights):
+                found = ri
+                break
+        if found < 0:
+            found = len(reps)
+            reps.append(g)
+            buckets.setdefault(sig, []).append(found)
+        row_map[i] = found
+    return reps, row_map
+
+
+def _prediction_scores_from_features(genome: Genome, x: np.ndarray, baseline: np.ndarray) -> np.ndarray:
+    pred = baseline.astype(np.float64, copy=True)
+    if len(genome.readout_weights) == len(genome.rules):
+        w = np.asarray(genome.readout_weights, dtype=np.float64)
+        active = np.flatnonzero(np.abs(w) > 1.0e-12)
+        if active.size:
+            pred += x[:, active].astype(np.float64, copy=False) @ w[active]
+    return pred
+
+
+def _prepare_inference_mps_context(genomes: Sequence[Genome],
+                                   mps_evaluator: MpsPopulationEvaluator,
+                                   pool_live_genomes: Sequence[Genome] | None = None):
+    """Pack one immutable genome set once for repeated candidate evaluations."""
+    reps, row_map = _dedupe_inference_genomes(genomes, id(mps_evaluator))
+    roots = genomes if pool_live_genomes is None else pool_live_genomes
+    packer = getattr(mps_evaluator, "_pack_population", None)
+    packed = packer(reps, pool_live_genomes=roots) if callable(packer) else None
+    return reps, row_map, packed
+
+
+def evaluate_inference_candidates(genomes: Sequence[Genome], candidates: Sequence[Sequence[int]],
+                                  backend: str, max_output: int,
+                                  mps_evaluator: MpsPopulationEvaluator | None = None,
+                                  mps_context=None,
+                                  pool_live_genomes: Sequence[Genome] | None = None) -> np.ndarray:
+    """Score the same candidate strings under every genome's fitted cleanliness readout.
+
+    ``mps_context`` is a prepacked ``(representatives, row_map, packed)`` tuple.
+    Reusing it is important for the inner GA: model rules do not change between
+    candidate generations, so rebuilding the candidate index every round is a
+    pure host/GPU setup bottleneck.
+    """
+    if not genomes or not candidates:
+        return np.empty((len(genomes), len(candidates)), dtype=np.float64)
+    if backend == "mps":
+        if mps_evaluator is None:
+            raise ValueError("MPS inference requires the persistent evaluator")
+        if mps_context is None:
+            reps, row_map = _dedupe_inference_genomes(genomes, id(mps_evaluator))
+            packed = None
+        else:
+            reps, row_map, packed = mps_context
+            if len(row_map) != len(genomes):
+                raise ValueError("inference MPS context does not match genome count")
+        mps_evaluator.set_inputs(candidates)
+        feats = mps_evaluator.evaluate_population(
+            reps,
+            pool_live_genomes=(genomes if pool_live_genomes is None else pool_live_genomes),
+            prepacked=packed,
+        )
+        rep_scores = np.empty((len(reps), len(candidates)), dtype=np.float64)
+        for i, (g, (x, baseline, _stats)) in enumerate(zip(reps, feats)):
+            rep_scores[i] = _prediction_scores_from_features(g, x, baseline)
+        return rep_scores[np.asarray(row_map, dtype=np.int32)]
+
+    scores = np.empty((len(genomes), len(candidates)), dtype=np.float64)
+    for gi, g in enumerate(genomes):
+        x, baseline, _stats, _states = trajectory_features_cpu(candidates, g, max_output)
+        scores[gi] = _prediction_scores_from_features(g, x, baseline)
+    return scores
+
+
+def _row_rank01(values: np.ndarray) -> np.ndarray:
+    """Per-row average-rank normalization in [0,1], with neutral ties.
+
+    Exact ties are common early in training when no active rule distinguishes two
+    candidate strings.  Assigning ordinal ranks to tied values leaked candidate
+    list order into GA selection.  Average ranks make an all-tied row contribute
+    exactly 0.5 to every candidate instead.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("rank normalization expects a 2-D matrix")
+    m = values.shape[1]
+    if m <= 1:
+        return np.ones_like(values, dtype=np.float64)
+    out = np.empty_like(values, dtype=np.float64)
+    den = float(m - 1)
+    for i in range(values.shape[0]):
+        out[i] = (average_ranks(values[i]) - 1.0) / den
+    return out
+
+
+def _inference_elite_ids(ensemble_score: Sequence[float], elite_count: int) -> np.ndarray:
+    """Return candidate ids copied byte-for-byte into the next inner-GA generation.
+
+    Keep at least one true elite whenever a candidate population exists, but for
+    width>1 reserve at least one slot for offspring.  Stable sorting makes exact
+    score ties deterministic instead of allowing NumPy's default quicksort order
+    to change which candidate survives.
+    """
+    score = np.asarray(ensemble_score, dtype=np.float64)
+    width = int(score.size)
+    if width <= 0:
+        return np.empty(0, dtype=np.int32)
+    max_elites = 1 if width == 1 else width - 1
+    keep = min(max_elites, max(1, int(elite_count)))
+    return np.argsort(-score, kind="stable")[:keep].astype(np.int32, copy=False)
+
+
+def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInferenceSet,
+                            sampler: CorpusSampler, population_size: int, generations: int,
+                            ensemble_size: int, backend: str, max_output: int,
+                            mps_evaluator: MpsPopulationEvaluator | None = None,
+                            restore_inputs: Sequence[Sequence[int]] | None = None,
+                            case_count: int | None = None,
+                            pool_live_genomes: Sequence[Genome] | None = None,
+                            elite_count: int = 3) -> dict:
+    """Inner GA over corrupted bytes; final recovery is objective #2.
+
+    Search is shared by the strongest Spearman ensemble.  Earlier v60 code paid
+    to score *all* ~450 genomes on every inner generation even though only the
+    top ensemble votes affected candidate evolution.  This version evaluates
+    only that ensemble during the search, then performs exactly one full-population
+    pass on the final candidate pool.  Besides being substantially cheaper, this
+    matches the requested semantics more closely: the second objective is the
+    recovery accuracy of the GA's *result*, not the best accidental intermediate
+    candidate seen at any prior inner generation.
+    """
+    t0 = time.perf_counter()
+    n_genomes = len(genomes)
+    max_cases = len(inference_set.slots)
+    use_cases = max_cases if case_count is None else max(1, min(max_cases, int(case_count)))
+    cases = inference_set.slots[:use_cases]
+    psize = max(2, int(population_size))
+    rounds = max(1, int(generations))
+    if n_genomes == 0 or not cases:
+        return {
+            "seconds": 0.0, "evaluations": 0, "ensemble_accuracy": float("nan"),
+            "model_jobs": 0, "kernel_jobs": 0, "search_rounds": 0,
+            "equivalent_work": 0.0,
+        }
+
+    # Preserve training diagnostics: inference intentionally reuses the same MPS
+    # evaluator/rule pool for speed, but profiler history should still describe
+    # the outer training evaluation.  Rule-pool state itself is not rolled back.
+    diag_attrs = (
+        "last_pack_seconds", "last_pack_cache_rows", "last_pack_rebuilt_rows",
+        "last_rule_pack_memo_hits", "last_rule_pack_memo_misses",
+        "last_dispatch_seconds", "last_pool_upload_seconds", "last_pool_new_rules",
+        "last_pool_new_tokens", "last_pool_gc_seconds", "last_pool_gc_triggered",
+        "last_pool_gc_reason", "last_pool_gc_rules_before", "last_pool_gc_rules_after",
+        "last_pool_gc_tokens_before", "last_pool_gc_tokens_after",
+        "last_pool_gc_alloc_before", "last_pool_gc_alloc_after", "last_profile",
+    )
+    saved_diag = None
+    if backend == "mps" and mps_evaluator is not None:
+        saved_diag = {k: (dict(getattr(mps_evaluator, k)) if k == "last_profile"
+                          else getattr(mps_evaluator, k)) for k in diag_attrs}
+
+    candidate_pops: List[List[List[int]]] = []
+    for case in cases:
+        pop = [list(case.noisy)]
+        seen = {tuple(case.noisy)}
+        attempts = 0
+        positions = list(case.mutable_positions)
+        while len(pop) < psize:
+            # Cover corrupted loci round-robin before spending proposals on
+            # duplicates.  This turns the first population into a set of local
+            # counterfactuals instead of 11 unrelated multi-byte perturbations.
+            focus = positions[(len(pop) - 1) % len(positions)] if positions else None
+            cand = mutate_inference_candidate(
+                case.noisy, case.mutable_positions, sampler, focus_position=focus
+            )
+            key = tuple(cand)
+            if key in seen:
+                cand = mutate_inference_candidate(
+                    cand, case.mutable_positions, sampler, force_changes=1,
+                    focus_position=focus,
+                )
+                key = tuple(cand)
+            attempts += 1
+            # The gene space can be tiny in smoke tests (e.g. one corrupted
+            # byte).  Do not spin forever trying to force uniqueness.
+            if key in seen and attempts < psize * 16:
+                continue
+            seen.add(key)
+            pop.append(cand)
+        candidate_pops.append(pop)
+
+    top_ids = np.argsort(np.asarray([float(g.fitness) for g in genomes], dtype=np.float64))[::-1]
+    top_ids = top_ids[:max(1, min(len(top_ids), int(ensemble_size)))]
+    search_genomes = [genomes[int(i)] for i in top_ids]
+    roots = genomes if pool_live_genomes is None else pool_live_genomes
+
+    search_context = None
+    total_candidate_evaluations = 0
+    total_model_jobs = 0
+    total_kernel_jobs = 0
+    executed_rounds = 0
+    final_ensemble_accuracy = float("nan")
+    oracle_accuracy = float("nan")
+    selected_change_rate = float("nan")
+
+    try:
+        if backend == "mps":
+            if mps_evaluator is None:
+                raise ValueError("MPS inference requires the persistent evaluator")
+            search_context = _prepare_inference_mps_context(search_genomes, mps_evaluator, roots)
+
+        # Search phase: only the voting ensemble is required here.
+        for step in range(rounds):
+            flat = [cand for pop in candidate_pops for cand in pop]
+            search_scores = evaluate_inference_candidates(
+                search_genomes, flat, backend, max_output,
+                mps_evaluator=mps_evaluator, mps_context=search_context,
+                pool_live_genomes=roots,
+            )
+            executed_rounds += 1
+            total_candidate_evaluations += len(flat)
+            total_model_jobs += len(search_genomes) * len(flat)
+            if backend == "mps" and search_context is not None:
+                total_kernel_jobs += len(search_context[0]) * len(flat)
+            else:
+                total_kernel_jobs += len(search_genomes) * len(flat)
+
+            next_pops: List[List[List[int]]] = []
+            offset = 0
+            for case, pop in zip(cases, candidate_pops):
+                width = len(pop)
+                local = search_scores[:, offset:offset + width]
+                ensemble_score = np.mean(_row_rank01(local), axis=0)
+
+                if step + 1 < rounds:
+                    # Explicit elitist preservation for the string-side GA.
+                    # These candidates are copied unchanged; mutation/crossover
+                    # is applied only to the remaining slots.  The helper also
+                    # guarantees at least one offspring slot when width>1.
+                    elite_ids = _inference_elite_ids(ensemble_score, elite_count)
+                    elite_n = int(elite_ids.size)
+                    elites = [list(pop[int(i)]) for i in elite_ids]
+                    new_pop = [list(x) for x in elites]
+                    seen = {tuple(x) for x in new_pop}
+                    ranked_ids = np.argsort(-ensemble_score, kind="stable")
+                    parent_pool = ranked_ids[:max(elite_n, width // 2)]
+                    attempts = 0
+                    while len(new_pop) < psize:
+                        # Bias reproduction toward exact elites without ever
+                        # mutating the elite copies already stored in new_pop.
+                        if elite_n and random.random() < 0.70:
+                            p1 = pop[int(random.choice(elite_ids))]
+                        else:
+                            p1 = pop[int(random.choice(parent_pool))]
+                        if len(parent_pool) > 1 and random.random() < 0.65:
+                            p2 = pop[int(random.choice(parent_pool))]
+                            child = crossover_inference_candidates(p1, p2, case.mutable_positions)
+                        else:
+                            child = list(p1)
+                        # Systematically revisit every corrupted locus.  A small
+                        # GA population otherwise spends many generations touching
+                        # only a subset of positions, making exact recovery zero
+                        # for purely combinatorial reasons.
+                        positions = list(case.mutable_positions)
+                        child_slot = max(0, len(new_pop) - elite_n)
+                        focus = (positions[(step * max(1, psize - elite_n) + child_slot) % len(positions)]
+                                 if positions else None)
+                        child = mutate_inference_candidate(
+                            child, case.mutable_positions, sampler,
+                            focus_position=focus if random.random() < 0.88 else None,
+                        )
+                        key = tuple(child)
+                        attempts += 1
+                        if key in seen and attempts < psize * 8:
+                            continue
+                        seen.add(key)
+                        new_pop.append(child)
+                    next_pops.append(new_pop[:psize])
+                offset += width
+
+            if step + 1 >= rounds:
+                break
+            candidate_pops = next_pops
+
+        # Objective phase: one full-population evaluation of the *final* candidate
+        # pool.  Hidden clean bytes are still used only after model scoring.
+        final_flat = [cand for pop in candidate_pops for cand in pop]
+        final_context = None
+        if backend == "mps":
+            assert mps_evaluator is not None
+            # A search-pack GC can invalidate cached pack rows for genomes outside
+            # the small voting ensemble.  Repacking those rows while the evaluator
+            # still contains inference candidates would choose semantically-valid
+            # but poorly tuned anchors for future training.  Restore the outer
+            # training inputs before the one full-population pack so any rebuilt
+            # anchor/filter heuristics are selected on the real training batch.
+            if restore_inputs is not None:
+                mps_evaluator.set_inputs(restore_inputs)
+            final_context = _prepare_inference_mps_context(genomes, mps_evaluator, roots)
+        final_scores = evaluate_inference_candidates(
+            genomes, final_flat, backend, max_output,
+            mps_evaluator=mps_evaluator, mps_context=final_context,
+            pool_live_genomes=roots,
+        )
+        total_candidate_evaluations += len(final_flat)
+        total_model_jobs += n_genomes * len(final_flat)
+        if backend == "mps" and final_context is not None:
+            total_kernel_jobs += len(final_context[0]) * len(final_flat)
+        else:
+            total_kernel_jobs += n_genomes * len(final_flat)
+
+        per_case_acc = np.zeros((n_genomes, len(cases)), dtype=np.float64)
+        per_case_full = np.zeros((n_genomes, len(cases)), dtype=np.float64)
+        ensemble_case_acc: List[float] = []
+        oracle_case_acc: List[float] = []
+        selected_changed = 0.0
+        selected_total = 0
+        offset = 0
+        for ci, (case, pop) in enumerate(zip(cases, candidate_pops)):
+            width = len(pop)
+            local = final_scores[:, offset:offset + width]
+            acc = np.asarray([_inference_recovery_accuracy(c, case) for c in pop], dtype=np.float64)
+            full = np.asarray([_inference_full_accuracy(c, case) for c in pop], dtype=np.float64)
+
+            # v60.1: score *all* exactly top-rated candidates uniformly instead
+            # of np.argmax's hidden index-order tie break.  Candidate 0 is the
+            # untouched noisy string, so np.argmax made a flat/quantized readout
+            # choose "do nothing" for every genome and could pin inferBest at
+            # exactly 0.000 even when recoveries were present in the candidate
+            # pool.  Averaging over the max-score tie set is the expected accuracy
+            # of an unbiased uniform tie-break; the clean target never changes
+            # which candidates belong to that set.
+            maxima = np.max(local, axis=1, keepdims=True)
+            tie = np.isclose(local, maxima, rtol=1.0e-12, atol=1.0e-12)
+            tie_n = np.maximum(1, tie.sum(axis=1)).astype(np.float64)
+            per_case_acc[:, ci] = (tie.astype(np.float64) @ acc) / tie_n
+            per_case_full[:, ci] = (tie.astype(np.float64) @ full) / tie_n
+            oracle_case_acc.append(float(np.max(acc)) if acc.size else 0.0)
+            if width:
+                noisy_tuple = tuple(case.noisy)
+                changed_mask = np.asarray([tuple(c) != noisy_tuple for c in pop], dtype=np.float64)
+                selected_changed += float(np.sum((tie.astype(np.float64) @ changed_mask) / tie_n))
+                selected_total += int(tie.shape[0])
+
+            ensemble_local = local[top_ids]
+            ensemble_score = np.mean(_row_rank01(ensemble_local), axis=0)
+            ens_max = float(np.max(ensemble_score))
+            ens_tie = np.isclose(ensemble_score, ens_max, rtol=1.0e-12, atol=1.0e-12)
+            ensemble_case_acc.append(float(np.mean(acc[ens_tie])) if np.any(ens_tie) else 0.0)
+            offset += width
+
+        per_genome = np.mean(per_case_acc, axis=1)
+        per_genome_full = np.mean(per_case_full, axis=1)
+        for g, a, fa in zip(genomes, per_genome.tolist(), per_genome_full.tolist()):
+            g.inference_accuracy = float(a)
+            g.inference_full_accuracy = float(fa)
+        final_ensemble_accuracy = (
+            float(statistics.fmean(ensemble_case_acc)) if ensemble_case_acc else float("nan")
+        )
+        oracle_accuracy = (
+            float(statistics.fmean(oracle_case_acc)) if oracle_case_acc else float("nan")
+        )
+        selected_change_rate = (
+            float(selected_changed) / float(selected_total) if selected_total else float("nan")
+        )
+
+    finally:
+        if backend == "mps" and mps_evaluator is not None:
+            if restore_inputs is not None:
+                mps_evaluator.set_inputs(restore_inputs)
+            if saved_diag is not None:
+                for k, v in saved_diag.items():
+                    setattr(mps_evaluator, k, v)
+
+    elapsed = float(time.perf_counter() - t0)
+    equiv = total_model_jobs / float(max(1, n_genomes))
+    return {
+        "seconds": elapsed,
+        "evaluations": int(total_candidate_evaluations),
+        "ensemble_accuracy": final_ensemble_accuracy,
+        # Diagnostic only: best truth-match present anywhere in the final
+        # candidate pool.  It never participates in search or selection.  If
+        # oracle>0 while inferBest==0, the models saw a recoverable candidate but
+        # ranked it incorrectly; if both are 0, proposal/search is the bottleneck.
+        "oracle_accuracy": oracle_accuracy,
+        "selected_change_rate": selected_change_rate,
+        "mean_accuracy": float(np.mean(per_genome)) if per_genome.size else float("nan"),
+        "best_accuracy": float(np.max(per_genome)) if per_genome.size else float("nan"),
+        "model_jobs": int(total_model_jobs),
+        "kernel_jobs": int(total_kernel_jobs),
+        "search_rounds": int(executed_rounds),
+        "equivalent_work": float(equiv),
+        "active_cases": int(len(cases)),
+        "candidate_population": int(psize),
+    }
+
+
+def assign_pareto_metrics(population: Sequence[Genome]) -> List[List[int]]:
+    """NSGA-II nondominated rank + crowding for (Spearman, inference accuracy).
+
+    The first v60 implementation used nested Python loops and tiny NumPy calls for
+    every genome pair.  At population=450 that alone cost ~0.8 s/generation on
+    the audit machine.  Two objectives fit comfortably in a 450x450 boolean
+    domination matrix, so compute all pair relations in vectorized NumPy and peel
+    fronts from the resulting counts.  Semantics are identical but host overhead
+    falls by roughly two orders of magnitude.
+    """
+    n = len(population)
+    if n == 0:
+        return []
+    obj = np.asarray([
+        [float(g.fitness) if math.isfinite(float(g.fitness)) else -1.0,
+         float(g.inference_accuracy) if math.isfinite(float(g.inference_accuracy)) else -1.0]
+        for g in population
+    ], dtype=np.float64)
+
+    # dominates[i,j] iff i is no worse on every objective and strictly better on
+    # at least one.  n=450 -> ~0.2M pair cells, tiny compared with model features.
+    ge = obj[:, None, :] >= obj[None, :, :]
+    gt = obj[:, None, :] > obj[None, :, :]
+    dominates = np.all(ge, axis=2) & np.any(gt, axis=2)
+    dominated_by = dominates.sum(axis=0, dtype=np.int32)
+    remaining = np.ones(n, dtype=bool)
+
+    fronts: List[List[int]] = []
+    rank = 0
+    current = np.flatnonzero(remaining & (dominated_by == 0))
+    while current.size:
+        front = current.astype(np.int32, copy=False).tolist()
+        fronts.append(front)
+        for i in front:
+            population[i].pareto_rank = rank
+        remaining[current] = False
+        # Remove every outgoing domination edge from this whole front at once.
+        dominated_by -= dominates[current].sum(axis=0, dtype=np.int32)
+        current = np.flatnonzero(remaining & (dominated_by == 0))
+        rank += 1
+
+    # Defensive fallback: finite two-objective inputs should always be exhausted.
+    # If a future caller feeds NaNs despite the sanitization above, do not leave
+    # stale Pareto metadata on unassigned genomes.
+    if np.any(remaining):
+        tail = np.flatnonzero(remaining).astype(np.int32, copy=False).tolist()
+        fronts.append(tail)
+        for i in tail:
+            population[i].pareto_rank = rank
+
+    for front in fronts:
+        for i in front:
+            population[i].pareto_crowding = 0.0
+        if len(front) <= 2:
+            for i in front:
+                population[i].pareto_crowding = float("inf")
+            continue
+        for axis in (0, 1):
+            ids = sorted(front, key=lambda i: obj[i, axis])
+            lo, hi = float(obj[ids[0], axis]), float(obj[ids[-1], axis])
+            span = hi - lo
+            # A constant objective carries no diversity information.  Marking
+            # arbitrary first/last rows as infinite crowding here used to bias
+            # selection whenever inference accuracy tied (very common because it
+            # is a discrete recovery fraction, and always true under
+            # --no-inference).  Skip the axis entirely when its span is zero.
+            if span <= 1.0e-15:
+                continue
+
+            # Recovery accuracy is intentionally discrete, so several genomes can
+            # share an exact boundary value.  Give every true min/max boundary
+            # point the same NSGA-II protection instead of whichever equal-valued
+            # row happened to sort first or last.
+            eps = max(1.0e-15, abs(span) * 1.0e-12)
+            for i in ids:
+                v = float(obj[i, axis])
+                if abs(v - lo) <= eps or abs(v - hi) <= eps:
+                    population[i].pareto_crowding = float("inf")
+
+            for k in range(1, len(ids) - 1):
+                gi = population[ids[k]]
+                if not math.isinf(gi.pareto_crowding):
+                    gi.pareto_crowding += float((obj[ids[k + 1], axis] - obj[ids[k - 1], axis]) / span)
+    return fronts
+
+
+def pareto_sort_key(g: Genome):
+    inf_acc = float(g.inference_accuracy) if math.isfinite(float(g.inference_accuracy)) else -1.0
+    crowd = float(g.pareto_crowding)
+    return (int(g.pareto_rank), -crowd, -float(g.fitness), -inf_acc)
+
+
+def pareto_better(a: Genome, b: Genome) -> bool:
+    return pareto_sort_key(a) < pareto_sort_key(b)
+
+
+def choose_pareto_knee(population: Sequence[Genome]) -> Genome:
+    front = [g for g in population if int(g.pareto_rank) == 0]
+    if not front:
+        return max(population, key=lambda g: g.fitness)
+    f = np.asarray([g.fitness for g in front], dtype=np.float64)
+    a = np.asarray([g.inference_accuracy for g in front], dtype=np.float64)
+    fr = max(1.0e-12, float(f.max() - f.min()))
+    ar = max(1.0e-12, float(a.max() - a.min()))
+    fn = (f - f.min()) / fr
+    an = (a - a.min()) / ar
+    dist = (1.0 - fn) ** 2 + (1.0 - an) ** 2
+    return front[int(np.argmin(dist))]
+
+
+def select_outer_elites(population: Sequence[Genome], elite_count: int) -> List[Genome]:
+    """Choose genomes copied structurally unchanged into the next generation.
+
+    NSGA-II crowding normally protects objective extremes, but make that guarantee
+    explicit: with enough elite slots, preserve the Pareto knee plus the best
+    Spearman and best inference individuals, then fill the remaining slots in
+    normal Pareto order.  This is *survivor elitism*, independent of HoF/QD.
+    """
+    if not population:
+        return []
+    keep = max(1, min(int(elite_count), len(population)))
+    ordered = sorted(population, key=pareto_sort_key)
+    inference_best = max(
+        population,
+        key=lambda g: float(g.inference_accuracy)
+        if math.isfinite(float(g.inference_accuracy)) else -1.0,
+    )
+    anchors = [choose_pareto_knee(population), max(population, key=lambda g: g.fitness), inference_best]
+    out: List[Genome] = []
+    seen: set[int] = set()
+    for g in anchors + ordered:
+        ident = id(g)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(g)
+        if len(out) >= keep:
+            break
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Evolution loop
 # ---------------------------------------------------------------------------
 
@@ -5450,6 +6374,10 @@ def save_genome(path: str, genome: Genome, generation: int) -> None:
         "generation": generation,
         "fitness": genome.fitness,
         "case_scores": genome.case_scores,
+        "inference_accuracy": genome.inference_accuracy,
+        "inference_full_accuracy": genome.inference_full_accuracy,
+        "pareto_rank": genome.pareto_rank,
+        "pareto_crowding": genome.pareto_crowding,
         "embedding": genome.embedding,
         "rules": [
             {
@@ -5478,6 +6406,10 @@ def _pack_genome_group(genomes: Sequence[Genome], prefix: str, arrays: dict) -> 
     weights = np.empty((pcount, rcount), dtype=np.float32)
     embeddings = np.empty((pcount, EMBEDDING_ENTRY_COUNT), dtype=np.int16)
     fitness = np.empty(pcount, dtype=np.float64)
+    inference_accuracy = np.empty(pcount, dtype=np.float64)
+    inference_full_accuracy = np.empty(pcount, dtype=np.float64)
+    pareto_rank = np.empty(pcount, dtype=np.int32)
+    pareto_crowding = np.empty(pcount, dtype=np.float64)
     score_offsets = [0]
     score_values: List[float] = []
     for gi, g in enumerate(genomes):
@@ -5485,6 +6417,10 @@ def _pack_genome_group(genomes: Sequence[Genome], prefix: str, arrays: dict) -> 
             raise ValueError("checkpoint requires fixed rule count")
         embeddings[gi] = np.asarray(g.embedding, dtype=np.int16)
         fitness[gi] = float(g.fitness)
+        inference_accuracy[gi] = float(g.inference_accuracy)
+        inference_full_accuracy[gi] = float(g.inference_full_accuracy)
+        pareto_rank[gi] = int(g.pareto_rank)
+        pareto_crowding[gi] = float(g.pareto_crowding)
         score_values.extend(map(float, g.case_scores))
         score_offsets.append(len(score_values))
         for ri, rule in enumerate(g.rules):
@@ -5503,6 +6439,10 @@ def _pack_genome_group(genomes: Sequence[Genome], prefix: str, arrays: dict) -> 
     arrays[prefix + "weights"] = weights
     arrays[prefix + "embeddings"] = embeddings
     arrays[prefix + "fitness"] = fitness
+    arrays[prefix + "inference_accuracy"] = inference_accuracy
+    arrays[prefix + "inference_full_accuracy"] = inference_full_accuracy
+    arrays[prefix + "pareto_rank"] = pareto_rank
+    arrays[prefix + "pareto_crowding"] = pareto_crowding
     arrays[prefix + "score_offsets"] = np.asarray(score_offsets, dtype=np.int32)
     arrays[prefix + "score_values"] = np.asarray(score_values, dtype=np.float64)
 
@@ -5519,6 +6459,18 @@ def _unpack_genome_group(z, prefix: str) -> List[Genome]:
     weights = z[prefix + "weights"]
     embeddings = z[prefix + "embeddings"]
     fitness = z[prefix + "fitness"]
+    inference_accuracy = (z[prefix + "inference_accuracy"]
+                          if prefix + "inference_accuracy" in z.files
+                          else np.full(count, np.nan, dtype=np.float64))
+    inference_full_accuracy = (z[prefix + "inference_full_accuracy"]
+                               if prefix + "inference_full_accuracy" in z.files
+                               else np.full(count, np.nan, dtype=np.float64))
+    pareto_rank = (z[prefix + "pareto_rank"]
+                   if prefix + "pareto_rank" in z.files
+                   else np.full(count, 2_147_483_647, dtype=np.int32))
+    pareto_crowding = (z[prefix + "pareto_crowding"]
+                       if prefix + "pareto_crowding" in z.files
+                       else np.zeros(count, dtype=np.float64))
     so = z[prefix + "score_offsets"]
     sv = z[prefix + "score_values"]
     out: List[Genome] = []
@@ -5537,6 +6489,10 @@ def _unpack_genome_group(z, prefix: str) -> List[Genome]:
             fitness=float(fitness[gi]),
             case_scores=scores,
             readout_weights=weights[gi].astype(np.float64).tolist(),
+            inference_accuracy=float(inference_accuracy[gi]),
+            inference_full_accuracy=float(inference_full_accuracy[gi]),
+            pareto_rank=int(pareto_rank[gi]),
+            pareto_crowding=float(pareto_crowding[gi]),
         ))
     return out
 
@@ -5609,6 +6565,10 @@ def load_checkpoint(path: str, sampler: CorpusSampler):
         np_rng = _array_object(z["np_rng"])
         torch_rng = np.asarray(z["torch_rng"], dtype=np.uint8).copy()
         sampler.ngrams = list(_array_object(z["sampler_ngrams"]))
+        # Contextual inference proposals are derived from the persisted n-gram
+        # pool.  Rebuild after replacing the constructor's temporary pool so a
+        # resumed run uses exactly the checkpointed proposal model.
+        sampler._rebuild_context_model()
         sampler._byte_buffer = np.asarray(z["sampler_byte_buffer"], dtype=np.uint16).copy()
         sampler._byte_pos = int(z["sampler_byte_pos"][0])
         config = dict(_array_object(z["config"]))
@@ -5632,11 +6592,16 @@ def _moving_average(values: Sequence[float], window: int) -> np.ndarray:
     if a.size == 0:
         return a
     w = max(1, int(window))
-    out = np.empty_like(a, dtype=np.float64)
-    csum = np.concatenate(([0.0], np.cumsum(a, dtype=np.float64)))
+    out = np.full_like(a, np.nan, dtype=np.float64)
+    finite = np.isfinite(a)
+    vals = np.where(finite, a, 0.0)
+    csum = np.concatenate(([0.0], np.cumsum(vals, dtype=np.float64)))
+    ccount = np.concatenate(([0], np.cumsum(finite.astype(np.int64))))
     for i in range(a.size):
         lo = max(0, i + 1 - w)
-        out[i] = (csum[i + 1] - csum[lo]) / float(i + 1 - lo)
+        count = int(ccount[i + 1] - ccount[lo])
+        if count > 0:
+            out[i] = (csum[i + 1] - csum[lo]) / float(count)
     return out
 
 
@@ -5714,19 +6679,50 @@ def write_plots(history: List[dict], prefix: str, ma_window: int) -> None:
     plt.close(fig)
     os.replace(tmp, out)
 
-    # Old Nim-style saturation view: magnifies improvements as rho -> 1.
+    # Old Nim-style saturation view plus v60 inference recovery on a second axis.
     def sat(v):
         return -np.log2(np.maximum(1e-9, 1.0 - np.minimum(v, 1.0 - 1e-9)))
+    # Inference mirrors the fitness plot semantics:
+    #   - gray line: best inference score in *this* generation
+    #   - best-ever: best inference score seen up to this generation
+    # Keep inference_raw in the history/CSV as a useful Pareto-champion
+    # diagnostic, but do not present it as the main "best" curve.
+    inference_best = np.asarray([
+        float(h.get("inference_best", h.get("inference_raw", np.nan)))
+        for h in history
+    ], dtype=float)
+    inference_best_ever = np.full_like(inference_best, np.nan, dtype=float)
+    running_inference_best = float("nan")
+    for i, value in enumerate(inference_best):
+        if np.isfinite(value):
+            running_inference_best = (
+                float(value) if not np.isfinite(running_inference_best)
+                else max(float(running_inference_best), float(value))
+            )
+        inference_best_ever[i] = running_inference_best
+    inference_ma = _moving_average(inference_best, ma_window)
     fig = plt.figure(figsize=(11, 6))
     ax = fig.add_subplot(111)
     ax.plot(gen, sat(best), label="best", color="lightgray")
     ax.plot(gen, sat(best_ever), label="best-ever")
     ax.plot(gen, sat(np.where(np.isfinite(ma), ma, best)), label=f"best MA({ma_window})")
     ax.set_xlabel("generation")
-    ax.set_ylabel("-log2(1 - fitness)")
+    ax.set_ylabel("-log2(1 - Spearman)")
     ax.grid(True, alpha=0.25)
-    ax.legend()
-    ax.set_title("Fitness near saturation | - log2( 1 - spearman )")
+
+    have_inference = np.any(np.isfinite(inference_best))
+    if have_inference:
+        ax2 = ax.twinx()
+        ax2.plot(gen, inference_best, label="inference best", color="gray", alpha=0.38, linewidth=1.0)
+        ax2.plot(gen, inference_best_ever, label="inference best-ever", linestyle="--", linewidth=1.25)
+        ax2.plot(gen, inference_ma, label=f"inference best MA({ma_window})", linewidth=1.5)
+        ax2.set_ylabel("corrupted-byte recovery accuracy")
+        ax2.set_ylim(-0.02, 1.02)
+        lines = ax.get_lines() + ax2.get_lines()
+        ax.legend(lines, [ln.get_label() for ln in lines], loc="best")
+    else:
+        ax.legend()
+    ax.set_title("Fitness near saturation + string-side inference recovery")
     fig.tight_layout()
     tmp = base + "_saturation.tmp.png"
     out = base + "_saturation.png"
@@ -5860,6 +6856,17 @@ def evolve(args) -> Genome:
     overlap_delta = float("nan")
     overlap_cases = 0
 
+    # v60 second-objective state. Inference cases are independent from the
+    # Spearman rolling set and rotate slowly; the inner GA itself reruns every
+    # generation so each new genome must earn its recovery score.
+    inference_set: RollingInferenceSet | None = None
+    inference_epoch = 0
+    inference_best_ever = max(
+        [float(h.get("inference_best_ever", h.get("inference_best", float("nan"))))
+         for h in history if math.isfinite(float(h.get("inference_best_ever", h.get("inference_best", float("nan"))) or float("nan")))]
+        or [0.0]
+    )
+
     # Persistent rolling elite-of-elites.  Structures survive checkpoints; their
     # case-score history restarts because the rolling evaluation serials restart.
     args.hof_size = max(args.hof_size, len(loaded_hof_genomes))
@@ -5885,17 +6892,17 @@ def evolve(args) -> Genome:
 
     mps_evaluator = None
     if args.backend == "mps":
-        sample_count = args.cases * args.samples
+        # Match RollingEvaluationSet's coercions exactly.  Using raw CLI values
+        # under-allocated the MPS sample buffers for --samples 1/2 (the rolling
+        # set enforces at least 3) and for --cases <= 0 (it enforces at least 1).
+        sample_count = max(1, min(int(args.cases), len(corpus))) * max(3, int(args.samples))
         t_stage = time.perf_counter()
         print(
             f"init: allocating v33 dual-anchor-bloom v31 narrow-state wc1-inplace fused-hash incremental-pack inplace-literal anchor-guided wc1-fast score-reuse direct-diff local-generic-candidate variable-length GPU-index rolling-HoF bounded-workload compacting-GC precise-mutation nonexpanding pooled MPS evaluator "
             f"(genome_batch={args.mps_genome_batch}, result_chunk={args.mps_result_chunk}, "
             f"threadgroup={args.mps_threadgroup}, samples={sample_count})...", flush=True,
         )
-        effective_raw_len = (
-            min(args.max_chunk, args.trajectory_len)
-            if args.trajectory_len > 0 else args.max_chunk
-        )
+        effective_raw_len = effective_trajectory_span(args, corpus)
         mps_evaluator = MpsPopulationEvaluator(
             sample_count=sample_count,
             rule_count=args.rules,
@@ -5949,6 +6956,7 @@ def evolve(args) -> Genome:
                 flush=True,
             )
 
+        outer_eval_t0 = time.perf_counter()
         mps_kernel_seconds = 0.0
         mps_pack_seconds = 0.0
         readout_seconds = 0.0
@@ -6062,6 +7070,7 @@ def evolve(args) -> Genome:
                     print(f"  eval {i+1}/{total_eval}", end="\r", flush=True)
         if args.progress:
             print(" " * 56, end="\r")
+        outer_eval_seconds = max(1.0e-9, time.perf_counter() - outer_eval_t0)
 
         # Only sampled entries have current observations. Never attach a fresh
         # case serial to an unobserved stale score.
@@ -6070,29 +7079,105 @@ def evolve(args) -> Genome:
                 entry, current_case_serials, args.hof_history_cases, args.hof_current_weight
             )
 
-        # Learn operator utility from the evaluation we already paid for. Reward
-        # comparison is restricted to unchanged rolling-case serials.
+        # Learn operator utility from the outer Spearman evaluation we already paid
+        # for. The v60 inference cases are a different rolling test, so mixing them
+        # into delayed operator credit would compare non-identical tasks.
         operator_updates, operator_reward_mean = op_bandit.observe_population(population)
 
-        population.sort(key=lambda g: g.fitness, reverse=True)
+        # v60 checked: bounded string-side genetic inference.  Candidate search
+        # is paid only for the voting ensemble; all genomes are scored once on
+        # the final candidate pool.  A hardware-independent equivalent-work cap
+        # keeps CPU/MPS evolution deterministic under the same RNG seed while
+        # leaving ample headroom below the requested ~2x ceiling.
+        inference_stats = {
+            "seconds": 0.0, "evaluations": 0, "ensemble_accuracy": float("nan"),
+            "oracle_accuracy": float("nan"), "selected_change_rate": float("nan"),
+            "mean_accuracy": float("nan"), "best_accuracy": float("nan"),
+            "model_jobs": 0, "kernel_jobs": 0, "search_rounds": 0,
+            "equivalent_work": 0.0,
+        }
+        inference_rotated_slot = -1
+        inf_cases = 0
+        inf_pop = 0
+        inf_gens = 0
+        inf_work = 0
+        if args.no_inference:
+            for g in population:
+                g.inference_accuracy = 0.0
+                g.inference_full_accuracy = 0.0
+        else:
+            if inference_set is None:
+                evaluator_span = effective_trajectory_span(args, corpus)
+                max_inf_cases = max(
+                    1,
+                    min(int(args.inference_cases), len(corpus), max(1, len(inputs) // 2)),
+                )
+                inference_set = RollingInferenceSet(
+                    corpus, sampler, max_inf_cases,
+                    min(args.inference_span, evaluator_span), args.inference_noise,
+                    excluded_sources=[c.source_index for c in rolling_dataset.slots],
+                )
+                print(
+                    f"init: inference set cases={max_inf_cases} span<={min(args.inference_span, evaluator_span)} "
+                    f"noise={args.inference_noise:.3f}", flush=True,
+                )
+            else:
+                rotate_every = max(1, int(args.inference_rotate_every))
+                if rel_generation > 0 and (rel_generation % rotate_every) == 0:
+                    inference_rotated_slot = ((rel_generation // rotate_every) - 1) % inference_set.case_count
+                    inference_set.rotate(
+                        inference_rotated_slot,
+                        excluded_sources=[c.source_index for c in rolling_dataset.slots],
+                    )
+                    inference_epoch += 1
+
+            # Budget against one full outer-population evaluation.  Keeping this
+            # hardware-independent is intentional: CPU and MPS must consume the
+            # same RNG stream and evolve the same population under a fixed seed.
+            inf_cases, inf_pop, inf_gens, inf_work = resolve_inference_budget(
+                len(inputs), inference_set.case_count, args.inference_population,
+                args.inference_generations, args.inference_budget_ratio,
+                genome_count=len(population),
+                outer_evaluated_genomes=len(population),
+                ensemble_size=args.inference_ensemble,
+            )
+            live_pool_roots = list(population) + [e.genome for e in hof_archive]
+            inference_stats = run_string_inference_ga(
+                population, inference_set, sampler, inf_pop, inf_gens,
+                args.inference_ensemble, args.backend, args.max_output,
+                mps_evaluator=mps_evaluator, restore_inputs=inputs,
+                case_count=inf_cases, pool_live_genomes=live_pool_roots,
+                elite_count=args.inference_elites,
+            )
+            inference_stats["budget_equivalent"] = int(inf_work)
+            inference_stats["budget_cases"] = int(inf_cases)
+            inference_stats["budget_population"] = int(inf_pop)
+            inference_stats["budget_generations"] = int(inf_gens)
+
+        fronts = assign_pareto_metrics(population)
+        population.sort(key=pareto_sort_key)
+        spearman_sorted = sorted(population, key=lambda g: g.fitness, reverse=True)
         search_model_t0 = time.perf_counter()
         linkage_model.refresh(
             population, generation, args.linkage_refresh, args.linkage_elites,
             args.linkage_loci, args.linkage_modules, args.linkage_max_module,
         )
         qd_grid = build_qd_grid(population, args.qd_bins)
-        qd_elites = sorted(qd_grid.values(), key=lambda g: g.fitness, reverse=True)
+        qd_elites = sorted(qd_grid.values(), key=pareto_sort_key)
         search_model_seconds = time.perf_counter() - search_model_t0
 
+        # HoF remains a long-term rank-representation archive; feed it the top
+        # Spearman candidates while the live population itself is NSGA-II Pareto.
         hof_candidate_n = max(0, min(int(args.hof_candidates), len(population)))
         hof_admitted, hof_replaced = update_hall_of_fame(
-            hof_archive, population[:hof_candidate_n], current_case_serials, generation,
+            hof_archive, spearman_sorted[:hof_candidate_n], current_case_serials, generation,
             args.hof_size, args.hof_history_cases, args.hof_current_weight, args.hof_min_distance,
         )
         hof_best_score = hof_archive[0].archive_score if hof_archive else float("nan")
         current_hof = [e for e in hof_archive if e.genome._eval_case_serials == tuple(current_case_serials)]
         hof_best_current = max((e.current_fitness for e in current_hof), default=float("nan"))
-        champion = population[0]
+        champion = spearman_sorted[0]
+        pareto_champion = choose_pareto_knee(population)
         expanding_rules = sum(1 for r in champion.rules if not is_rule_nonexpanding(r))
         if expanding_rules:
             raise AssertionError(f"v22 invariant broken: champion has {expanding_rules} expanding rules")
@@ -6139,6 +7224,14 @@ def evolve(args) -> Genome:
         previous_case_scores = current_case_scores
         previous_case_serials = current_case_serials
 
+        inference_values = [float(g.inference_accuracy) for g in population
+                            if math.isfinite(float(g.inference_accuracy))]
+        inference_best = max(inference_values) if inference_values else float("nan")
+        inference_mean = statistics.fmean(inference_values) if inference_values else float("nan")
+        if math.isfinite(inference_best):
+            inference_best_ever = max(float(inference_best_ever), float(inference_best))
+        pareto_front_size = len(fronts[0]) if fronts else 0
+
         elapsed = time.perf_counter() - t0
         mean_fit = statistics.fmean(g.fitness for g in population)
         med_fit = statistics.median(g.fitness for g in population)
@@ -6152,6 +7245,31 @@ def evolve(args) -> Genome:
             "mean": mean_fit,
             "median": med_fit,
             "best_ever": best_ever.fitness,
+            "inference_raw": float(pareto_champion.inference_accuracy),
+            "inference_best": inference_best,
+            "inference_best_ever": inference_best_ever,
+            "inference_mean": inference_mean,
+            "inference_full_raw": float(pareto_champion.inference_full_accuracy),
+            "inference_ensemble": float(inference_stats.get("ensemble_accuracy", float("nan"))),
+            "inference_oracle": float(inference_stats.get("oracle_accuracy", float("nan"))),
+            "inference_selected_change_rate": float(inference_stats.get("selected_change_rate", float("nan"))),
+            "inference_seconds": float(inference_stats.get("seconds", 0.0)),
+            "inference_evaluations": int(inference_stats.get("evaluations", 0)),
+            "inference_model_jobs": int(inference_stats.get("model_jobs", 0)),
+            "inference_kernel_jobs": int(inference_stats.get("kernel_jobs", 0)),
+            "inference_equivalent_work": float(inference_stats.get("equivalent_work", 0.0)),
+            "inference_budget_equivalent": int(inference_stats.get("budget_equivalent", 0)),
+            "inference_budget_cases": int(inference_stats.get("budget_cases", inf_cases)),
+            "inference_budget_population": int(inference_stats.get("budget_population", inf_pop)),
+            "inference_budget_generations": int(inference_stats.get("budget_generations", inf_gens)),
+            "inference_search_rounds": int(inference_stats.get("search_rounds", 0)),
+            "inference_outer_eval_seconds": float(outer_eval_seconds),
+            "inference_time_ratio": float(inference_stats.get("seconds", 0.0)) / max(1.0e-9, float(outer_eval_seconds)),
+            "inference_epoch": inference_epoch,
+            "inference_rotated_slot": inference_rotated_slot,
+            "pareto_front_size": pareto_front_size,
+            "pareto_champion_fitness": float(pareto_champion.fitness),
+            "pareto_champion_inference": float(pareto_champion.inference_accuracy),
             "active_rules": active,
             "expanding_rules": expanding_rules,
             "mutation_stagnation": stagnation,
@@ -6225,6 +7343,16 @@ def evolve(args) -> Genome:
         print(
             f"gen={generation:6d} best={champion.fitness:+.6f} "
             f"mean={mean_fit:+.6f} median={med_fit:+.6f} "
+            f"infer={float(pareto_champion.inference_accuracy):.3f} "
+            f"inferBest={inference_best:.3f} "
+            f"infEns={float(inference_stats.get('ensemble_accuracy', float('nan'))):.3f} "
+            f"infOracle={float(inference_stats.get('oracle_accuracy', float('nan'))):.3f} "
+            f"infMove={float(inference_stats.get('selected_change_rate', float('nan'))):.2f} "
+            f"front={pareto_front_size} "
+            f"infGA={float(inference_stats.get('seconds', 0.0)):.2f}s "
+            f"infPlan={inf_cases}x{inf_pop}x{inf_gens}/"
+            f"{int(inference_stats.get('search_rounds', 0))}r "
+            f"infEq={float(inference_stats.get('equivalent_work', 0.0)):.1f}/{inf_work} "
             f"active={active}/{len(champion.rules)} expand={expanding_rules} "
             f"stag={stagnation} roll={dataset_epoch} overlap={overlap_cases}/{len(current_case_serials)} "
             f"d={overlap_delta:+.3e} hof={len(hof_archive)}/{args.hof_size} "
@@ -6270,7 +7398,11 @@ def evolve(args) -> Genome:
         if args.progress:
             print(f"gen={generation}: breeding next population...", flush=True)
         elite_n = max(1, min(args.elites, args.population))
-        next_pop = [clone_genome_shallow(g) for g in population[:elite_n]]
+        elite_sources = select_outer_elites(population, elite_n)
+        # True elite preservation: these structural genomes are copied unchanged
+        # and never enter the mutation/crossover path below.  Copy-on-write Rule
+        # sharing keeps this cheap while preserving the exact program/embedding.
+        next_pop = [clone_genome_shallow(g) for g in elite_sources]
 
         # MAP-Elites-style survivor grid: every injected genome was already
         # evaluated in this generation.  Diversity therefore consumes population
@@ -6414,7 +7546,7 @@ def evolve(args) -> Genome:
             print(" " * 72, end="\r")
         op_summary = "/".join(f"{a}:{operator_counts[a]}" for a in operator_arms)
         print(
-            f"gen={generation}: breed={breed_seconds:.2f}s "
+            f"gen={generation}: breed={breed_seconds:.2f}s elite_keep={len(elite_sources)} "
             f"mut(local/bal/explore)={mutation_regime_counts['local']}/"
             f"{mutation_regime_counts['balanced']}/{mutation_regime_counts['explore']} "
             f"rows_changed={mutation_rows_changed} mix_rows={mixed_rows} "
@@ -6430,7 +7562,7 @@ def evolve(args) -> Genome:
         ):
             tc = time.perf_counter()
             if args.current_save:
-                save_genome(args.current_save, champion, generation)
+                save_genome(args.current_save, pareto_champion, generation)
             save_checkpoint(
                 args.checkpoint, generation + 1, next_pop, best_ever,
                 history, sampler, args, hof_archive,
@@ -6439,7 +7571,7 @@ def evolve(args) -> Genome:
         population = next_pop
 
     if args.current_save and args.generations > start_generation:
-        save_genome(args.current_save, champion, args.generations - 1)
+        save_genome(args.current_save, pareto_champion, args.generations - 1)
     if args.checkpoint:
         save_checkpoint(args.checkpoint, args.generations, population, best_ever, history, sampler, args, hof_archive)
     if history and not args.no_plot:
@@ -6520,9 +7652,21 @@ def parse_args():
     ap.add_argument("--cases", type=int, default=4)
     ap.add_argument("--samples", type=int, default=50)
     ap.add_argument("--max-noise", type=float, default=0.35)
+    # v60.1 string-side inference objective. Default work is 3 cases x 12 candidates
+    # x 6 rounds, then automatically reduced to the --inference-budget-ratio cap.
+    ap.add_argument("--inference-cases", type=int, default=3, help="independent noisy snippets optimized by the inner string GA")
+    ap.add_argument("--inference-population", type=int, default=22, help="candidate strings per inference case")
+    ap.add_argument("--inference-generations", type=int, default=350, help="inner GA generations per outer model generation; v60.1 default 6 remains well inside the inference work cap")
+    ap.add_argument("--inference-elites", type=int, default=3, help="top candidate strings copied unchanged each inner GA generation; clamped to leave at least one offspring slot")
+    ap.add_argument("--inference-span", type=int, default=1500, help="maximum bytes in each inference snippet")
+    ap.add_argument("--inference-noise", type=float, default=0.05, help="fraction of snippet bytes deliberately corrupted and mutable")
+    ap.add_argument("--inference-ensemble", type=int, default=64, help="top Spearman genomes voting to evolve the shared candidate pool")
+    ap.add_argument("--inference-rotate-every", type=int, default=2, help="replace one inference case every N outer generations")
+    ap.add_argument("--inference-budget-ratio", type=float, default=0.75, help="extra unique trajectory work relative to one outer evaluation; hard-capped at 0.85")
+    ap.add_argument("--no-inference", action="store_true", help="disable v60 string inference and reduce Pareto selection to Spearman")
     ap.add_argument("--population", type=int, default=450)
     ap.add_argument("--rules", type=int, default=1500)
-    ap.add_argument("--elites", type=int, default=40)
+    ap.add_argument("--elites", type=int, default=40, help="outer Pareto elites copied structurally unchanged into the next generation")
     ap.add_argument("--hof-size", type=int, default=16384, help="rolling elite-of-elites archive capacity")
     ap.add_argument("--hof-eval", type=int, default=128, help="random archive evaluation budget per generation; 0 disables archive evaluation")
     ap.add_argument("--hof-candidates", type=int, default=1, help="top current genomes considered for HoF admission each generation")
@@ -6592,7 +7736,7 @@ def parse_args():
     )
     ap.add_argument("--generations", type=int, default=1_000_000)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--current-save", default="latest_minimal_gp.json", help="latest evaluated champion, independent of the best-observed record")
+    ap.add_argument("--current-save", default="latest_minimal_gp.json", help="latest balanced Pareto-knee champion; --save remains best observed Spearman")
     ap.add_argument("--save", default="best_minimal_gp.json", help="best-ever genome JSON")
     ap.add_argument("--checkpoint", default="minimal_gp_checkpoint.npz", help="full resumable population checkpoint")
     ap.add_argument("--checkpoint-every", type=int, default=10, help="save full checkpoint every N generations; 0 disables periodic saves")
