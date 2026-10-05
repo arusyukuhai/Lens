@@ -1,5 +1,6 @@
-import random
-import main as m
+import importlib.util, sys, random
+spec=importlib.util.spec_from_file_location('v56','/mnt/data/minimal_replacer_gp_embedding_plot_v56.py')
+m=importlib.util.module_from_spec(spec); sys.modules['v56']=m; spec.loader.exec_module(m)
 
 def mk(base):
     rs=[]

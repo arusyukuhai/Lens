@@ -1,181 +1,150 @@
-# v60 — String-side Genetic Inference + Spearman/Recovery Pareto
+# v59 — All-Sample Pairwise Rank Ridge + Full Spearman
 
-v59 の all-sample pairwise rank readout と v58 の linkage/QD/operator search を残したまま、**実際に入力文字列側を探索して復元できるか**を第二目的に追加した版です。
+v58 の Budget-Neutral Linkage / QD / Adaptive Search を維持したまま、readout と fitness の目的関数を順位最適化へ揃えた版です。
 
-## 何を追加したか
+## 変更の中心
 
-各 outer generation で、通常の Spearman 評価後に独立した短い code snippet を数個用意します。snippet には既知の位置だけ人工ノイズを入れます。
+従来は既定 `--cases 3 --samples 36`、合計108 trajectoriesのうち、`sample_id % 3 == 0` の36本だけで raw cleanliness を dual Ridge 回帰し、残り72本だけで held-out Spearman を計算していました。
 
-```text
-clean text
-   ↓ corruption (positions are recorded)
-noisy text
-   ↓ inner genetic search: only corrupted positions may change
-candidate strings
-   ↓ current Replace population scores candidates
-best-scoring inferred strings
-   ↓ compare to hidden clean bytes at corrupted positions only
-recovery accuracy
-```
-
-未変更部分を分母へ入れると accuracy が不当に高くなるため、第二目的 `inference_accuracy` は **人工的に壊した byte の復元率だけ**です。
-
-clean byte は mutation proposal や candidate fitness には一切使わず、最終採点にだけ使います。
-
-## Inner GA
-
-既定値は以下です。
+v59 の既定 `--readout-mode pairwise-all` では holdout を廃止します。
 
 ```text
---inference-cases 3
---inference-population 12
---inference-generations 4
---inference-elites 3
---inference-span 192
---inference-noise 0.05
---inference-ensemble 64
---inference-rotate-every 2
---inference-budget-ratio 0.75
+3 cases × 36 trajectories = 108 trajectories
+
+Pairwise Rank Ridge:
+  caseごとに36本をtarget rank順へ並べる
+  adjacent 35 pairs / case
+  3 × 35 = 105 pair constraints
+  108 trajectoriesすべてがpair graphに参加
+
+Spearman fitness:
+  36 trajectories / case 全部
+  3 caseのSpearman平均
 ```
 
-候補文字列は corrupted loci だけを gene として扱います。mutation は corpus byte distribution と現在の局所 context から byte を提案し、clean target は見ません。crossover も corrupted loci だけで行います。
+したがって、同じ108 trajectoriesすべてを readout fitting と fitness の両方に使います。
 
-candidate pool は全 genome 共通です。上位 Spearman genome 群だけが search generation 中の candidate を rank 化して投票し、その平均 rank で shared candidate population を進化させます。raw readout scale の大きい genome が投票を独占しないよう、tie-safe な平均順位を使います。
+## Pairwise objective
 
-探索が終わったら **最終 candidate pool だけ** を全 genome で一度評価します。各 genome の第二目的は、その genome 自身の readout が最終 pool 内で最も高く評価した candidate の復元率を case 平均した値です。したがって `inference_accuracy` は genome ごとに異なりますが、中間世代を全450 genomeで評価する無駄はありません。
-
-### エリート保存
-
-文字列側GAには `--inference-elites`（既定3）を追加し、各 inner generation で上位候補を **byte-for-byte そのまま次世代へコピー**します。elite copy 自体には crossover / mutation を掛けません。候補数が小さくなった場合でも最低1枠は offspring 用に残すため、budget縮小時に elite だけで population が埋まって探索停止することもありません。
-
-## Pareto selection
-
-outer population は
+予測は従来どおり
 
 ```text
-objective 1: Spearman fitness  (maximize)
-objective 2: inference_accuracy (maximize)
+prediction = overflow_baseline + X @ w
 ```
 
-の2目的を NSGA-II 型 non-dominated sorting + crowding distance で選択します。
-
-- elite survivor: **明示的な survivor elitism**。Pareto knee / best Spearman / best inference を優先的に固定し、残りを Pareto rank / crowding 順で `--elites` 枠まで無改変コピー
-- tournament parent selection: Pareto rank / crowding 順
-- QD cell representative: Pareto comparator
-- linkage elite set: Pareto 順
-
-HoF は従来の「rank representation の長期 archive」という役割を保つため、admission 自体は top Spearman candidates を使います。
-
-`best_minimal_gp.json` は従来互換で best-observed Spearman、`latest_minimal_gp.json` は現在の Pareto front の knee（Spearman と inference のバランス点）を保存します。
-
-## 2倍を超えにくくする予算制御
-
-checked revision では inner GA の仕事量を **full-population trajectory equivalent** で見積もります。
+です。各case内でtarget rankが隣接する2 trajectoryを `hi`, `lo` とすると、
 
 ```text
-cases * candidate_population * (1 + generations * ensemble_size / population_size)
+(X_hi - X_lo) @ w
+  ~= normalized_rank_margin - (baseline_hi - baseline_lo)
 ```
 
-`1` は最終 candidate pool を全 genome で採点する1回分です。search generation は上位 ensemble だけを評価します。`--inference-budget-ratio` には引き続き 0.85 の hard cap を掛けます。
+をL2正則化付きRidgeで解きます。
 
-デフォルト population=450, ensemble=64, cases=3, candidates=12, generations=4 なら、
+全ペア `36 choose 2` を使うと1case630 constraintsになりreadoutが重くなるため、rank chainの隣接35本だけを使います。これでも全36 trajectoryが少なくとも1 constraintへ入り、推移律を通じてcase全体の順序を学習できます。tiesはaverage rankを使い、同順位間はmargin=0になります。
+
+## 速度対策
+
+105×1500 pair matrixに対して105×105 Gramを全1500 ruleで作ると旧readoutよりhost負荷が増えます。v59では全105 pair・全1500 columnsをまず一回だけ走査し、normalized pairwise covarianceで上位256 rule columnsを選び、その256列だけに対して **exact dual Ridge** を解きます。
+
+既定値:
 
 ```text
-3 * 12 * (1 + 4*64/450) = 56.48 equivalent trajectories
-outer = 4 * 50 = 200 trajectories
-nominal extra ~= 28%
+--rank-max-features 256
 ```
 
-となります。inference snippet は既定192 bytesで通常trajectoryより短いため、初版v60よりかなり余裕を持って2倍未満を狙える構成です。
+重要なのは、feature screening前のrelevance計算には105 pair全部が使われるため、108 trajectoriesの参加条件は変わらないことです。
 
-Apple MPS では同じ persistent evaluator / Global Rule Pool を再利用し、active sample prefix に加えて、**同じ search ensemble の rule/index pack を inner generation 間で再利用**します。search ensemble は1回、最後の全population採点でもう1回だけpackします。
-
-## グラフ
-
-`training_saturation.png` は左軸が従来どおり
+1500-rule相当の疎な合成 firing matrix でのhost microbenchmark例:
 
 ```text
--log2(1 - Spearman)
+legacy 36-row exact ridge : 約0.7〜1.0 ms / genome
+v59 105-pair screened rank ridge : 約1.4〜1.5 ms / genome
 ```
 
-右軸が
+計測ノイズはありますが、450 genomesでの追加host時間は概算0.2〜0.4秒/世代程度です。Metal rewrite evaluationが数十秒級なら小さい割合です。実機値はMacで `readout=...` ログを確認してください。
+
+## 目的関数の整合
+
+v58以前:
 
 ```text
-corrupted-byte recovery accuracy [0, 1]
+fit: raw cleanliness MSE + L2
+select: held-out Spearman
 ```
 
-です。右軸には
+v59:
 
-- `inference raw` — 現在の Pareto-knee genome の実測 recovery（gray）
-- `inference best` — その世代の population 内の最良 recovery
-- `inference MA(200)` — raw recovery の移動平均
+```text
+fit: case-local pairwise rank constraints + L2
+select: same case内全trajectoryのSpearman
+```
 
-を重ねます。
+したがって、readoutもselectionも「値そのもの」ではなく順位を重視します。
 
-history CSV には `inference_raw`, `inference_best`, `inference_best_ever`, `inference_mean`, `inference_seconds`, `inference_model_jobs`, `inference_equivalent_work`, `inference_search_rounds`, `pareto_front_size` 等も保存します。
+## 注意: in-sample fitness
 
-## checkpoint compatibility
+v59の既定方式は、同じ108 trajectoriesをfitとSpearman採点の両方に使います。そのため従来のheld-out fitnessより楽観的になり、個々のrolling caseへの過学習は増え得ます。
 
-v59以前の version=1 checkpoint をそのままロードできます。新しい inference/Pareto arrays が無い旧 checkpoint は NaN/default で読み込み、最初の v60 generation で再評価します。
+ただしrolling evaluation自体は残っており、case slotは世代をまたいで順次入れ替わります。完全固定データへのfitではありません。
+
+外部generalizationを測る場合は既存 `audit_generalization.py` を使うか、A/B用に旧方式へ戻せます。
+
+```bash
+--readout-mode legacy-holdout
+```
 
 ## 推奨実行
+
+既存checkpointはそのままロードできます。
 
 ```bash
 python3 main.py --backend mps \
   --load minimal_gp_checkpoint.npz \
-  --checkpoint minimal_gp_checkpoint_v60.npz \
-  --save best_minimal_gp_v60.json \
-  --current-save latest_minimal_gp_v60.json \
-  --history-csv fitness_history_v60.csv \
-  --plot-prefix training_v60
+  --checkpoint minimal_gp_checkpoint_v59.npz \
+  --save best_minimal_gp_v59.json \
+  --current-save latest_minimal_gp_v59.json \
+  --history-csv fitness_history_v59.csv \
+  --plot-prefix training_v59
 ```
 
-負荷をさらに下げるなら例えば:
+明示する場合:
 
-```bash
---inference-budget-ratio 0.50 --inference-generations 3
+```text
+--readout-mode pairwise-all
+--rank-max-features 256
 ```
 
-A/B 用に第二目的を完全に切る場合:
+## v58探索器は維持
 
-```bash
---no-inference
-```
+- Sparse linkage learning
+- Budget-neutral / deferred optimal mixing
+- MAP-Elites-style quality diversity
+- Adaptive operator bandit
+- legacy crossover arm
+- precise rule mutation
+- rolling HoF
+- Global Rule Pool / differential pack / MPS evaluator
+
+いずれも追加GPU fitness evaluationを発生させません。
 
 ## 検証
 
 ```bash
 python3 main.py --self-test
-python3 -m unittest -v \
-  test_improvements.py \
-  test_v58_search.py \
-  test_v59_rank_readout.py \
-  test_v60_inference.py
+python3 -m unittest -v test_improvements.py test_v58_search.py test_v59_rank_readout.py
 ```
 
-v60 では追加で以下をテストします。
+確認済み:
 
-- inference work hard cap
-- mutation が corrupted loci 以外を変更しないこと
-- 2目的 Pareto front/rank
-- checkpoint pack/unpack で inference/Pareto metadata が保存されること
-- CPU smoke training で inner GA + Pareto breeding が通ること
+- existing tests: 14/14 PASS
+- v59 rank-readout tests: 3/3 PASS
+- 合計17/17 PASS
+- 3×36=108 trajectoriesでCPU smoke training 3 generations: PASS
+- 3×36から105 adjacent pairs生成: PASS
+- 108 trajectoryすべてがpair graphへ参加: PASS
+- caseを跨ぐpairなし: PASS
+- full-36 Spearman / case: PASS
+- checkpoint / rolling evaluation / HoF / v58 searchとの互換: PASS
 
-この環境では Apple MPS 実機を持たないため、Metal kernel の実機 benchmark は未実施です。host orchestration と CPU path はテスト済みです。
-
-
-## Checked revision
-
-追加監査で見つかった修正点の詳細は `AUDIT_v60.md` を参照してください。
-
-## v60.1 inference zero fix
-
-If `inferBest=0.000` stayed pinned in the previous v60 package, use this revision.
-A real tie-handling bug was found: final `np.argmax` preferred candidate 0, which is
-always the untouched noisy string, whenever Replacer scores tied. v60.1 removes that
-no-op bias, adds context-guided one-locus proposals, and prints `infOracle` / `infMove`
-diagnostics. See `README_v60.md` and `AUDIT_v60.md`.
-
-## v60.2 inference mutation radius
-
-Normal string-side mutations now choose the number of corrupted loci with `round(exp(uniform(0, log(k))))`, clamped to `1..k`. A scheduled focus locus is included inside that log-uniform mutation set rather than forcing a one-byte mutation. Only known corrupted loci remain mutable.
+Apple MPS実機はこの環境にはないため、Metal kernel自体には変更を加えていません。
