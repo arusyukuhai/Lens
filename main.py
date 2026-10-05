@@ -659,7 +659,7 @@ def stream_github_code(limit: int, min_len: int, max_len: int) -> List[bytes]:
         if not isinstance(text, str):
             continue
         b = text.encode("utf-8", errors="ignore")
-        if len(b) < min_len or len(part) >= max_len:
+        if len(b) < min_len or len(b) >= max_len:
             continue
         if max_len > 0 and len(b) > max_len:
             start = random.randrange(0, len(b) - max_len + 1)
@@ -6517,11 +6517,11 @@ def parse_args():
         "--stagnation-epsilon", type=float, default=1.0e-6,
         help="minimum mean Spearman gain on overlapping case slots that resets stagnation",
     )
-    ap.add_argument("--cases", type=int, default=4)
-    ap.add_argument("--samples", type=int, default=50)
+    ap.add_argument("--cases", type=int, default=3)
+    ap.add_argument("--samples", type=int, default=36)
     ap.add_argument("--max-noise", type=float, default=0.35)
     ap.add_argument("--population", type=int, default=450)
-    ap.add_argument("--rules", type=int, default=1500)
+    ap.add_argument("--rules", type=int, default=7500)
     ap.add_argument("--elites", type=int, default=40)
     ap.add_argument("--hof-size", type=int, default=16384, help="rolling elite-of-elites archive capacity")
     ap.add_argument("--hof-eval", type=int, default=128, help="random archive evaluation budget per generation; 0 disables archive evaluation")
