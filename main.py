@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Replacement-rule genetic programming core (v60.3 inference-Pareto, differential git-merge crossover).
+Replacement-rule genetic programming core (v60.5 inference-consensus repair, inference-Pareto, differential git-merge crossover).
+
+v60.5 makes the inner inference vote smaller and inference-aware: the default voting ensemble is 32 instead of 128, half of its available slots preferentially preserve inherited inference specialists / previous Pareto-front survivors, candidate fitness combines robust consensus with a top-quartile specialist signal, and inner elites / cross-generation seeds are kept with mutable-locus diversity.  Under the same 0.75 equivalent-work cap, the default plan becomes about 3x16x29 instead of 3x16x7, so model-job cost stays similar while the string GA gets substantially more sequential repair steps.  This targets runs where infEns lagged far behind inferBest/infOracle despite a healthy 16-wide candidate pool.
+
+v60.4 repairs the string-side search geometry: the inference work budget now preserves candidate-population width and reduces inner generations first; initial candidates are single-locus counterfactuals; ordinary inference mutation is local-heavy with rare wide jumps; the voting ensemble reserves slots for inherited inference-strong Pareto survivors; and the context proposal table is strengthened by a bounded deterministic corpus sample. This directly addresses runs where infOracle == inferBest but the candidate pool itself recovers only ~5-16% of corrupted bytes.
 
 v60.3 adds a three-parent categorical differential/git-style crossover: for base A, donor X, and target Y, non-conflicting A->X rule-sequence edits are applied to Y. It probabilistically shares the existing crossover budget with legacy two-point crossover.
 
@@ -769,13 +773,41 @@ class CorpusSampler:
         self._unused_embedding_cache: dict[tuple[int, ...], tuple[int, ...]] = {}
 
     def _rebuild_context_model(self) -> None:
+        """Build a compact raw-byte transition model for inference proposals.
+
+        v60.4 keeps the 256x256 table small, but no longer derives it from only
+        the ~4k short rule-seeding n-grams.  A deterministic, bounded sample of
+        the actual corpus contributes up to about two million adjacent-byte
+        transitions, which is still cheap at startup/resume and gives the
+        single-locus inference mutations a much less noisy proposal prior.
+        No clean inference target is consulted here.
+        """
         self._context_pairs = np.ones((INPUT_BYTE_COUNT, INPUT_BYTE_COUNT), dtype=np.float64) * 0.25
+
         for ng in self.ngrams:
             if len(ng) < 2:
                 continue
             a = np.asarray(ng[:-1], dtype=np.int16)
             b = np.asarray(ng[1:], dtype=np.int16)
             np.add.at(self._context_pairs, (a, b), 1.0)
+
+        # Strengthen the proposal model from the real corpus without an
+        # unbounded full-corpus scan.  Evenly spaced indices are deterministic,
+        # so checkpoint resume does not consume RNG merely to rebuild this cache.
+        if self.chunks:
+            take = min(4096, len(self.chunks))
+            if take == len(self.chunks):
+                ids = range(len(self.chunks))
+            elif take > 1:
+                ids = np.linspace(0, len(self.chunks) - 1, num=take, dtype=np.int64).tolist()
+            else:
+                ids = [0]
+            for idx in ids:
+                raw = np.frombuffer(self.chunks[int(idx)][:512], dtype=np.uint8)
+                if raw.size < 2:
+                    continue
+                np.add.at(self._context_pairs, (raw[:-1], raw[1:]), 1.0)
+
         self._context_row_sum = self._context_pairs.sum(axis=1)
         self._context_col_sum = self._context_pairs.sum(axis=0)
 
@@ -5737,6 +5769,9 @@ class InferenceCase:
     mutable_positions: Tuple[int, ...]
     source_index: int
     serial: int
+    # Model-ranked candidates carried across outer generations while this case
+    # remains resident.  These are selected without consulting ``clean``.
+    search_seed: List[List[int]] = field(default_factory=list)
 
 
 class RollingInferenceSet:
@@ -5815,20 +5850,21 @@ def resolve_inference_budget(sample_count: int, requested_cases: int,
                              ensemble_size: int | None = None) -> Tuple[int, int, int, int]:
     """Bound inner inference work in *full-population trajectory equivalents*.
 
-    v60 originally budgeted only ``cases * population * generations`` and then
-    evaluated every outer genome on every inner generation.  That understated
-    wall-clock risk when outer score reuse made only a fraction of genomes need
-    normal evaluation.  The checked version searches with only the voting
-    ensemble and performs one full-population scoring pass on the final candidate
-    pool.  Its approximate equivalent work is therefore
+    v60.4 preserves search width before depth.  The previous resolver reduced the
+    candidate population first, so the default 3x16x256 request at 200 outer
+    samples collapsed to roughly 3x2x84: effectively a (1+1) hill climber.
+    For byte reconstruction that is the wrong geometry.  Wide candidate pools
+    are needed to test many independent one-locus repairs and to make crossover
+    meaningful.  The best model-ranked candidates are also carried across
+    successive outer generations while an inference case remains resident.
+
+    Approximate equivalent work remains
 
         cases * population * (1 + generations * ensemble / genome_count).
 
-    ``outer_evaluated_genomes`` further scales the allowance when the normal
-    evaluator reused many genomes.  The 0.85 hard ratio is retained as a safety
-    ceiling; tiny smoke configurations keep a small floor so inference remains
-    executable at all.  The returned ``work`` is the ceiling of this equivalent
-    trajectory count, not raw model×trajectory jobs.
+    We therefore cap by sample capacity, reduce generations analytically first,
+    reduce population only if even one generation will not fit, and reduce case
+    count only as a last resort.  The 0.85 hard ratio remains the safety ceiling.
     """
     sample_count = max(1, int(sample_count))
     n_genomes = max(1, int(genome_count) if genome_count is not None else 1)
@@ -5839,7 +5875,6 @@ def resolve_inference_budget(sample_count: int, requested_cases: int,
     outer_fraction = outer_n / float(n_genomes)
     budget = max(4.0, sample_count * hard_ratio * outer_fraction)
 
-    # At least two candidate strings are needed for an actual GA population.
     cases = max(1, min(int(requested_cases), max(1, sample_count // 2)))
     generations = max(1, int(requested_generations))
     population = max(2, int(requested_population))
@@ -5847,35 +5882,44 @@ def resolve_inference_budget(sample_count: int, requested_cases: int,
     def equivalent_work(c: int, p: int, g: int) -> float:
         return float(c * p) * (1.0 + float(g) * ensemble / float(n_genomes))
 
-    # Final all-genome scoring evaluates cases*population strings in one active
-    # prefix, so it must fit in the evaluator's training sample allocation.
+    # The final all-genome scoring pass evaluates cases*population strings in
+    # one active prefix, so width must fit the evaluator's sample allocation.
     population = min(population, max(2, sample_count // cases))
 
-    # Prefer preserving several independent cases.  First reduce candidate
-    # population, then inner generations, and only then the number of cases.
-    # Recompute after each structural reduction because the active-sample bound
-    # changes with ``cases``.
-    while equivalent_work(cases, population, generations) > budget:
-        denom = cases * (1.0 + float(generations) * ensemble / float(n_genomes))
-        max_pop = int(math.floor(budget / max(1.0e-12, denom)))
-        if max_pop >= 2 and population > max_pop:
-            population = max(2, max_pop)
-            continue
-        if generations > 1:
-            generations -= 1
-            continue
-        if cases > 1:
-            cases -= 1
-            population = min(population, max(2, sample_count // cases))
-            continue
-        # With an extremely cheap/reused outer generation even 1×2×1 may exceed
-        # the nominal ratio.  Keep the minimal meaningful inference pass.
+    # Width first: solve directly for the deepest generation count that keeps
+    # the requested candidate population.  Default 200/450/128/0.75 becomes
+    # 3x16x7 instead of 3x2x84, at essentially identical equivalent work.
+    if equivalent_work(cases, population, generations) > budget and generations > 1:
+        base = float(cases * population)
+        headroom = budget / max(1.0e-12, base) - 1.0
+        max_g = int(math.floor(headroom * float(n_genomes) / float(ensemble)))
+        generations = max(1, min(generations, max_g))
+
+    # If even one generation at the requested width does not fit, shrink width.
+    if equivalent_work(cases, population, generations) > budget:
+        per_candidate = float(cases) * (1.0 + float(generations) * ensemble / float(n_genomes))
+        max_pop = int(math.floor(budget / max(1.0e-12, per_candidate)))
+        if max_pop >= 2:
+            population = min(population, max_pop)
+
+    # Preserve independent cases as long as possible; only tiny smoke budgets
+    # should reach this fallback.
+    while equivalent_work(cases, population, generations) > budget and cases > 1:
+        cases -= 1
+        population = min(population, max(2, sample_count // cases))
+        per_candidate = float(cases) * (1.0 + float(generations) * ensemble / float(n_genomes))
+        max_pop = int(math.floor(budget / max(1.0e-12, per_candidate)))
+        if max_pop >= 2:
+            population = min(population, max_pop)
+
+    if equivalent_work(cases, population, generations) > budget:
         population = 2
-        break
+        generations = 1
+        while equivalent_work(cases, population, generations) > budget and cases > 1:
+            cases -= 1
 
     actual = int(math.ceil(equivalent_work(cases, population, generations)))
     return cases, population, generations, actual
-
 
 def _inference_recovery_accuracy(candidate: Sequence[int], case: InferenceCase) -> float:
     pos = case.mutable_positions
@@ -5921,23 +5965,33 @@ def _propose_inference_byte(candidate: Sequence[int], pos: int, sampler: CorpusS
 
 
 def sample_inference_mutation_count(item_count: int) -> int:
-    """Log-uniform number of corrupted loci to mutate, in ``[1, item_count]``.
+    """Local-heavy mutation radius for corrupted loci.
 
-    The draw is exactly the requested geometry before integer rounding::
+    The v60.2 pure log-uniform draw has E[k] ~= (n-1)/log(n); with roughly 100
+    corrupted bytes that means ~21 simultaneous edits per offspring.  That is
+    useful as an occasional escape move but destructive as the default for
+    denoising, because a newly repaired byte is usually perturbed again before
+    the scorer can accumulate local improvements.
 
-        exp(uniform(0, log(item_count)))
+    v60.4 therefore uses:
+      * 70%: exactly one corrupted locus
+      * 20%: a small 2..4-locus move
+      * 10%: the original full log-uniform radius
 
-    This keeps one/few-locus edits common while giving every scale up to a
-    whole-corruption rewrite a non-negligible chance.
+    This still retains rare long jumps while making ordinary evolution resemble
+    coordinate/local search around repaired strings.
     """
     n = max(0, int(item_count))
     if n <= 0:
         return 0
     if n == 1:
         return 1
-    draw = math.exp(random.uniform(0.0, math.log(float(n))))
-    return max(1, min(n, int(round(draw))))
-
+    r = random.random()
+    if r < 0.70:
+        return 1
+    if r < 0.90:
+        return random.randint(2, min(4, n))
+    return sample_log_uniform_mutation_range(1, n)
 
 def mutate_inference_candidate(candidate: Sequence[int], positions: Sequence[int],
                                sampler: CorpusSampler, force_changes: int = 0,
@@ -6090,13 +6144,139 @@ def _row_rank01(values: np.ndarray) -> np.ndarray:
     return out
 
 
-def _inference_elite_ids(ensemble_score: Sequence[float], elite_count: int) -> np.ndarray:
-    """Return candidate ids copied byte-for-byte into the next inner-GA generation.
+def _candidate_mutable_distance(a: Sequence[int], b: Sequence[int],
+                                positions: Sequence[int]) -> float:
+    """Normalized Hamming distance restricted to the known-corrupted loci."""
+    pos = list(map(int, positions))
+    if not pos:
+        return 0.0
+    return sum(int(a[i]) != int(b[i]) for i in pos) / float(len(pos))
 
-    Keep at least one true elite whenever a candidate population exists, but for
-    width>1 reserve at least one slot for offspring.  Stable sorting makes exact
-    score ties deterministic instead of allowing NumPy's default quicksort order
-    to change which candidate survives.
+
+def _inference_vote_weights(genomes: Sequence[Genome]) -> np.ndarray:
+    """Moderately upweight models with inherited inference evidence.
+
+    Structural offspring have NaN inference_accuracy until the current inner
+    search finishes.  Surviving Pareto/QD elites retain the previous generation's
+    value.  We use that stale-but-useful signal only as a bounded vote weight; it
+    can never overwhelm the rest of the ensemble.
+    """
+    n = len(genomes)
+    if n <= 0:
+        return np.empty(0, dtype=np.float64)
+    prior = np.asarray([
+        float(g.inference_accuracy) if math.isfinite(float(g.inference_accuracy)) else np.nan
+        for g in genomes
+    ], dtype=np.float64)
+    finite = np.isfinite(prior)
+    weights = np.full(n, 0.75, dtype=np.float64)
+    if int(finite.sum()) >= 2:
+        vals = prior[finite]
+        lo = float(np.quantile(vals, 0.20))
+        hi = float(np.quantile(vals, 0.80))
+        if hi > lo + 1.0e-12:
+            z = np.clip((vals - lo) / (hi - lo), 0.0, 1.0)
+            weights[finite] = 0.75 + 1.50 * z
+        else:
+            weights[finite] = 1.25
+    elif int(finite.sum()) == 1:
+        weights[finite] = 1.50
+    mean_w = float(weights.mean())
+    if mean_w > 0.0:
+        weights /= mean_w
+    return weights
+
+
+def _aggregate_inference_candidate_scores(local: np.ndarray,
+                                          model_weights: Sequence[float] | None = None
+                                          ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Robust candidate vote: consensus + credible specialist support.
+
+    A plain mean across 128 ranks washed out useful local repair signals in runs
+    where infEns << inferBest ~= infOracle.  We still require broad agreement, but
+    preserve candidates strongly endorsed by a coherent top quartile of models.
+    No clean target enters this calculation.
+    """
+    ranks = _row_rank01(np.asarray(local, dtype=np.float64))
+    if ranks.ndim != 2 or ranks.shape[1] == 0:
+        z = np.zeros(ranks.shape[1] if ranks.ndim == 2 else 0, dtype=np.float64)
+        return z, z, z, z
+    m = int(ranks.shape[0])
+    if model_weights is not None:
+        w = np.asarray(model_weights, dtype=np.float64)
+        if w.shape != (m,) or not np.all(np.isfinite(w)) or float(w.sum()) <= 0.0:
+            w = np.ones(m, dtype=np.float64)
+    else:
+        w = np.ones(m, dtype=np.float64)
+    weighted = np.average(ranks, axis=0, weights=w)
+
+    sr = np.sort(ranks, axis=0)
+    trim = int(math.floor(0.10 * m)) if m >= 10 else 0
+    core = sr[trim:m - trim] if trim > 0 and (m - 2 * trim) >= 1 else sr
+    trimmed = np.mean(core, axis=0)
+    consensus = 0.55 * weighted + 0.45 * trimmed
+
+    top_n = max(1, int(math.ceil(0.25 * m)))
+    specialist = np.mean(sr[-top_n:], axis=0)
+    support = np.mean(ranks >= 0.75, axis=0)
+    score = 0.55 * consensus + 0.30 * specialist + 0.15 * support
+    return score, consensus, specialist, support
+
+
+def _diverse_candidate_ids(score: Sequence[float], population: Sequence[Sequence[int]],
+                           positions: Sequence[int], count: int,
+                           diversity_weight: float = 0.20,
+                           anchors: Sequence[int] = ()) -> np.ndarray:
+    """Greedy score/diversity selection over mutable loci only."""
+    score = np.asarray(score, dtype=np.float64)
+    width = int(score.size)
+    keep = max(0, min(int(count), width))
+    if keep <= 0:
+        return np.empty(0, dtype=np.int32)
+    lo = float(np.min(score))
+    hi = float(np.max(score))
+    norm = (score - lo) / max(1.0e-12, hi - lo)
+    selected: List[int] = []
+    seen: set[int] = set()
+    for raw in anchors:
+        i = int(raw)
+        if 0 <= i < width and i not in seen:
+            selected.append(i); seen.add(i)
+            if len(selected) >= keep:
+                return np.asarray(selected, dtype=np.int32)
+    if not selected:
+        i = int(np.argmax(score))
+        selected.append(i); seen.add(i)
+    while len(selected) < keep:
+        best_i = -1
+        best_merit = float("-inf")
+        for i in range(width):
+            if i in seen:
+                continue
+            min_dist = min(
+                _candidate_mutable_distance(population[i], population[j], positions)
+                for j in selected
+            ) if selected else 0.0
+            merit = (1.0 - float(diversity_weight)) * float(norm[i]) + float(diversity_weight) * min_dist
+            if merit > best_merit + 1.0e-15:
+                best_merit = merit
+                best_i = i
+        if best_i < 0:
+            break
+        selected.append(best_i); seen.add(best_i)
+    return np.asarray(selected, dtype=np.int32)
+
+
+def _inference_elite_ids(ensemble_score: Sequence[float], elite_count: int,
+                         population: Sequence[Sequence[int]] | None = None,
+                         positions: Sequence[int] = (),
+                         consensus: Sequence[float] | None = None,
+                         specialist: Sequence[float] | None = None) -> np.ndarray:
+    """Keep robust, specialist and diverse candidate elites.
+
+    The first anchor is the aggregate winner.  When available, the strongest
+    consensus and specialist candidates are also protected before score/diversity
+    filling.  width>1 always leaves at least one offspring slot.
     """
     score = np.asarray(ensemble_score, dtype=np.float64)
     width = int(score.size)
@@ -6104,7 +6284,70 @@ def _inference_elite_ids(ensemble_score: Sequence[float], elite_count: int) -> n
         return np.empty(0, dtype=np.int32)
     max_elites = 1 if width == 1 else width - 1
     keep = min(max_elites, max(1, int(elite_count)))
-    return np.argsort(-score, kind="stable")[:keep].astype(np.int32, copy=False)
+    anchors: List[int] = [int(np.argmax(score))]
+    if consensus is not None and len(consensus) == width:
+        anchors.append(int(np.argmax(np.asarray(consensus, dtype=np.float64))))
+    if specialist is not None and len(specialist) == width:
+        anchors.append(int(np.argmax(np.asarray(specialist, dtype=np.float64))))
+    if population is None:
+        out: List[int] = []
+        for i in anchors + np.argsort(-score, kind="stable").tolist():
+            ii = int(i)
+            if ii not in out:
+                out.append(ii)
+            if len(out) >= keep:
+                break
+        return np.asarray(out, dtype=np.int32)
+    return _diverse_candidate_ids(score, population, positions, keep, 0.20, anchors)
+
+
+def _select_inference_ensemble_ids(genomes: Sequence[Genome], ensemble_size: int) -> np.ndarray:
+    """Small mixed ensemble: inherited Pareto/inference specialists + fitness leaders.
+
+    Current-generation inference scores are unavailable until this search ends.
+    Surviving elites retain the previous generation's inference/Pareto metadata,
+    so we reserve up to half the ensemble for that evidence and fill the rest by
+    current Spearman fitness.  Fresh runs automatically degrade to fitness-only.
+    """
+    n = len(genomes)
+    if n <= 0:
+        return np.empty(0, dtype=np.int32)
+    target = max(1, min(n, int(ensemble_size)))
+    fit_order = np.argsort(np.asarray([float(g.fitness) for g in genomes], dtype=np.float64))[::-1]
+    finite_inf = [i for i, g in enumerate(genomes) if math.isfinite(float(g.inference_accuracy))]
+    inf_order = sorted(
+        finite_inf,
+        key=lambda i: (float(genomes[i].inference_accuracy), float(genomes[i].fitness)),
+        reverse=True,
+    )
+    pareto_order = sorted(
+        [i for i in finite_inf if int(genomes[i].pareto_rank) == 0],
+        key=lambda i: (float(genomes[i].inference_accuracy), float(genomes[i].fitness)),
+        reverse=True,
+    )
+
+    specialist_target = min(len(inf_order), target // 2)
+    pareto_target = min(len(pareto_order), max(1, target // 4)) if pareto_order else 0
+    out: List[int] = []
+    seen: set[int] = set()
+
+    for i in pareto_order[:pareto_target]:
+        ii = int(i)
+        if ii not in seen:
+            seen.add(ii); out.append(ii)
+    for i in inf_order:
+        if len([j for j in out if j in finite_inf]) >= specialist_target:
+            break
+        ii = int(i)
+        if ii not in seen:
+            seen.add(ii); out.append(ii)
+    for i in fit_order:
+        if len(out) >= target:
+            break
+        ii = int(i)
+        if ii not in seen:
+            seen.add(ii); out.append(ii)
+    return np.asarray(out[:target], dtype=np.int32)
 
 
 def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInferenceSet,
@@ -6117,7 +6360,8 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
                             elite_count: int = 3) -> dict:
     """Inner GA over corrupted bytes; final recovery is objective #2.
 
-    Search is shared by the strongest Spearman ensemble.  Earlier v60 code paid
+    Search is shared by a mixed ensemble of current Spearman leaders and
+    inherited inference-strong Pareto survivors.  Earlier v60 code paid
     to score *all* ~450 genomes on every inner generation even though only the
     top ensemble votes affected candidate evolution.  This version evaluates
     only that ensemble during the search, then performs exactly one full-population
@@ -6161,15 +6405,36 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
     for case in cases:
         pop = [list(case.noisy)]
         seen = {tuple(case.noisy)}
-        attempts = 0
         positions = list(case.mutable_positions)
+        mutable = set(positions)
+
+        # Carry at most half the population from the previous outer generation.
+        # This gives the now-wider 7-ish-round search continuity without letting
+        # an old local basin consume every slot; the rest are fresh one-locus
+        # counterfactuals around the original noisy string.
+        carry_limit = max(0, min(len(case.search_seed), (psize - 1) // 2))
+        for seed in case.search_seed[:carry_limit]:
+            if len(seed) != len(case.noisy):
+                continue
+            if any(int(seed[i]) != int(case.noisy[i]) for i in range(len(seed)) if i not in mutable):
+                continue
+            key = tuple(map(int, seed))
+            if key in seen:
+                continue
+            seen.add(key)
+            pop.append(list(map(int, seed)))
+
+        attempts = 0
+        fresh_slot = 0
         while len(pop) < psize:
             # Cover corrupted loci round-robin before spending proposals on
-            # duplicates.  This turns the first population into a set of local
-            # counterfactuals instead of 11 unrelated multi-byte perturbations.
-            focus = positions[(len(pop) - 1) % len(positions)] if positions else None
+            # duplicates.  Initial fresh candidates are exactly one-locus edits;
+            # wider mutations are reserved for later offspring.
+            focus = positions[fresh_slot % len(positions)] if positions else None
+            fresh_slot += 1
             cand = mutate_inference_candidate(
-                case.noisy, case.mutable_positions, sampler, focus_position=focus
+                case.noisy, case.mutable_positions, sampler,
+                force_changes=1, focus_position=focus,
             )
             key = tuple(cand)
             if key in seen:
@@ -6187,9 +6452,9 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
             pop.append(cand)
         candidate_pops.append(pop)
 
-    top_ids = np.argsort(np.asarray([float(g.fitness) for g in genomes], dtype=np.float64))[::-1]
-    top_ids = top_ids[:max(1, min(len(top_ids), int(ensemble_size)))]
+    top_ids = _select_inference_ensemble_ids(genomes, ensemble_size)
     search_genomes = [genomes[int(i)] for i in top_ids]
+    search_vote_weights = _inference_vote_weights(search_genomes)
     roots = genomes if pool_live_genomes is None else pool_live_genomes
 
     search_context = None
@@ -6207,7 +6472,7 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
                 raise ValueError("MPS inference requires the persistent evaluator")
             search_context = _prepare_inference_mps_context(search_genomes, mps_evaluator, roots)
 
-        # Search phase: only the voting ensemble is required here.
+        # Search phase: only the mixed voting ensemble is required here.
         for step in range(rounds):
             flat = [cand for pop in candidate_pops for cand in pop]
             search_scores = evaluate_inference_candidates(
@@ -6228,14 +6493,19 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
             for case, pop in zip(cases, candidate_pops):
                 width = len(pop)
                 local = search_scores[:, offset:offset + width]
-                ensemble_score = np.mean(_row_rank01(local), axis=0)
+                ensemble_score, consensus_score, specialist_score, _support = (
+                    _aggregate_inference_candidate_scores(local, search_vote_weights)
+                )
 
                 if step + 1 < rounds:
                     # Explicit elitist preservation for the string-side GA.
                     # These candidates are copied unchanged; mutation/crossover
                     # is applied only to the remaining slots.  The helper also
                     # guarantees at least one offspring slot when width>1.
-                    elite_ids = _inference_elite_ids(ensemble_score, elite_count)
+                    elite_ids = _inference_elite_ids(
+                        ensemble_score, elite_count, pop, case.mutable_positions,
+                        consensus_score, specialist_score,
+                    )
                     elite_n = int(elite_ids.size)
                     elites = [list(pop[int(i)]) for i in elite_ids]
                     new_pop = [list(x) for x in elites]
@@ -6341,10 +6611,23 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
                 selected_total += int(tie.shape[0])
 
             ensemble_local = local[top_ids]
-            ensemble_score = np.mean(_row_rank01(ensemble_local), axis=0)
+            ensemble_score, consensus_score, specialist_score, _support = (
+                _aggregate_inference_candidate_scores(ensemble_local, search_vote_weights)
+            )
             ens_max = float(np.max(ensemble_score))
             ens_tie = np.isclose(ensemble_score, ens_max, rtol=1.0e-12, atol=1.0e-12)
             ensemble_case_acc.append(float(np.mean(acc[ens_tie])) if np.any(ens_tie) else 0.0)
+
+            # Persist a compact, diverse model-ranked seed set.  The hidden clean
+            # target remains diagnostic-only and never influences carry-over.
+            carry = max(0, (psize - 1) // 2)
+            seed_ids = _diverse_candidate_ids(
+                ensemble_score, pop, case.mutable_positions, carry, 0.25,
+                anchors=(int(np.argmax(ensemble_score)),
+                         int(np.argmax(consensus_score)),
+                         int(np.argmax(specialist_score))),
+            )
+            case.search_seed = [list(pop[int(i)]) for i in seed_ids]
             offset += width
 
         per_genome = np.mean(per_case_acc, axis=1)
@@ -6390,6 +6673,7 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
         "equivalent_work": float(equiv),
         "active_cases": int(len(cases)),
         "candidate_population": int(psize),
+        "ensemble_members": int(len(search_genomes)),
     }
 
 
@@ -6506,21 +6790,37 @@ def choose_pareto_knee(population: Sequence[Genome]) -> Genome:
 def select_outer_elites(population: Sequence[Genome], elite_count: int) -> List[Genome]:
     """Choose genomes copied structurally unchanged into the next generation.
 
-    NSGA-II crowding normally protects objective extremes, but make that guarantee
-    explicit: with enough elite slots, preserve the Pareto knee plus the best
-    Spearman and best inference individuals, then fill the remaining slots in
-    normal Pareto order.  This is *survivor elitism*, independent of HoF/QD.
+    Elite preservation must itself respect the two-objective Pareto ordering.
+    Earlier revisions picked the global best Spearman / inference rows as explicit
+    anchors.  With tied objective values that could preserve a *dominated* row
+    (e.g. equal-best Spearman but worse inference) merely because ``max`` returned
+    it first.  Anchor only members of the first nondominated front, breaking an
+    objective tie by the other objective, then fill the remaining slots in normal
+    NSGA-II rank/crowding order.  This is survivor elitism, independent of HoF/QD.
     """
     if not population:
         return []
     keep = max(1, min(int(elite_count), len(population)))
     ordered = sorted(population, key=pareto_sort_key)
-    inference_best = max(
-        population,
-        key=lambda g: float(g.inference_accuracy)
-        if math.isfinite(float(g.inference_accuracy)) else -1.0,
-    )
-    anchors = [choose_pareto_knee(population), max(population, key=lambda g: g.fitness), inference_best]
+
+    # ``assign_pareto_metrics`` is called immediately before breeding, so rank 0
+    # is the current nondominated set.  Keep a defensive fallback for standalone
+    # callers/tests with stale or uninitialised metadata.
+    front0 = [g for g in population if int(g.pareto_rank) == 0]
+    if not front0:
+        return ordered[:keep]
+
+    def inf_value(g: Genome) -> float:
+        v = float(g.inference_accuracy)
+        return v if math.isfinite(v) else -1.0
+
+    # The secondary key is essential: if several rows share an objective maximum,
+    # choose the one that is best on the other objective.  Thus neither explicit
+    # extreme anchor can be dominated by another equal-extreme point.
+    spearman_anchor = max(front0, key=lambda g: (float(g.fitness), inf_value(g)))
+    inference_anchor = max(front0, key=lambda g: (inf_value(g), float(g.fitness)))
+    anchors = [choose_pareto_knee(front0), spearman_anchor, inference_anchor]
+
     out: List[Genome] = []
     seen: set[int] = set()
     for g in anchors + ordered:
@@ -6850,11 +7150,34 @@ def write_plots(history: List[dict], prefix: str, ma_window: int) -> None:
     os.replace(tmp, out)
 
     # Old Nim-style saturation view plus v60 inference recovery on a second axis.
+    # Inference intentionally exposes exactly three summary series:
+    #   best      = best genome in the current generation
+    #   best MA   = trailing moving average of that per-generation best
+    #   best ever = cumulative best observed so far
+    # Older history rows may predate inference_best_ever, so reconstruct the
+    # cumulative maximum from inference_best and merge any saved best-ever value.
     def sat(v):
         return -np.log2(np.maximum(1e-9, 1.0 - np.minimum(v, 1.0 - 1e-9)))
-    inference_raw = np.asarray([float(h.get("inference_raw", np.nan)) for h in history], dtype=float)
     inference_best = np.asarray([float(h.get("inference_best", np.nan)) for h in history], dtype=float)
-    inference_ma = _moving_average(inference_raw, ma_window)
+    inference_best_ma = _moving_average(inference_best, ma_window)
+    inference_best_ever = np.full_like(inference_best, np.nan, dtype=float)
+    running_inference_best = float("nan")
+    for i, h in enumerate(history):
+        candidates = [float(inference_best[i])]
+        try:
+            candidates.append(float(h.get("inference_best_ever", np.nan)))
+        except (TypeError, ValueError):
+            pass
+        finite_candidates = [v for v in candidates if math.isfinite(v)]
+        if finite_candidates:
+            generation_best = max(finite_candidates)
+            running_inference_best = (
+                generation_best if not math.isfinite(running_inference_best)
+                else max(running_inference_best, generation_best)
+            )
+        if math.isfinite(running_inference_best):
+            inference_best_ever[i] = running_inference_best
+
     fig = plt.figure(figsize=(11, 6))
     ax = fig.add_subplot(111)
     ax.plot(gen, sat(best), label="best", color="lightgray")
@@ -6864,14 +7187,14 @@ def write_plots(history: List[dict], prefix: str, ma_window: int) -> None:
     ax.set_ylabel("-log2(1 - Spearman)")
     ax.grid(True, alpha=0.25)
 
-    have_inference = np.any(np.isfinite(inference_raw))
+    have_inference = np.any(np.isfinite(inference_best))
     if have_inference:
         ax2 = ax.twinx()
-        ax2.plot(gen, inference_raw, label="inference raw", color="gray", alpha=0.38, linewidth=1.0)
-        ax2.plot(gen, inference_best, label="inference best", linestyle="--", linewidth=1.25)
-        ax2.plot(gen, inference_ma, label=f"inference MA({ma_window})", linewidth=1.5)
+        ax2.plot(gen, inference_best, label="inference best", linewidth=1.25, color="lightgray")
+        ax2.plot(gen, inference_best_ever, label="inference best ever", linewidth=1.35, color="purple")
+        ax2.plot(gen, inference_best_ma, label=f"inference best MA({ma_window})", linewidth=1.5, color="green")
         ax2.set_ylabel("corrupted-byte recovery accuracy")
-        ax2.set_ylim(-0.02, 1.02)
+        #ax2.set_ylim(-0.02, 1.02)
         lines = ax.get_lines() + ax2.get_lines()
         ax.legend(lines, [ln.get_label() for ln in lines], loc="best")
     else:
@@ -7417,6 +7740,7 @@ def evolve(args) -> Genome:
             "inference_budget_population": int(inference_stats.get("budget_population", inf_pop)),
             "inference_budget_generations": int(inference_stats.get("budget_generations", inf_gens)),
             "inference_search_rounds": int(inference_stats.get("search_rounds", 0)),
+            "inference_ensemble_members": int(inference_stats.get("ensemble_members", 0)),
             "inference_outer_eval_seconds": float(outer_eval_seconds),
             "inference_time_ratio": float(inference_stats.get("seconds", 0.0)) / max(1.0e-9, float(outer_eval_seconds)),
             "inference_epoch": inference_epoch,
@@ -7497,8 +7821,8 @@ def evolve(args) -> Genome:
         print(
             f"gen={generation:6d} best={champion.fitness:+.6f} "
             f"mean={mean_fit:+.6f} median={med_fit:+.6f} "
-            f"infer={float(pareto_champion.inference_accuracy):.3f} "
             f"inferBest={inference_best:.3f} "
+            f"inferBestEver={inference_best_ever:.3f} "
             f"infEns={float(inference_stats.get('ensemble_accuracy', float('nan'))):.3f} "
             f"infOracle={float(inference_stats.get('oracle_accuracy', float('nan'))):.3f} "
             f"infMove={float(inference_stats.get('selected_change_rate', float('nan'))):.2f} "
@@ -7506,6 +7830,7 @@ def evolve(args) -> Genome:
             f"infGA={float(inference_stats.get('seconds', 0.0)):.2f}s "
             f"infPlan={inf_cases}x{inf_pop}x{inf_gens}/"
             f"{int(inference_stats.get('search_rounds', 0))}r "
+            f"infVote={int(inference_stats.get('ensemble_members', 0))} "
             f"infEq={float(inference_stats.get('equivalent_work', 0.0)):.1f}/{inf_work} "
             f"active={active}/{len(champion.rules)} expand={expanding_rules} "
             f"stag={stagnation} roll={dataset_epoch} overlap={overlap_cases}/{len(current_case_serials)} "
@@ -7788,6 +8113,32 @@ def self_test() -> None:
     ma2 = _moving_average([1.0, 2.0, 3.0, 4.0], 2)
     assert np.allclose(ma2, [1.0, 1.5, 2.5, 3.5])
 
+    # v60.4/v60.5 inference budget: preserve width and spend the same work on
+    # more search depth when the voting ensemble is made smaller.
+    bc, bp, bg, bw = resolve_inference_budget(
+        200, 3, 16, 256, 0.75, genome_count=450,
+        outer_evaluated_genomes=450, ensemble_size=128,
+    )
+    assert (bc, bp, bg) == (3, 16, 7), (bc, bp, bg, bw)
+    assert bw <= 150
+    bc, bp, bg, bw = resolve_inference_budget(
+        200, 3, 16, 256, 0.75, genome_count=450,
+        outer_evaluated_genomes=450, ensemble_size=32,
+    )
+    assert (bc, bp, bg) == (3, 16, 29), (bc, bp, bg, bw)
+    assert bw <= 150
+
+    # v60.5 robust candidate vote: broad consensus wins when specialist evidence
+    # is weak, while a coherent specialist subset remains visible.
+    toy = np.asarray([
+        [0.9, 0.2, 0.1], [0.8, 0.3, 0.2], [0.85, 0.1, 0.3], [0.75, 0.4, 0.2],
+        [0.2, 0.95, 0.1], [0.2, 0.90, 0.2], [0.1, 0.85, 0.2], [0.2, 0.80, 0.3],
+    ], dtype=np.float64)
+    agg, con, spec, sup = _aggregate_inference_candidate_scores(toy)
+    assert agg.shape == con.shape == spec.shape == sup.shape == (3,)
+    assert int(np.argmax(con)) in (0, 1)
+    assert np.all(np.isfinite(agg))
+
     # v60.3 categorical differential/git-merge smoke.  A->X changes only the
     # middle token; Y independently changed the tail, so both edits survive.
     merged, edits = merge_sequence_delta([1, 2, 3], [1, 9, 3], [1, 2, 8])
@@ -7832,15 +8183,16 @@ def parse_args():
     ap.add_argument("--cases", type=int, default=2)
     ap.add_argument("--samples", type=int, default=100)
     ap.add_argument("--max-noise", type=float, default=0.35)
-    # v60.1 string-side inference objective. Default work is 3 cases x 12 candidates
-    # x 6 rounds, then automatically reduced to the --inference-budget-ratio cap.
+    # v60.5 string-side inference objective. Candidate width is preserved
+    # before search depth; the smaller 32-model inference-aware ensemble lets the
+    # same 0.75 equivalent-work budget resolve to about 3x16x29 inner rounds.
     ap.add_argument("--inference-cases", type=int, default=3, help="independent noisy snippets optimized by the inner string GA")
     ap.add_argument("--inference-population", type=int, default=16, help="candidate strings per inference case")
-    ap.add_argument("--inference-generations", type=int, default=256, help="inner GA generations per outer model generation; v60.1 default 6 remains well inside the inference work cap")
+    ap.add_argument("--inference-generations", type=int, default=256, help="upper bound on inner GA generations; the work budget reduces depth before candidate-population width")
     ap.add_argument("--inference-elites", type=int, default=3, help="top candidate strings copied unchanged each inner GA generation; clamped to leave at least one offspring slot")
     ap.add_argument("--inference-span", type=int, default=2000, help="maximum bytes in each inference snippet")
-    ap.add_argument("--inference-noise", type=float, default=0.012, help="fraction of snippet bytes deliberately corrupted and mutable")
-    ap.add_argument("--inference-ensemble", type=int, default=64, help="top Spearman genomes voting to evolve the shared candidate pool")
+    ap.add_argument("--inference-noise", type=float, default=0.05, help="fraction of snippet bytes deliberately corrupted and mutable")
+    ap.add_argument("--inference-ensemble", type=int, default=32, help="small inference-aware voting ensemble; inherited Pareto/inference specialists are mixed with current Spearman leaders")
     ap.add_argument("--inference-rotate-every", type=int, default=2, help="replace one inference case every N outer generations")
     ap.add_argument("--inference-budget-ratio", type=float, default=0.75, help="extra unique trajectory work relative to one outer evaluation; hard-capped at 0.85")
     ap.add_argument("--no-inference", action="store_true", help="disable v60 string inference and reduce Pareto selection to Spearman")
@@ -7869,7 +8221,7 @@ def parse_args():
     ap.add_argument("--linkage-max-module", type=int, default=16, help="maximum rules transplanted by one learned module")
     ap.add_argument("--operator-ucb", type=float, default=3.0e-4, help="UCB exploration scale for adaptive reproduction operators")
     ap.add_argument("--operator-epsilon", type=float, default=0.04, help="uniform exploration probability for adaptive reproduction operators")
-    ap.add_argument("--tournament", type=int, default=8)
+    ap.add_argument("--tournament", type=int, default=16)
     ap.add_argument("--crossover-rate", type=float, default=0.45)
     ap.add_argument("--diff-merge-share", type=float, default=0.50, help="within crossover events, probability of A->X delta/git-style three-parent merge instead of legacy two-point crossover")
     ap.add_argument("--mutation-rate", type=float, default=0.90)
@@ -7888,11 +8240,11 @@ def parse_args():
     )
     ap.add_argument("--max-output", type=int, default=MAX_OUTPUT)
     ap.add_argument(
-        "--mps-genome-batch", type=int, default=512,
+        "--mps-genome-batch", type=int, default=256,
         help="genomes sharing scratch buffers in one Metal dispatch; 4 is conservative, 8 may improve occupancy",
     )
     ap.add_argument(
-        "--mps-result-chunk", type=int, default=512,
+        "--mps-result-chunk", type=int, default=256,
         help="genomes queued before one MPS->CPU result synchronization; 32 balances queue depth and responsiveness",
     )
     ap.add_argument(
@@ -7916,7 +8268,7 @@ def parse_args():
         help="minimum guaranteed-dead rules before ratio-triggered pool compaction (default: 150000)",
     )
     ap.add_argument("--generations", type=int, default=1_000_000)
-    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--current-save", default="latest_minimal_gp.json", help="latest balanced Pareto-knee champion; --save remains best observed Spearman")
     ap.add_argument("--save", default="best_minimal_gp.json", help="best-ever genome JSON")
     ap.add_argument("--checkpoint", default="minimal_gp_checkpoint.npz", help="full resumable population checkpoint")
