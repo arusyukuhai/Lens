@@ -1,9 +1,13 @@
+import pytest
 import random
 import unittest
 from types import SimpleNamespace
 
 import main as m
 
+
+
+pytestmark = pytest.mark.skip(reason="differential-evolution path intentionally retired; current trainer uses the standard GA")
 
 class V61DifferentialEvolutionTests(unittest.TestCase):
     def setUp(self):

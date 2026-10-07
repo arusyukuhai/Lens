@@ -1,4 +1,6 @@
-# v60 — String-side Genetic Inference + Spearman/Recovery Pareto
+# v64 — Hidden Phrase Memory + v60 String-side Genetic Inference
+
+最新の表現力拡張（`-2/-3` hidden capture、24種類の hidden read/pop/delete、走査末尾の persistent hidden rewrite、hidden-aware cycle detection）は **[README_v64.md](README_v64.md)** を参照してください。以下は引き続き有効な v60 系 inference/Pareto の説明です。
 
 v59 の all-sample pairwise rank readout と v58 の linkage/QD/operator search を残したまま、**実際に入力文字列側を探索して復元できるか**を第二目的に追加した版です。
 
@@ -116,7 +118,7 @@ history CSV には `inference_raw`, `inference_best`, `inference_best_ever`, `in
 
 ## checkpoint compatibility
 
-v59以前の version=1 checkpoint をそのままロードできます。新しい inference/Pareto arrays が無い旧 checkpoint は NaN/default で読み込み、最初の v60 generation で再評価します。
+v64 の新規 checkpoint は `version=2` です。`version=1` checkpoint もそのままロードできますが、旧版では負の pattern token 全てが同じ wildcard 意味だったため、ロード時に旧 `-1..-16` を普通の `-1` wildcard に正規化してから v64 意味論へ移行します。これにより旧個体中の偶然の `-2/-3` が hidden-memory side effect として再解釈されることを防ぎます。
 
 ## 推奨実行
 

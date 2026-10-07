@@ -1,0 +1,1107 @@
+--- a/main.py
++++ b/main.py
+@@ -1,6 +1,17 @@
+ #!/usr/bin/env python3
+ """
+-Replacement-rule genetic programming core (v60.5 inference-consensus repair, inference-Pareto, differential git-merge crossover).
++Replacement-rule genetic programming core (v64 hidden phrase memory + v60.5 inference-consensus repair).
++
++v64 adds a second interacting state space beside the visible rewrite stream.
++Pattern -1 remains the ordinary wildcard; -2/-3 are wildcard captures that also
++write phrase pairs to the top/bottom of two persistent hidden lists. A disjoint
++24-op replacement bank (-128..-151) can read/pop/delete top/bottom, first/second,
++left/right entries. At each sweep end the current left/right entries act as
++persistent literal rewrite pairs for up to min(pair_count, 8) non-expanding
++passes. Cycle identity now hashes both visible state and hidden memory, avoiding
++false early termination when text repeats while memory is still evolving. CPU
++and cooperative MPS evaluators implement the same semantics; legacy v1
++checkpoints normalize their formerly-equivalent negative pattern spellings to -1.
+ 
+ v60.5 makes the inner inference vote smaller and inference-aware: the default voting ensemble is 32 instead of 128, half of its available slots preferentially preserve inherited inference specialists / previous Pareto-front survivors, candidate fitness combines robust consensus with a top-quartile specialist signal, and inner elites / cross-generation seeds are kept with mutable-locus diversity.  Under the same 0.75 equivalent-work cap, the default plan becomes about 3x16x29 instead of 3x16x7, so model-job cost stays similar while the string GA gets substantially more sequential repair steps.  This targets runs where infEns lagged far behind inferBest/infOracle despite a healthy 16-wide candidate pool.
+ 
+@@ -120,6 +131,12 @@
+ MAX_WILDCARDS = 16
+ MAX_RULE_TOKENS = 64
+ MAX_OUTPUT = 32768
++HIDDEN_MEMORY_MAX_ITEMS = 32
++HIDDEN_REWRITE_MAX_PASSES = 8
++# Existing replacement opcodes occupy -1..-111.  Hidden-memory operations live
++# in a disjoint 24-opcode bank so old capture/transform programs stay valid.
++HIDDEN_OPCODE_BASE = 128
++HIDDEN_OPCODE_COUNT = 24
+ RIDGE_LAMBDA = 4.0
+ TRAIN_MOD = 3  # legacy-holdout only
+ PAIRWISE_RANK_MAX_FEATURES = 256
+@@ -138,6 +155,44 @@
+ TRANSFORM_FAMILIES = ("capture", "reverse", "plus1", "minus1", "times2", "div2")
+ 
+ 
++def is_hidden_opcode(op: int) -> bool:
++    x = -int(op) - HIDDEN_OPCODE_BASE
++    return 0 <= x < HIDDEN_OPCODE_COUNT
++
++
++def encode_hidden_opcode(*, from_bottom: bool, second: bool,
++                         right: bool, action: int) -> int:
++    """Encode one of 24 hidden-list instructions.
++
++    action: 0=read, 1=pop(read+remove), 2=delete(remove without reading).
++    Selection dimensions are top/bottom, first/second, and left/right list.
++    """
++    action = max(0, min(2, int(action)))
++    idx = action + 3 * (int(bool(right)) + 2 * (int(bool(second)) + 2 * int(bool(from_bottom))))
++    return -(HIDDEN_OPCODE_BASE + idx)
++
++
++def decode_hidden_opcode(op: int) -> tuple[bool, bool, bool, int]:
++    if not is_hidden_opcode(op):
++        raise ValueError(f"not a hidden opcode: {op}")
++    idx = -int(op) - HIDDEN_OPCODE_BASE
++    action = idx % 3
++    q = idx // 3
++    right = bool(q & 1)
++    second = bool((q >> 1) & 1)
++    from_bottom = bool((q >> 2) & 1)
++    return from_bottom, second, right, action
++
++
++def random_hidden_opcode() -> int:
++    return encode_hidden_opcode(
++        from_bottom=bool(random.getrandbits(1)),
++        second=bool(random.getrandbits(1)),
++        right=bool(random.getrandbits(1)),
++        action=random.randrange(3),
++    )
++
++
+ @dataclass(slots=True)
+ class Rule:
+     pattern: List[int]
+@@ -1113,6 +1168,10 @@
+     return sum(1 for x in pattern if x < 0)
+ 
+ 
++def hidden_capture_count(pattern: Sequence[int]) -> int:
++    return sum(1 for x in pattern if x in (-2, -3))
++
++
+ def capture_number(op: int) -> int:
+     if op >= -15:
+         return -op
+@@ -1128,7 +1187,9 @@
+ def random_replacement_opcode(wc: int) -> int:
+     wc = max(1, min(MAX_WILDCARDS, wc))
+     r = random.random()
+-    if r < 0.55:
++    if r < 0.18:
++        return random_hidden_opcode()
++    if r < 0.61:
+         return -random.randint(1, min(15, wc))
+     # sort bank is omitted; family bank numbers in the Nim opcode layout:
+     # reverse=1, +1=2, -1=3, *2=4, //2=5 after the sort bank.
+@@ -1138,10 +1199,16 @@
+ 
+ 
+ def sanitize_rule(rule: Rule, sampler: CorpusSampler, embedding: Sequence[int] | None = None) -> None:
+-    # At most 16 wildcards.
++    # v64 pattern language: -1 is an ordinary wildcard, -2 captures into the
++    # top of hidden memory, and -3 captures into the bottom.  Older revisions
++    # generated -4..-16 even though all negative pattern values had identical
++    # matching semantics; normalize those legacy spellings to -1.
+     seen = 0
+     for i, v in enumerate(rule.pattern):
+         if v < 0:
++            if v not in (-1, -2, -3):
++                v = -1
++                rule.pattern[i] = v
+             seen += 1
+             if seen > MAX_WILDCARDS:
+                 rule.pattern[i] = sampler.literal(embedding)
+@@ -1153,6 +1220,9 @@
+         if t >= 0:
+             rule.replacement[i] = t % VOCAB
+             continue
++        if is_hidden_opcode(t):
++            rule.replacement[i] = int(t)
++            continue
+         # Never emit the unsupported sort bank in the minimal MPS core.
+         if -31 <= t <= -16:
+             t = -(32 + random.randrange(16))  # reverse family
+@@ -1207,7 +1277,7 @@
+     wc = wildcard_count(rule.pattern)
+     refs = [0] * wc
+     for t in rule.replacement:
+-        if t < 0 and wc > 0:
++        if t < 0 and not is_hidden_opcode(t) and wc > 0:
+             ci = capture_number(t) - 1
+             if 0 <= ci < wc:
+                 refs[ci] += 1
+@@ -1241,6 +1311,12 @@
+                 repaired.append(t)
+                 literal_budget -= 1
+             continue
++        if is_hidden_opcode(t):
++            # Hidden reads are runtime-capped by the consumed match width; pop
++            # and delete operations may emit nothing.  They therefore do not
++            # consume the static literal/capture budget here.
++            repaired.append(t)
++            continue
+         if wc <= 0:
+             continue
+         ci = capture_number(t)
+@@ -1300,7 +1376,7 @@
+     lb = max(1, min(MAX_RULE_TOKENS, int(lb)))
+     a = sampler.seeded_pattern(la, embedding)
+     if a and random.random() < 0.15:
+-        a[random.randrange(len(a))] = -1
++        a[random.randrange(len(a))] = random.choices((-1, -2, -3), weights=(0.72, 0.14, 0.14), k=1)[0]
+     b = [sampler.literal(embedding) for _ in range(lb)]
+     wc = wildcard_count(a)
+     if wc and b and random.random() < 0.20:
+@@ -1436,7 +1512,7 @@
+     """
+     if not seq:
+         if is_pattern and random.random() < 0.60:
+-            seq.append(-1)
++            seq.append(random.choices((-1, -2, -3), weights=(0.72, 0.14, 0.14), k=1)[0])
+         elif (not is_pattern) and random.random() < 0.20:
+             seq.append(random_replacement_opcode(max(1, wc_hint)))
+         else:
+@@ -1457,7 +1533,7 @@
+     if op == 0:  # substitute exactly one token/opcode
+         p = random.randrange(len(seq))
+         if is_pattern and random.random() < 0.20:
+-            seq[p] = -1 - random.randrange(min(15, MAX_WILDCARDS))
++            seq[p] = random.choices((-1, -2, -3), weights=(0.72, 0.14, 0.14), k=1)[0]
+         elif (not is_pattern) and random.random() < 0.20:
+             seq[p] = random_replacement_opcode(max(1, wc_hint))
+         else:
+@@ -1465,7 +1541,7 @@
+     elif op == 1 and len(seq) < MAX_RULE_TOKENS:  # insert one token
+         p = random.randrange(len(seq) + 1)
+         if is_pattern and random.random() < 0.15:
+-            v = -1 - random.randrange(min(15, MAX_WILDCARDS))
++            v = random.choices((-1, -2, -3), weights=(0.72, 0.14, 0.14), k=1)[0]
+         elif (not is_pattern) and random.random() < 0.20:
+             v = random_replacement_opcode(max(1, wc_hint))
+         else:
+@@ -2203,6 +2279,92 @@
+ # ---------------------------------------------------------------------------
+ 
+ 
++@dataclass(slots=True)
++class HiddenMemory:
++    """Two persistent phrase lists used by v64's attention-like side channel."""
++
++    left: List[List[int]] = field(default_factory=list)
++    right: List[List[int]] = field(default_factory=list)
++
++    def signature(self) -> tuple:
++        return (
++            tuple(tuple(map(int, x)) for x in self.left),
++            tuple(tuple(map(int, x)) for x in self.right),
++        )
++
++    @staticmethod
++    def _bounded_insert(dst: List[List[int]], phrase: Sequence[int], *, front: bool) -> None:
++        item = list(map(int, phrase))
++        if front:
++            dst.insert(0, item)
++            if len(dst) > HIDDEN_MEMORY_MAX_ITEMS:
++                dst.pop()
++        else:
++            dst.append(item)
++            if len(dst) > HIDDEN_MEMORY_MAX_ITEMS:
++                del dst[0]
++
++    def insert_pair(self, left_phrase: Sequence[int], right_phrase: Sequence[int], *, front: bool) -> None:
++        self._bounded_insert(self.left, left_phrase, front=front)
++        self._bounded_insert(self.right, right_phrase, front=front)
++
++    @staticmethod
++    def _select_index(items: Sequence[Sequence[int]], *, from_bottom: bool, second: bool) -> int | None:
++        n = len(items)
++        if n <= 0:
++            return None
++        offset = 1 if second and n >= 2 else 0
++        return (n - 1 - offset) if from_bottom else offset
++
++    def execute(self, op: int) -> tuple[List[int], bool]:
++        """Return (read phrase, memory_changed) for one hidden opcode."""
++        from_bottom, second, right, action = decode_hidden_opcode(op)
++        items = self.right if right else self.left
++        idx = self._select_index(items, from_bottom=from_bottom, second=second)
++        if idx is None:
++            return [], False
++        phrase = list(items[idx])
++        if action == 0:  # read
++            return phrase, False
++        del items[idx]
++        if action == 1:  # pop = read + remove
++            return phrase, True
++        return [], True  # delete = remove only
++
++
++def _record_hidden_captures_cpu(
++    state: Sequence[int], pattern: Sequence[int], caps: Sequence[Tuple[int, int]], memory: HiddenMemory
++) -> bool:
++    """Store the first two -2 and -3 captures as left/right pairs.
++
++    -2 inserts at the top, -3 at the bottom.  If a bank has only one capture,
++    its right partner is the empty phrase.  Further captures still participate
++    in ordinary wildcard references but are ignored by the memory write.
++    """
++    changed = False
++    capture_i = 0
++    front_vals: List[List[int]] = []
++    back_vals: List[List[int]] = []
++    for t in pattern:
++        if t >= 0:
++            continue
++        if capture_i >= len(caps):
++            break
++        s, ln = caps[capture_i]
++        if t == -2 and len(front_vals) < 2:
++            front_vals.append(list(state[s:s + ln]))
++        elif t == -3 and len(back_vals) < 2:
++            back_vals.append(list(state[s:s + ln]))
++        capture_i += 1
++    if front_vals:
++        memory.insert_pair(front_vals[0], front_vals[1] if len(front_vals) > 1 else [], front=True)
++        changed = True
++    if back_vals:
++        memory.insert_pair(back_vals[0], back_vals[1] if len(back_vals) > 1 else [], front=False)
++        changed = True
++    return changed
++
++
+ def _match_at_cpu(state: Sequence[int], pattern: Sequence[int], start: int):
+     n = len(state)
+     pos = start
+@@ -2241,12 +2403,31 @@
+     return pos, caps
+ 
+ 
+-def _emit_replacement_cpu(state: Sequence[int], rep: Sequence[int], caps: Sequence[Tuple[int, int]]) -> List[int]:
++def _emit_replacement_cpu(
++    state: Sequence[int],
++    rep: Sequence[int],
++    caps: Sequence[Tuple[int, int]],
++    memory: HiddenMemory | None = None,
++    max_emit_len: int | None = None,
++) -> tuple[List[int], bool]:
+     out: List[int] = []
++    memory_changed = False
+     wc = len(caps)
+     for t in rep:
+         if t >= 0:
+-            out.append(t)
++            if max_emit_len is None or len(out) < max_emit_len:
++                out.append(t)
++            continue
++        if is_hidden_opcode(t):
++            vals: List[int] = []
++            changed = False
++            if memory is not None:
++                vals, changed = memory.execute(t)
++                memory_changed = memory_changed or changed
++            if vals:
++                room = len(vals) if max_emit_len is None else max(0, max_emit_len - len(out))
++                if room >= len(vals):
++                    out.extend(vals)
+             continue
+         if wc <= 0:
+             continue
+@@ -2279,19 +2460,24 @@
+             vals = [((v * 2) & 511) if 0 <= v < 512 else v for v in vals]
+         elif kind == 6:
+             vals = [v // 2 if v < 512 else v for v in vals]
+-        out.extend(vals)
+-    return out
++        room = len(vals) if max_emit_len is None else max(0, max_emit_len - len(out))
++        if room >= len(vals):
++            out.extend(vals)
++    return out, memory_changed
+ 
+ 
+-def replace_once_cpu(state: Sequence[int], rule: Rule, max_output: int) -> Tuple[List[int], bool, bool]:
++def replace_once_cpu(
++    state: Sequence[int], rule: Rule, max_output: int, memory: HiddenMemory | None = None
++) -> Tuple[List[int], bool, bool, bool]:
+     pattern = rule.pattern
+     if not pattern or not state:
+-        return list(state), False, False
++        return list(state), False, False, False
+     leading = pattern[0] >= 0
+     out: List[int] = []
+     prev = 0
+     scan = 0
+     matched = False
++    memory_changed = False
+     while scan < len(state):
+         chosen = None
+         if leading:
+@@ -2311,18 +2497,87 @@
+             break
+         s, finish, caps = chosen
+         matched = True
++        if memory is not None:
++            memory_changed = _record_hidden_captures_cpu(state, pattern, caps, memory) or memory_changed
+         out.extend(state[prev:s])
+-        out.extend(_emit_replacement_cpu(state, rule.replacement, caps))
++        # Preserve the engine's non-expanding invariant dynamically even when a
++        # hidden-memory read has unknown length at rule-construction time.
++        emitted, mem_changed = _emit_replacement_cpu(
++            state, rule.replacement, caps, memory=memory, max_emit_len=max(0, finish - s)
++        )
++        memory_changed = memory_changed or mem_changed
++        out.extend(emitted)
+         if len(out) > max_output:
+-            return list(state), True, True
++            return list(state), True, True, memory_changed
+         prev = finish
+         scan = finish
+     if not matched:
+-        return list(state), False, False
++        return list(state), False, False, memory_changed
+     out.extend(state[prev:])
+     if len(out) > max_output:
+-        return list(state), True, True
+-    return out, True, False
++        return list(state), True, True, memory_changed
++    return out, True, False, memory_changed
++
++
++def _replace_phrase_nonexpanding_cpu(
++    state: Sequence[int], needle: Sequence[int], repl: Sequence[int], max_output: int
++) -> tuple[List[int], bool, bool]:
++    """Replace all non-overlapping literal occurrences, never expanding state.
++
++    Empty right-hand phrases are deliberately skipped: a hidden-memory sweep
++    may rewrite but never uses an empty entry as a deletion instruction.
++    """
++    if not needle or not repl or len(repl) > len(needle):
++        return list(state), False, False
++    n = len(state)
++    k = len(needle)
++    out: List[int] = []
++    i = 0
++    changed = False
++    while i <= n - k:
++        if list(state[i:i + k]) == list(needle):
++            out.extend(repl)
++            changed = changed or list(needle) != list(repl)
++            i += k
++        else:
++            out.append(int(state[i]))
++            i += 1
++        if len(out) > max_output:
++            return list(state), changed, True
++    out.extend(map(int, state[i:]))
++    if len(out) > max_output:
++        return list(state), changed, True
++    return out, changed, False
++
++
++def hidden_rewrite_cpu(
++    state: Sequence[int], memory: HiddenMemory, max_output: int
++) -> tuple[List[int], bool, bool]:
++    """Apply persistent left->right memory mappings at the end of a sweep.
++
++    With one pair there is one pass.  With N pairs we allow up to N passes,
++    capped at HIDDEN_REWRITE_MAX_PASSES, and stop immediately at a local fixed
++    point.  The memory itself is never consumed by this phase.
++    """
++    current = list(state)
++    pair_count = min(len(memory.left), len(memory.right))
++    if pair_count <= 0:
++        return current, False, False
++    passes = min(HIDDEN_REWRITE_MAX_PASSES, max(1, pair_count))
++    any_changed = False
++    for _ in range(passes):
++        pass_changed = False
++        for i in range(pair_count):
++            current, changed, overflow = _replace_phrase_nonexpanding_cpu(
++                current, memory.left[i], memory.right[i], max_output
++            )
++            if overflow:
++                return list(state), any_changed or changed, True
++            pass_changed = pass_changed or changed
++            any_changed = any_changed or changed
++        if not pass_changed:
++            break
++    return current, any_changed, False
+ 
+ 
+ def trajectory_features_cpu(inputs: Sequence[Sequence[int]], genome: Genome, max_output: int):
+@@ -2335,31 +2590,45 @@
+     final_states: List[List[int]] = []
+     for j, inp in enumerate(inputs):
+         state = list(inp)
++        memory = HiddenMemory()
+         limit = max(1, int(math.ceil(2.0 * math.sqrt(max(1, len(inp))))))
+-        seen = {hash(tuple(state))}
++        seen = {(tuple(state), memory.signature())}
+         for rnd in range(limit):
+             rewrote = False
+             overflow = False
++            memory_changed = False
+             for ri, rule in enumerate(genome.rules):
+-                next_state, matched, of = replace_once_cpu(state, rule, max_output)
++                next_state, matched, of, mem_changed = replace_once_cpu(
++                    state, rule, max_output, memory=memory
++                )
+                 if matched:
+                     features[j, ri] += 1.0
+                     stats[j, 1] += 1
+                     rewrote = True
++                memory_changed = memory_changed or mem_changed
+                 if of:
+                     baselines[j] -= 1.0
+                     stats[j, 2] = 1
+                     overflow = True
+                     break
+                 state = next_state
++            if not overflow:
++                state, hidden_changed, hidden_overflow = hidden_rewrite_cpu(
++                    state, memory, max_output
++                )
++                if hidden_overflow:
++                    baselines[j] -= 1.0
++                    stats[j, 2] = 1
++                    overflow = True
++                rewrote = rewrote or hidden_changed
+             stats[j, 0] = rnd + 1
+-            if overflow or not rewrote:
++            if overflow or (not rewrote and not memory_changed):
+                 break
+-            h = hash(tuple(state))
+-            if h in seen:
++            key = (tuple(state), memory.signature())
++            if key in seen:
+                 stats[j, 3] = 1
+                 break
+-            seen.add(h)
++            seen.add(key)
+         final_states.append(state)
+     return features, baselines, stats, final_states
+ 
+@@ -2393,9 +2662,12 @@
+ typedef short gp_token_t;
+ constant int GP_RULE_WORDS = 64;
+ constant int GP_INDEX_TOKENS = 513;
+-constant int GP_META_WIDTH = 7;
++constant int GP_META_WIDTH = 8;
+ constant int GP_ANCHOR_WIDTH = 5;
+ constant int GP_PAIR_BLOOM_WORDS = 128;
++constant int GP_HIDDEN_MAX_ITEMS = 32;
++constant int GP_HIDDEN_OPCODE_BASE = 128;
++constant int GP_HIDDEN_OPCODE_COUNT = 24;
+ 
+ inline uint gp_mix32(uint x) {
+     x ^= x >> 16;
+@@ -3143,6 +3415,215 @@
+     return pos > start;
+ }
+ 
++// -----------------------------------------------------------------------
++// v64 hidden phrase memory. Two independent packed phrase lists live beside
++// each trajectory. -2 captures enqueue a left/right pair at the top, -3 at the
++// bottom. Replacement opcodes -128..-151 select top/bottom, first/second,
++// left/right and read/pop/delete. The lists are bounded deques; on pressure an
++// insertion evicts from the opposite end rather than overflowing scratch.
++// -----------------------------------------------------------------------
++inline bool gp_is_hidden_opcode(int op) {
++    int x = -op - GP_HIDDEN_OPCODE_BASE;
++    return x >= 0 && x < GP_HIDDEN_OPCODE_COUNT;
++}
++
++inline int gp_hidden_item_start(
++    const device int* lens, int lens_base, int idx)
++{
++    int s = 0;
++    for (int i = 0; i < idx; ++i) s += max(0, lens[lens_base + i]);
++    return s;
++}
++
++inline void gp_hidden_delete_item_lane0(
++    device gp_token_t* tokens,
++    device int* lens,
++    int token_base,
++    int lens_base,
++    threadgroup int* hidden_state,
++    int count_slot,
++    int total_slot,
++    int idx)
++{
++    int count = hidden_state[count_slot];
++    int total = hidden_state[total_slot];
++    if (idx < 0 || idx >= count) return;
++    int start = gp_hidden_item_start(lens, lens_base, idx);
++    int ln = max(0, lens[lens_base + idx]);
++    for (int q = start + ln; q < total; ++q)
++        tokens[token_base + q - ln] = tokens[token_base + q];
++    for (int i = idx + 1; i < count; ++i)
++        lens[lens_base + i - 1] = lens[lens_base + i];
++    hidden_state[count_slot] = count - 1;
++    hidden_state[total_slot] = total - ln;
++}
++
++inline void gp_hidden_insert_item_lane0(
++    device gp_token_t* tokens,
++    device int* lens,
++    int token_base,
++    int lens_base,
++    threadgroup int* hidden_state,
++    int count_slot,
++    int total_slot,
++    const device gp_token_t* phrase_src,
++    int phrase_base,
++    int phrase_len,
++    bool front,
++    int capacity)
++{
++    int count = hidden_state[count_slot];
++    int total = hidden_state[total_slot];
++    int ln = max(0, min(capacity, phrase_len));
++
++    // Make both descriptor and token room. Front insert evicts from the bottom;
++    // bottom insert evicts from the top, preserving deque locality.
++    while ((count >= GP_HIDDEN_MAX_ITEMS || total + ln > capacity) && count > 0) {
++        if (front) {
++            int last_len = max(0, lens[lens_base + count - 1]);
++            total -= last_len;
++            count -= 1;
++            hidden_state[count_slot] = count;
++            hidden_state[total_slot] = total;
++        } else {
++            gp_hidden_delete_item_lane0(
++                tokens, lens, token_base, lens_base, hidden_state,
++                count_slot, total_slot, 0);
++            count = hidden_state[count_slot];
++            total = hidden_state[total_slot];
++        }
++    }
++    if (ln > capacity) return;
++    if (front) {
++        for (int q = total - 1; q >= 0; --q)
++            tokens[token_base + q + ln] = tokens[token_base + q];
++        for (int i = count - 1; i >= 0; --i)
++            lens[lens_base + i + 1] = lens[lens_base + i];
++        for (int q = 0; q < ln; ++q)
++            tokens[token_base + q] = phrase_src[phrase_base + q];
++        lens[lens_base] = ln;
++    } else {
++        for (int q = 0; q < ln; ++q)
++            tokens[token_base + total + q] = phrase_src[phrase_base + q];
++        lens[lens_base + count] = ln;
++    }
++    hidden_state[count_slot] = count + 1;
++    hidden_state[total_slot] = total + ln;
++}
++
++inline void gp_hidden_record_captures_lane0(
++    const device gp_token_t* src,
++    int base,
++    const device gp_token_t* pattern,
++    int pattern_len,
++    threadgroup int* cap_start,
++    threadgroup int* cap_len,
++    device gp_token_t* hidden_left,
++    device gp_token_t* hidden_right,
++    device int* hidden_left_lens,
++    device int* hidden_right_lens,
++    int hidden_token_base,
++    int hidden_lens_base,
++    threadgroup int* hidden_state,
++    int capacity,
++    threadgroup atomic_uint* hidden_changed)
++{
++    int front_s0 = 0, front_l0 = 0, front_s1 = 0, front_l1 = 0, front_n = 0;
++    int back_s0 = 0, back_l0 = 0, back_s1 = 0, back_l1 = 0, back_n = 0;
++    int ci = 0;
++    for (int p = 0; p < pattern_len; ++p) {
++        int t = int(pattern[p]);
++        if (t >= 0) continue;
++        if (t == -2 && front_n < 2) {
++            if (front_n == 0) { front_s0 = cap_start[ci]; front_l0 = cap_len[ci]; }
++            else { front_s1 = cap_start[ci]; front_l1 = cap_len[ci]; }
++            front_n += 1;
++        } else if (t == -3 && back_n < 2) {
++            if (back_n == 0) { back_s0 = cap_start[ci]; back_l0 = cap_len[ci]; }
++            else { back_s1 = cap_start[ci]; back_l1 = cap_len[ci]; }
++            back_n += 1;
++        }
++        ci += 1;
++    }
++    if (front_n > 0) {
++        gp_hidden_insert_item_lane0(
++            hidden_left, hidden_left_lens, hidden_token_base, hidden_lens_base,
++            hidden_state, 0, 2, src, base + front_s0, front_l0, true, capacity);
++        gp_hidden_insert_item_lane0(
++            hidden_right, hidden_right_lens, hidden_token_base, hidden_lens_base,
++            hidden_state, 1, 3, src, base + front_s1,
++            (front_n > 1 ? front_l1 : 0), true, capacity);
++        atomic_store_explicit(hidden_changed, 1u, memory_order_relaxed);
++    }
++    if (back_n > 0) {
++        gp_hidden_insert_item_lane0(
++            hidden_left, hidden_left_lens, hidden_token_base, hidden_lens_base,
++            hidden_state, 0, 2, src, base + back_s0, back_l0, false, capacity);
++        gp_hidden_insert_item_lane0(
++            hidden_right, hidden_right_lens, hidden_token_base, hidden_lens_base,
++            hidden_state, 1, 3, src, base + back_s1,
++            (back_n > 1 ? back_l1 : 0), false, capacity);
++        atomic_store_explicit(hidden_changed, 1u, memory_order_relaxed);
++    }
++}
++
++inline int gp_hidden_execute_lane0(
++    int op,
++    const device gp_token_t* src,
++    device gp_token_t* dst,
++    int base,
++    int n,
++    int out_pos,
++    int out_limit,
++    device gp_token_t* hidden_left,
++    device gp_token_t* hidden_right,
++    device int* hidden_left_lens,
++    device int* hidden_right_lens,
++    int hidden_token_base,
++    int hidden_lens_base,
++    threadgroup int* hidden_state,
++    threadgroup atomic_uint* hidden_changed,
++    threadgroup atomic_uint* diff_flag)
++{
++    int code = -op - GP_HIDDEN_OPCODE_BASE;
++    if (code < 0 || code >= GP_HIDDEN_OPCODE_COUNT) return 0;
++    int action = code % 3;
++    int q = code / 3;
++    bool right = (q & 1) != 0;
++    bool second = ((q >> 1) & 1) != 0;
++    bool from_bottom = ((q >> 2) & 1) != 0;
++
++    device gp_token_t* tokens = right ? hidden_right : hidden_left;
++    device int* lens = right ? hidden_right_lens : hidden_left_lens;
++    int count_slot = right ? 1 : 0;
++    int total_slot = right ? 3 : 2;
++    int count = hidden_state[count_slot];
++    if (count <= 0) return 0;
++    int offset = (second && count >= 2) ? 1 : 0;
++    int idx = from_bottom ? (count - 1 - offset) : offset;
++    int start = gp_hidden_item_start(lens, hidden_lens_base, idx);
++    int ln = max(0, lens[hidden_lens_base + idx]);
++
++    int emitted = 0;
++    if (action != 2 && out_pos + ln <= out_limit) {
++        for (int i = 0; i < ln; ++i) {
++            int v = int(tokens[hidden_token_base + start + i]);
++            int oq = out_pos + i;
++            dst[base + oq] = gp_token_t(v);
++            if (oq >= n || v != int(src[base + oq]))
++                atomic_store_explicit(diff_flag, 1u, memory_order_relaxed);
++        }
++        emitted = ln;
++    }
++    if (action == 1 || action == 2) {
++        gp_hidden_delete_item_lane0(
++            tokens, lens, hidden_token_base, hidden_lens_base, hidden_state,
++            count_slot, total_slot, idx);
++        atomic_store_explicit(hidden_changed, 1u, memory_order_relaxed);
++    }
++    return emitted;
++}
++
+ 
+ // Fast path for wildcard-free pattern + all-literal replacement on short states.
+ // All candidate starts are matched in parallel once; lane 0 performs only the
+@@ -3900,6 +4381,14 @@
+     threadgroup int* cap_start,
+     threadgroup int* cap_len,
+     threadgroup atomic_uint* diff_flag,
++    device gp_token_t* hidden_left,
++    device gp_token_t* hidden_right,
++    device int* hidden_left_lens,
++    device int* hidden_right_lens,
++    int hidden_token_base,
++    int hidden_lens_base,
++    threadgroup int* hidden_state,
++    threadgroup atomic_uint* hidden_changed,
+     device int* changed_regions)
+ {
+     if (tid == 0) {
+@@ -3956,7 +4445,7 @@
+                 if (ctrl[9] >= 0) break;
+                 tile += int(tg_size);
+             }
+-            if (tid == 0 && ctrl[9] >= 0 && wildcard_count > 0 && replacement_all_literal == 0) {
++            if (tid == 0 && ctrl[9] >= 0 && wildcard_count > 0) {
+                 int finish = -1;
+                 bool ok = gp_match_capture_selected(src, base, n, pattern, pattern_len,
+                     ctrl[9], cap_start, cap_len, finish);
+@@ -3976,6 +4465,15 @@
+         if (ctrl[9] < 0) break;
+ 
+         if (tid == 0) {
++            gp_hidden_record_captures_lane0(
++                src, base, pattern, pattern_len, cap_start, cap_len,
++                hidden_left, hidden_right, hidden_left_lens, hidden_right_lens,
++                hidden_token_base, hidden_lens_base, hidden_state, capacity,
++                hidden_changed);
++        }
++        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++
++        if (tid == 0) {
+             ctrl[0] = 1;
+             ctrl[1] = 1;
+             ctrl[4] += 1;
+@@ -4005,6 +4503,7 @@
+         if (tid == 0) ctrl[8] += seg_len;
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+         int replacement_out_start = ctrl[8];
++        int match_out_limit = replacement_out_start + max(0, ctrl[10] - ctrl[9]);
+ 
+         // Fast path for the overwhelmingly common all-literal replacement:
+         // reserve once, copy the entire replacement cooperatively, and pay one
+@@ -4034,7 +4533,7 @@
+                 if (tid == 0) {
+                     if (ctrl[8] >= capacity || ctrl[8] >= logical_max_output)
+                         ctrl[3] = 1;
+-                    else {
++                    else if (ctrl[8] < match_out_limit) {
+                         int oq = ctrl[8];
+                         dst[base + oq] = t;
+                         if (oq >= n || t != src[base + oq])
+@@ -4047,6 +4546,19 @@
+                 continue;
+             }
+ 
++            if (gp_is_hidden_opcode(t)) {
++                if (tid == 0) {
++                    int emitted = gp_hidden_execute_lane0(
++                        t, src, dst, base, n, ctrl[8], match_out_limit,
++                        hidden_left, hidden_right, hidden_left_lens, hidden_right_lens,
++                        hidden_token_base, hidden_lens_base, hidden_state,
++                        hidden_changed, diff_flag);
++                    ctrl[8] += emitted;
++                }
++                threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++                continue;
++            }
++
+             if (wildcard_count <= 0) {
+                 threadgroup_barrier(mem_flags::mem_threadgroup);
+                 continue;
+@@ -4074,6 +4586,7 @@
+                 ctrl[14] = ci;
+                 ctrl[11] = cap_start[ci];
+                 ctrl[12] = cap_len[ci];
++                if (ctrl[8] + ctrl[12] > match_out_limit) ctrl[12] = 0;
+                 if (ctrl[8] + ctrl[12] > capacity ||
+                     ctrl[8] + ctrl[12] > logical_max_output) ctrl[3] = 1;
+             }
+@@ -4314,6 +4827,10 @@
+     device int* literal_positions [[buffer(28)]],
+     device int* wildcard_aux [[buffer(29)]],
+     const device int* anchors [[buffer(30)]],
++    device gp_token_t* hidden_left [[buffer(31)]],
++    device gp_token_t* hidden_right [[buffer(32)]],
++    device int* hidden_left_lens [[buffer(33)]],
++    device int* hidden_right_lens [[buffer(34)]],
+     uint group_u [[threadgroup_position_in_grid]],
+     uint tid [[thread_index_in_threadgroup]],
+     uint tg_size [[threads_per_threadgroup]])
+@@ -4338,6 +4855,7 @@
+     threadgroup atomic_uint token_seen[17];
+     threadgroup atomic_uint pair_bloom[GP_PAIR_BLOOM_WORDS];
+     threadgroup atomic_uint diff_flag;
++    threadgroup atomic_uint hidden_changed;
+     threadgroup int best_s_lane[GP_TG_SIZE];
+     threadgroup int best_f_lane[GP_TG_SIZE];
+     threadgroup int cap_start[16];
+@@ -4353,6 +4871,8 @@
+     threadgroup uint hash_part1[GP_TG_SIZE];
+     threadgroup uint hash_part2[GP_TG_SIZE];
+     threadgroup uint hash_out[2];
++    // left_count, right_count, left_token_count, right_token_count
++    threadgroup int hidden_state[4];
+ 
+     int emb_base = global_genome * 256;
+     for (int i = int(tid); i < n; i += int(tg_size)) {
+@@ -4371,6 +4891,7 @@
+         shared[1] = n;
+         shared[2] = 0; // stop
+         shared[3] = 0; // seen_count
++        for (int i = 0; i < 4; ++i) hidden_state[i] = 0;
+     }
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+@@ -4383,6 +4904,7 @@
+             shared[6] = 0; // round_state_changed
+             shared[7] = 0; // next rule index
+             shared[8] = 1; // 1=full build, 2=monotone extension
++            atomic_store_explicit(&hidden_changed, 0u, memory_order_relaxed);
+         }
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+@@ -4401,6 +4923,30 @@
+                     pair_capacity, tid, tg_size, candidate_bits, token_seen, pair_bloom,
+                     hash_part1, hash_part2, hash_out);
+                 if (tid == 0) {
++                    // Cycle identity is the complete machine state, not just
++                    // the visible token stream.  Without hidden memory here,
++                    // a same-text/different-memory state would be terminated
++                    // spuriously after v64.
++                    uint mh1 = gp_mix32(uint(hidden_state[0]) ^ 0x51ed270bu);
++                    uint mh2 = gp_mix32(uint(hidden_state[1]) ^ 0x94d049bbu);
++                    int lp = 0;
++                    for (int i = 0; i < hidden_state[0]; ++i) {
++                        int ln = max(0, hidden_left_lens[job * GP_HIDDEN_MAX_ITEMS + i]);
++                        mh1 ^= gp_mix32(uint(ln) + uint(i) * 0x9e3779b9u);
++                        for (int q = 0; q < ln; ++q)
++                            mh1 ^= gp_mix32(uint(hidden_left[base + lp + q]) + uint(q + 1) * 0x85ebca6bu);
++                        lp += ln;
++                    }
++                    int rp = 0;
++                    for (int i = 0; i < hidden_state[1]; ++i) {
++                        int ln = max(0, hidden_right_lens[job * GP_HIDDEN_MAX_ITEMS + i]);
++                        mh2 += gp_mix32(uint(ln) + uint(i) * 0xc2b2ae35u);
++                        for (int q = 0; q < ln; ++q)
++                            mh2 += gp_mix32(uint(hidden_right[base + rp + q]) + uint(q + 1) * 0x27d4eb2du);
++                        rp += ln;
++                    }
++                    hash_out[0] ^= gp_mix32(mh1 ^ uint(hidden_state[2]));
++                    hash_out[1] += gp_mix32(mh2 ^ uint(hidden_state[3]));
+                     // v31: candidate construction already scanned every token.
+                     // Fold cycle hashing into that same pass instead of reading
+                     // the whole state again at the end of the previous round.
+@@ -4461,6 +5007,7 @@
+             int wc = metadata[mq + 4];
+             int leading = metadata[mq + 5];
+             int rep_literal = metadata[mq + 6];
++            int hidden_rule = metadata[mq + 7];
+             device gp_token_t* dst = current_is_a ? buffer_b : buffer_a;
+             int aq = (global_genome * rule_count + r) * GP_ANCHOR_WIDTH;
+             int anchor_kind = anchors[aq + 0];
+@@ -4481,8 +5028,8 @@
+                 continue;
+             }
+ 
+-            bool use_literal_fast = (wc == 0 && rep_literal != 0);
+-            bool use_wc1_fast = (wc == 1);
++            bool use_literal_fast = (hidden_rule == 0 && wc == 0 && rep_literal != 0);
++            bool use_wc1_fast = (hidden_rule == 0 && wc == 1);
+             if (use_literal_fast) {
+                 gp_apply_literal_fast(
+                     src_rw, dst, base, current_n, capacity, logical_max_output,
+@@ -4500,7 +5047,10 @@
+                     src, dst, base, current_n, capacity, logical_max_output,
+                     pat, pat_len, rep, rep_len, wc, leading, rep_literal,
+                     tid, tg_size, ctrl, best_s_lane, best_f_lane,
+-                    cap_start, cap_len, &diff_flag, literal_positions + base);
++                    cap_start, cap_len, &diff_flag,
++                    hidden_left, hidden_right, hidden_left_lens, hidden_right_lens,
++                    base, job * GP_HIDDEN_MAX_ITEMS, hidden_state, &hidden_changed,
++                    literal_positions + base);
+             }
+ 
+             // v23 fast path: literal rewrites already expose every changed span.
+@@ -4578,10 +5128,69 @@
+         // termination semantics and do not count a phantom extra round.
+         if (shared[2] != 0) break;
+ 
++        // v64 attention-like memory phase. Pair hidden left/right phrases by
++        // their current list positions and apply left->right literal rewrites.
++        // One pair gets one pass; N pairs get up to min(N, 8) passes. Hidden
++        // entries are deliberately persistent here (no pop/delete on use).
++        if (hidden_state[0] > 0 && hidden_state[1] > 0 && shared[5] == 0) {
++            int pair_count = min(hidden_state[0], hidden_state[1]);
++            int hidden_passes = min(8, max(1, pair_count));
++            for (int hp = 0; hp < hidden_passes; ++hp) {
++                if (tid == 0) shared[10] = 0; // pass changed
++                threadgroup_barrier(mem_flags::mem_threadgroup);
++                for (int hi = 0; hi < pair_count; ++hi) {
++                    if (tid == 0) {
++                        shared[11] = gp_hidden_item_start(
++                            hidden_left_lens, job * GP_HIDDEN_MAX_ITEMS, hi);
++                        shared[12] = max(0, hidden_left_lens[job * GP_HIDDEN_MAX_ITEMS + hi]);
++                        shared[13] = gp_hidden_item_start(
++                            hidden_right_lens, job * GP_HIDDEN_MAX_ITEMS, hi);
++                        shared[14] = max(0, hidden_right_lens[job * GP_HIDDEN_MAX_ITEMS + hi]);
++                    }
++                    threadgroup_barrier(mem_flags::mem_threadgroup);
++                    int ll = shared[12];
++                    int rl = shared[14];
++                    // Empty RHS is not a deletion instruction.  Keep the hard
++                    // non-expanding invariant by skipping mappings that grow.
++                    if (ll <= 0 || rl <= 0 || rl > ll) continue;
++
++                    int current_n = shared[1];
++                    bool current_is_a = shared[0] != 0;
++                    device gp_token_t* src_rw = current_is_a ? buffer_a : buffer_b;
++                    device gp_token_t* dst = current_is_a ? buffer_b : buffer_a;
++                    gp_apply_literal_fast(
++                        src_rw, dst, base, current_n, capacity, logical_max_output,
++                        hidden_left + base + shared[11], ll,
++                        hidden_right + base + shared[13], rl,
++                        0, -1, tid, tg_size, ctrl,
++                        (device atomic_uint*)(wildcard_aux + base),
++                        literal_positions + base, best_s_lane);
++                    if (tid == 0) {
++                        if (ctrl[3] != 0) {
++                            stat_local[2] = 1;
++                            shared[5] = 1;
++                        } else if (ctrl[1] != 0 && ctrl[2] != 0) {
++                            shared[1] = ctrl[5];
++                            if (ctrl[14] == 0)
++                                shared[0] = current_is_a ? 0 : 1;
++                            shared[4] = 1;
++                            shared[6] = 1;
++                            shared[10] = 1;
++                        }
++                    }
++                    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++                    if (shared[5] != 0) break;
++                }
++                if (shared[5] != 0 || shared[10] == 0) break;
++                threadgroup_barrier(mem_flags::mem_threadgroup);
++            }
++        }
++
+         if (tid == 0) {
+             stat_local[0] = round_idx + 1;
+-            if (shared[5] != 0 || shared[4] == 0) shared[2] = 1;
+-            else if (shared[6] == 0) {
++            bool mem_changed = atomic_load_explicit(&hidden_changed, memory_order_relaxed) != 0u;
++            if (shared[5] != 0 || (shared[4] == 0 && !mem_changed)) shared[2] = 1;
++            else if (shared[6] == 0 && !mem_changed) {
+                 stat_local[3] = 1;
+                 shared[2] = 1;
+             }
+@@ -4610,7 +5219,7 @@
+ 
+ 
+ class MpsPopulationEvaluator:
+-    META_WIDTH = 7
++    META_WIDTH = 8
+ 
+     def __init__(self, sample_count: int, rule_count: int, max_raw_len: int,
+                  max_output: int, genome_batch: int = 4,
+@@ -4659,6 +5268,15 @@
+         # v27: one extra int scratch row lets the one-wildcard matcher keep a
+         # nearest-suffix table/output-start table without touching the live state.
+         self.wildcard_aux = torch.empty((jobs, self.capacity), dtype=torch.int32, device=self.device)
++        # v64 persistent per-trajectory hidden phrase memory. Tokens are packed
++        # densely per side up to one state-capacity; 32 descriptor lengths keep
++        # top/bottom and first/second operations O(32) without large per-item
++        # fixed slots.
++        self.hidden_left = torch.empty((jobs, self.capacity), dtype=torch.int16, device=self.device)
++        self.hidden_right = torch.empty_like(self.hidden_left)
++        self.hidden_left_lens = torch.empty(
++            (jobs, HIDDEN_MEMORY_MAX_ITEMS), dtype=torch.int32, device=self.device)
++        self.hidden_right_lens = torch.empty_like(self.hidden_left_lens)
+         self.seen = torch.empty((jobs, self.max_rounds, 2), dtype=torch.int32, device=self.device)
+         self._raw_byte_counts = np.ones(INPUT_BYTE_COUNT, dtype=np.float64)
+         self._raw_pair_counts = np.zeros((INPUT_BYTE_COUNT, INPUT_BYTE_COUNT), dtype=np.int64)
+@@ -4717,7 +5335,7 @@
+         # rescanning ~675k rule patterns every generation merely to feed the
+         # v28 anchor-guided literal matcher.  New structural rules pay once.
+         self._anchor_offset_cache: dict[tuple[int, int, int, int], int] = {}
+-        self._pool_meta_host: list[tuple[int, int, int, int, int, int, int]] = []
++        self._pool_meta_host: list[tuple[int, int, int, int, int, int, int, int]] = []
+         self._pool_tokens_host: list[int] = []
+         self._pool_rule_capacity = max(4096, self.rule_count * 2)
+         self._pool_token_capacity = max(65536, self.rule_count * 16)
+@@ -4743,7 +5361,8 @@
+         # Unified-memory visibility is important on M1: a large genome_batch
+         # multiplies three max_output-sized scratch buffers.  Report it so batch
+         # tuning is based on the actual working set rather than "bigger is faster".
+-        scratch_bytes = int(jobs) * int(self.capacity) * 12
++        scratch_bytes = int(jobs) * int(self.capacity) * 16
++        scratch_bytes += int(jobs) * int(HIDDEN_MEMORY_MAX_ITEMS) * 8
+         self.scratch_bytes = scratch_bytes
+         if self.progress:
+             msg = f"  mps scratch={scratch_bytes / (1024**3):.2f} GiB"
+@@ -4989,7 +5608,7 @@
+         non-Apple machines and so the mark/compact semantics are explicit.
+         """
+         new_key_to_id: dict[tuple, int] = {}
+-        new_meta: list[tuple[int, int, int, int, int, int, int]] = []
++        new_meta: list[tuple[int, int, int, int, int, int, int, int]] = []
+         new_tokens: list[int] = []
+         object_pid: dict[int, int] = {}
+ 
+@@ -5024,6 +5643,8 @@
+                     new_meta.append((
+                         po, len(p), ro, len(rep), int(rule.pack_wc),
+                         int(rule.pack_leading), int(rule.pack_rep_literal),
++                        1 if (any(int(v) in (-2, -3) for v in p) or
++                              any(is_hidden_opcode(int(v)) for v in rep)) else 0,
+                     ))
+                     new_key_to_id[key] = pid
+                 object_pid[oid] = int(pid)
+@@ -5188,6 +5809,8 @@
+         self._pool_meta_host.append((
+             po, len(p), ro, len(rep), int(rule.pack_wc),
+             int(rule.pack_leading), int(rule.pack_rep_literal),
++            1 if (any(int(v) in (-2, -3) for v in p) or
++                  any(is_hidden_opcode(int(v)) for v in rep)) else 0,
+         ))
+         self._pool_key_to_id[key] = pid
+         rule.pool_id = pid
+@@ -5448,6 +6071,8 @@
+                     int(global_start), int(local_start), int(self.max_rounds),
+                     int(pair_cap), self.literal_positions, self.wildcard_aux,
+                     self._anchors_d[:total].reshape(-1),
++                    self.hidden_left, self.hidden_right,
++                    self.hidden_left_lens.reshape(-1), self.hidden_right_lens.reshape(-1),
+                     threads=[jobs * self.threadgroup_size, 1, 1],
+                     group_size=[self.threadgroup_size, 1, 1],
+                 )
+@@ -6841,6 +7466,7 @@
+ 
+ def save_genome(path: str, genome: Genome, generation: int) -> None:
+     payload = {
++        "program_version": 64,
+         "generation": generation,
+         "fitness": genome.fitness,
+         "case_scores": genome.case_scores,
+@@ -6982,7 +7608,9 @@
+     if not path:
+         return
+     arrays: dict = {
+-        "version": np.asarray([1], dtype=np.int32),
++        # v2 distinguishes the new semantic -2/-3 pattern tokens from the old
++        # revisions where every negative pattern spelling meant plain wildcard.
++        "version": np.asarray([2], dtype=np.int32),
+         "next_generation": np.asarray([int(next_generation)], dtype=np.int64),
+         "history": _bytes_array(list(history)),
+         "py_rng": _bytes_array(random.getstate()),
+@@ -7023,7 +7651,7 @@
+ def load_checkpoint(path: str, sampler: CorpusSampler):
+     with np.load(path, allow_pickle=False) as z:
+         version = int(z["version"][0])
+-        if version != 1:
++        if version not in (1, 2):
+             raise ValueError(f"unsupported checkpoint version {version}")
+         next_generation = int(z["next_generation"][0])
+         population = _unpack_genome_group(z, "pop_")
+@@ -7042,6 +7670,17 @@
+         sampler._byte_buffer = np.asarray(z["sampler_byte_buffer"], dtype=np.uint16).copy()
+         sampler._byte_pos = int(z["sampler_byte_pos"][0])
+         config = dict(_array_object(z["config"]))
++    if version == 1:
++        # Pre-v64 pattern values -1..-16 were semantically indistinguishable.
++        # Convert them all to ordinary -1 before enabling -2/-3 side effects so
++        # resuming an old run does not silently reinterpret existing genomes.
++        groups = [population, best_group, hof_group]
++        for group in groups:
++            for g in group:
++                for r in g.rules:
++                    if any(int(v) < 0 for v in r.pattern):
++                        r.pattern[:] = [-1 if int(v) < 0 else int(v) for v in r.pattern]
++                        invalidate_rule_pack_cache(r)
+     random.setstate(py_rng)
+     np.random.set_state(np_rng)
+     if torch is not None and torch_rng.size:

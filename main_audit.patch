@@ -1,0 +1,749 @@
+--- main.pre_audit.py	2026-10-07 05:01:09.924986631 +0000
++++ main.py	2026-10-07 05:14:39.712447238 +0000
+@@ -18,7 +18,7 @@
+ 
+ v60.5 makes the inner inference vote smaller and inference-aware: the default voting ensemble is 32 instead of 128, half of its available slots preferentially preserve inherited inference specialists / previous Pareto-front survivors, candidate fitness combines robust consensus with a top-quartile specialist signal, and inner elites / cross-generation seeds are kept with mutable-locus diversity.  Under the same 0.75 equivalent-work cap, the default plan becomes about 3x16x29 instead of 3x16x7, so model-job cost stays similar while the string GA gets substantially more sequential repair steps.  This targets runs where infEns lagged far behind inferBest/infOracle despite a healthy 16-wide candidate pool.
+ 
+-v60.4 repairs the string-side search geometry: the inference work budget now preserves candidate-population width and reduces inner generations first; initial candidates are single-locus counterfactuals; ordinary inference mutation is local-heavy with rare wide jumps; the voting ensemble reserves slots for inherited inference-strong Pareto survivors; and the context proposal table is strengthened by a bounded deterministic corpus sample. This directly addresses runs where infOracle == inferBest but the candidate pool itself recovers only ~5-16% of corrupted bytes.
++v60.4 repairs the string-side search geometry: the inference work budget now preserves candidate-population width and reduces inner generations first; initial candidates are single-locus counterfactuals; ordinary inference mutation uses the v60.2 log-uniform mutation radius; the voting ensemble reserves slots for inherited inference-strong Pareto survivors; and the context proposal table is strengthened by a bounded deterministic corpus sample. This directly addresses runs where infOracle == inferBest but the candidate pool itself recovers only ~5-16% of corrupted bytes.
+ 
+ v60.3 adds a three-parent categorical differential/git-style crossover: for base A, donor X, and target Y, non-conflicting A->X rule-sequence edits are applied to Y. It probabilistically shares the existing crossover budget with legacy two-point crossover.
+ 
+@@ -31,8 +31,9 @@
+ ensemble-only inner search + one full-population final scoring pass, reuses MPS
+ rule/index packs across inner generations, fixes tie handling/GC roots/corpus edge
+ cases, and keeps a conservative inference-work cap well below the requested ~2x
+-wall-time envelope. v57/v59 ranking and Metal rewrite kernels are retained.
+-CPU path can run without PyTorch. Metal rewrite kernels are unchanged.
++wall-time envelope. v57/v59 ranking is retained. CPU path can run without PyTorch.
++The v64 hidden-memory Metal path includes equivalent bounded-list optimizations to avoid
++quadratic pair-prefix scans; visible rewrite semantics remain unchanged.
+ 
+ Original engine lineage (v51 len1-word-prefix v50 len1-direct v45 match-bitset v38 literal-3gram-bloom v55 rule-pack-memo v56 recode-pack-memo v33 dual-anchor-bloom v31 narrow-state wc1-inplace fused-hash v30 wc1-general-fast v28 inplace-literal anchor-guided score-reuse direct-diff variable-length GPU-index incremental-candidate rolling-HoF rolling-evaluation bounded-workload compacting-GC precise-mutation/nonexpanding cooperative MPS), ported from
+ at_jev(20261002-082442).nim.
+@@ -60,8 +61,9 @@
+ 
+ Deliberately removed:
+   FAST/FULL, rolling timescales, race/rejection, lexicase,
+-  full mutation bandits/probes, Jev/fusion, genealogy, Pareto runtime pressure,
+-  checkpoint migration and most diagnostics.
++  full mutation bandits/probes, Jev/fusion, genealogy, runtime-pressure objectives,
++  and most legacy diagnostics. Checkpoint compatibility is retained for supported
++  historical formats, while v3 deduplicates rule structure on disk.
+ 
+ GPU path:
+   MPS maps one whole trajectory to one cooperative Metal threadgroup. Threads
+@@ -313,11 +315,10 @@
+ 
+ 
+ def clone_genome_deep(g: Genome) -> Genome:
+-    """Fully independent clone used for the persistent Hall-of-Fame.
++    """Fully independent structural clone for diagnostics/legacy callers.
+ 
+-    Normal offspring intentionally share untouched Rule objects for speed. The v25
+-    readout itself is genome-local, but a long-lived HoF still owns Rule objects so
+-    later structural cache mutations/recoding cannot leak across archive lineages.
++    Normal evolution and the HoF use copy-on-write shallow clones; this helper is
++    retained for tests and callers that explicitly require independent Rule objects.
+     """
+     out = Genome(
+         [clone_rule(r) for r in g.rules],
+@@ -370,13 +371,61 @@
+     return min(1.0, 0.90 * rule_distance + 0.10 * emb_distance)
+ 
+ 
++def genome_structural_distance_below(
++    a: Genome, b: Genome, threshold: float
++) -> float | None:
++    """Return the exact distance only when it is strictly below ``threshold``.
++
++    HoF admission needs only a yes/no answer for the diversity radius.  Since the
++    rule component is a non-negative mismatch count, once its lower bound crosses
++    the threshold the remaining ~1500 rows cannot make the genomes near again.
++    This preserves the exact decision while allowing far lineages to stop after a
++    few mismatches instead of scanning every archived rule.
++    """
++    limit = max(0.0, float(threshold))
++    if limit <= 0.0:
++        return None
++
++    la, lb = len(a.rules), len(b.rules)
++    n = min(la, lb)
++    m = min(len(a.embedding), len(b.embedding))
++    if m:
++        emb_distance = sum(
++            int(x != y) for x, y in zip(a.embedding[:m], b.embedding[:m])
++        ) / float(m)
++    else:
++        emb_distance = 0.0
++
++    if n <= 0:
++        rule_distance = 1.0 if la != lb else 0.0
++        distance = min(1.0, 0.90 * rule_distance + 0.10 * emb_distance)
++        return distance if distance < limit else None
++
++    length_penalty = abs(la - lb) / max(1, max(la, lb))
++    # Even zero mismatches cannot get below the threshold if the fixed length /
++    # embedding contribution already exceeds it.
++    fixed = 0.90 * min(1.0, length_penalty) + 0.10 * emb_distance
++    if fixed >= limit:
++        return None
++
++    mismatches = 0
++    for ra, rb in zip(a.rules[:n], b.rules[:n]):
++        if not ((ra is rb) or (ra.pattern == rb.pattern and ra.replacement == rb.replacement)):
++            mismatches += 1
++            rule_lower = min(1.0, mismatches / float(n) + length_penalty)
++            if min(1.0, 0.90 * rule_lower + 0.10 * emb_distance) >= limit:
++                return None
++
++    rule_distance = min(1.0, mismatches / float(n) + length_penalty)
++    distance = min(1.0, 0.90 * rule_distance + 0.10 * emb_distance)
++    return distance if distance < limit else None
+ 
+ 
+ def same_genome_structure(a: Genome, b: Genome) -> bool:
+     if a.embedding != b.embedding or len(a.rules) != len(b.rules):
+         return False
+     return all(
+-        ra.pattern == rb.pattern and ra.replacement == rb.replacement
++        (ra is rb) or (ra.pattern == rb.pattern and ra.replacement == rb.replacement)
+         for ra, rb in zip(a.rules, b.rules)
+     )
+ 
+@@ -426,7 +475,10 @@
+     genome: Genome, case_serials: Sequence[int], generation: int,
+     history_cases: int, current_weight: float,
+ ) -> HallOfFameEntry:
+-    entry = HallOfFameEntry(clone_genome_deep(genome), born_generation=int(generation))
++    # Rule structures are immutable under normal evolution (offspring use COW).
++    # Sharing them with the archive avoids 1500 fresh Rule objects per admission
++    # attempt while evaluator-local cache fields remain safe to share.
++    entry = HallOfFameEntry(clone_genome_shallow(genome), born_generation=int(generation))
+     refresh_hof_entry(entry, case_serials, history_cases, current_weight)
+     return entry
+ 
+@@ -458,14 +510,35 @@
+         cand = make_hof_entry(genome, case_serials, generation, history_cases, current_weight)
+         if not archive:
+             archive.append(cand); admitted += 1; continue
+-        distances = [genome_structural_distance(cand.genome, e.genome) for e in archive]
+-        nearest = int(np.argmin(np.asarray(distances, dtype=np.float64)))
+-        if distances[nearest] < threshold:
++        nearest = -1
++        nearest_dist = float("inf")
++        if threshold > 0.0:
++            for i, entry in enumerate(archive):
++                distance = genome_structural_distance_below(
++                    cand.genome, entry.genome, threshold
++                )
++                if distance is not None and distance < nearest_dist:
++                    nearest = i
++                    nearest_dist = distance
++        if nearest >= 0:
+             incumbent = archive[nearest]
+-            # For the same lineage, require a genuinely better current test score.
+-            # Historical cache belongs to the old structure and must not be copied.
++            # For the same lineage, require a genuinely better score on serials
++            # both structures actually saw. A resumed HoF has no comparable
++            # serials yet; do not let its stale pre-resume fitness block a fresh
++            # candidate from the same lineage.
+             common = sorted(set(cand.score_cache) & set(incumbent.score_cache))
+-            if common and statistics.fmean(cand.score_cache[k] - incumbent.score_cache[k] for k in common) > 1.0e-12:
++            better_common = (
++                bool(common)
++                and statistics.fmean(
++                    cand.score_cache[k] - incumbent.score_cache[k] for k in common
++                ) > 1.0e-12
++            )
++            incumbent_unscored = (
++                not common
++                and (not math.isfinite(incumbent.archive_score)
++                     or not math.isfinite(incumbent.current_fitness))
++            )
++            if better_common or incumbent_unscored:
+                 archive[nearest] = cand
+                 replaced += 1
+         else:
+@@ -714,11 +787,16 @@
+         parts = raw.splitlines()
+     for part in parts:
+         part = part.strip(b"\r\n")
+-        if len(part) < min_len or len(part) > max_len:
++        if len(part) < min_len:
+             continue
++        # ``max_len <= 0`` means unbounded.  Longer chunks are useful training
++        # material and should be randomly windowed, not discarded before this
++        # branch can run.
+         if max_len > 0 and len(part) > max_len:
+             start = random.randrange(0, len(part) - max_len + 1)
+             part = part[start : start + max_len]
++        if len(part) < min_len:
++            continue
+         chunks.append(bytes(part))
+         if len(chunks) >= limit:
+             break
+@@ -746,11 +824,13 @@
+         if not isinstance(text, str):
+             continue
+         b = text.encode("utf-8", errors="ignore")
+-        if len(b) < min_len or len(b) > max_len:
++        if len(b) < min_len:
+             continue
+         if max_len > 0 and len(b) > max_len:
+             start = random.randrange(0, len(b) - max_len + 1)
+             b = b[start : start + max_len]
++        if len(b) < min_len:
++            continue
+         chunks.append(b)
+         if len(chunks) >= limit:
+             break
+@@ -3505,8 +3585,22 @@
+     int count = hidden_state[count_slot];
+     int total = hidden_state[total_slot];
+     if (idx < 0 || idx >= count) return;
+-    int start = gp_hidden_item_start(lens, lens_base, idx);
+     int ln = max(0, lens[lens_base + idx]);
++    // Hidden opcodes can address only the first/second item from either edge.
++    // Compute those offsets in O(1); retain the generic prefix scan solely as a
++    // defensive fallback for future opcode extensions.
++    int start = 0;
++    if (idx <= 0) {
++        start = 0;
++    } else if (idx == 1) {
++        start = max(0, lens[lens_base]);
++    } else if (idx == count - 1) {
++        start = max(0, total - ln);
++    } else if (idx == count - 2) {
++        start = max(0, total - ln - max(0, lens[lens_base + count - 1]));
++    } else {
++        start = gp_hidden_item_start(lens, lens_base, idx);
++    }
+     if (ln > 0) {
+         for (int q = start + ln; q < total; ++q)
+             tokens[token_base + q - ln] = tokens[token_base + q];
+@@ -3662,8 +3756,20 @@
+     if (count <= 0) return 0;
+     int offset = (second && count >= 2) ? 1 : 0;
+     int idx = from_bottom ? (count - 1 - offset) : offset;
+-    int start = gp_hidden_item_start(lens, hidden_lens_base, idx);
+     int ln = max(0, lens[hidden_lens_base + idx]);
++    int total = hidden_state[total_slot];
++    int start = 0;
++    if (idx <= 0) {
++        start = 0;
++    } else if (idx == 1) {
++        start = max(0, lens[hidden_lens_base]);
++    } else if (idx == count - 1) {
++        start = max(0, total - ln);
++    } else if (idx == count - 2) {
++        start = max(0, total - ln - max(0, lens[hidden_lens_base + count - 1]));
++    } else {
++        start = gp_hidden_item_start(lens, hidden_lens_base, idx);
++    }
+ 
+     int emitted = 0;
+     if (action != 2 && out_pos + ln <= out_limit) {
+@@ -5243,14 +5349,21 @@
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+         if (hidden_state[0] > 0 && hidden_state[1] > 0 && shared[5] == 0) {
+             int pair_count = min(hidden_state[0], hidden_state[1]);
++            // The old code recomputed item i's prefix sum from item 0 on every
++            // iteration, making one hidden mapping scan O(pair_count^2) on lane
++            // 0. Carry the two prefix sums forward so the scan is O(pair_count).
++            int hidden_left_scan_start = 0;
++            int hidden_right_scan_start = 0;
+             for (int hi = 0; hi < pair_count; ++hi) {
+                 if (tid == 0) {
+-                    shared[11] = gp_hidden_item_start(
+-                        hidden_left_lens, job * GP_HIDDEN_MAX_ITEMS, hi);
+-                    shared[12] = max(0, hidden_left_lens[job * GP_HIDDEN_MAX_ITEMS + hi]);
+-                    shared[13] = gp_hidden_item_start(
+-                        hidden_right_lens, job * GP_HIDDEN_MAX_ITEMS, hi);
+-                    shared[14] = max(0, hidden_right_lens[job * GP_HIDDEN_MAX_ITEMS + hi]);
++                    int ll_scan = max(0, hidden_left_lens[job * GP_HIDDEN_MAX_ITEMS + hi]);
++                    int rl_scan = max(0, hidden_right_lens[job * GP_HIDDEN_MAX_ITEMS + hi]);
++                    shared[11] = hidden_left_scan_start;
++                    shared[12] = ll_scan;
++                    shared[13] = hidden_right_scan_start;
++                    shared[14] = rl_scan;
++                    hidden_left_scan_start += ll_scan;
++                    hidden_right_scan_start += rl_scan;
+                 }
+                 threadgroup_barrier(mem_flags::mem_threadgroup);
+                 int ll = shared[12];
+@@ -5810,6 +5923,11 @@
+         before_tokens = len(self._pool_tokens_host)
+         before_alloc = self._mps_allocated_bytes()
+ 
++        # Bump the owner epoch before tracing. Rules outside this collection's
++        # live roots then retain a stale owner and will be safely re-interned if
++        # they are selected from a large HoF later. This lets GC avoid tracing the
++        # entire persistent archive without ever trusting an obsolete pool id.
++        self._pool_owner = int(self._pool_owner) + 1
+         new_key_to_id, new_meta, new_tokens = self._trace_live_rule_pool(genomes)
+ 
+         after_rules = len(new_meta)
+@@ -6016,8 +6134,9 @@
+         gc_roots = genomes if pool_live_genomes is None else pool_live_genomes
+         gc_reason = self._gc_trigger(gc_roots)
+         if gc_reason:
+-            # Score reuse may evaluate only a subset, but compacting GC must trace
+-            # every live population/HoF rule or cached pool ids would become stale.
++            # Only the explicitly supplied active roots need tracing. Rules held
++            # solely by the persistent HoF become stale by pool-owner epoch and
++            # are re-interned lazily if that lineage is used again.
+             self._compact_rule_pool(gc_roots, gc_reason)
+             for g in gc_roots:
+                 _invalidate_genome_pack(g)
+@@ -6638,6 +6757,9 @@
+     count only as a last resort.  The 0.85 hard ratio remains the safety ceiling.
+     """
+     sample_count = max(1, int(sample_count))
++    legacy_full_scoring = (
++        genome_count is None and outer_evaluated_genomes is None and ensemble_size is None
++    )
+     n_genomes = max(1, int(genome_count) if genome_count is not None else 1)
+     ensemble = n_genomes if ensemble_size is None else max(1, min(n_genomes, int(ensemble_size)))
+     outer_n = n_genomes if outer_evaluated_genomes is None else max(1, min(n_genomes, int(outer_evaluated_genomes)))
+@@ -6657,9 +6779,20 @@
+     # one active prefix, so width must fit the evaluator's sample allocation.
+     population = min(population, max(2, sample_count // cases))
+ 
++    # Backward-compatible standalone mode: when no model/ensemble geometry is
++    # supplied, every inner round is effectively a full-model pass.  Preserve
++    # requested depth and shrink width first.  Real training always supplies the
++    # ensemble geometry and therefore uses the width-first policy below.
++    if legacy_full_scoring and equivalent_work(cases, population, generations) > budget:
++        per_candidate = float(cases) * (1.0 + float(generations))
++        max_pop = int(math.floor(budget / max(1.0e-12, per_candidate)))
++        if max_pop >= 2:
++            population = min(population, max_pop)
++
+     # Width first: solve directly for the deepest generation count that keeps
+     # the requested candidate population.  Default 200/450/128/0.75 becomes
+-    # 3x16x7 instead of 3x2x84, at essentially identical equivalent work.
++    # Preserve useful candidate width first; ensemble subsampling makes deeper
++    # inner search affordable than a naive full-model-pass estimate suggests.
+     if equivalent_work(cases, population, generations) > budget and generations > 1:
+         base = float(cases * population)
+         headroom = budget / max(1.0e-12, base) - 1.0
+@@ -6736,33 +6869,19 @@
+ 
+ 
+ def sample_inference_mutation_count(item_count: int) -> int:
+-    """Local-heavy mutation radius for corrupted loci.
+-
+-    The v60.2 pure log-uniform draw has E[k] ~= (n-1)/log(n); with roughly 100
+-    corrupted bytes that means ~21 simultaneous edits per offspring.  That is
+-    useful as an occasional escape move but destructive as the default for
+-    denoising, because a newly repaired byte is usually perturbed again before
+-    the scorer can accumulate local improvements.
+-
+-    v60.4 therefore uses:
+-      * 70%: exactly one corrupted locus
+-      * 20%: a small 2..4-locus move
+-      * 10%: the original full log-uniform radius
++    """Draw round(exp(U(0, log(n)))) mutable loci, clamped to 1..n.
+ 
+-    This still retains rare long jumps while making ordinary evolution resemble
+-    coordinate/local search around repaired strings.
++    This is the explicitly requested inference-side mutation geometry.  A focus
++    locus, when supplied by the scheduler, is included in this many-locus move
++    rather than collapsing the radius to one.
+     """
+     n = max(0, int(item_count))
+     if n <= 0:
+         return 0
+     if n == 1:
+         return 1
+-    r = random.random()
+-    if r < 0.70:
+-        return 1
+-    if r < 0.90:
+-        return random.randint(2, min(4, n))
+-    return sample_log_uniform_mutation_range(1, n)
++    value = int(round(math.exp(random.uniform(0.0, math.log(float(n))))))
++    return max(1, min(n, value))
+ 
+ def mutate_inference_candidate(candidate: Sequence[int], positions: Sequence[int],
+                                sampler: CorpusSampler, force_changes: int = 0,
+@@ -6845,7 +6964,9 @@
+                                    mps_evaluator: MpsPopulationEvaluator,
+                                    pool_live_genomes: Sequence[Genome] | None = None):
+     """Pack one immutable genome set once for repeated candidate evaluations."""
+-    reps, row_map = _dedupe_inference_genomes(genomes, id(mps_evaluator))
++    reps, row_map = _dedupe_inference_genomes(
++        genomes, int(getattr(mps_evaluator, "_pool_owner", id(mps_evaluator)))
++    )
+     roots = genomes if pool_live_genomes is None else pool_live_genomes
+     packer = getattr(mps_evaluator, "_pack_population", None)
+     packed = packer(reps, pool_live_genomes=roots) if callable(packer) else None
+@@ -7641,7 +7762,9 @@
+     os.replace(tmp, path)
+ 
+ 
+-def _pack_genome_group(genomes: Sequence[Genome], prefix: str, arrays: dict) -> None:
++def _pack_genome_group(
++    genomes: Sequence[Genome], prefix: str, arrays: dict, *, include_training_state: bool = True
++) -> None:
+     if not genomes:
+         arrays[prefix + "count"] = np.asarray([0], dtype=np.int32)
+         return
+@@ -7651,48 +7774,88 @@
+     rep_offsets = [0]
+     pat_tokens: List[int] = []
+     rep_tokens: List[int] = []
+-    weights = np.empty((pcount, rcount), dtype=np.float32)
++    rule_refs = np.empty((pcount, rcount), dtype=np.int32)
++    weights = (np.empty((pcount, rcount), dtype=np.float32)
++               if include_training_state else None)
+     embeddings = np.empty((pcount, EMBEDDING_ENTRY_COUNT), dtype=np.int16)
+-    fitness = np.empty(pcount, dtype=np.float64)
++    fitness = (np.empty(pcount, dtype=np.float64)
++               if include_training_state else None)
+     inference_accuracy = np.empty(pcount, dtype=np.float64)
+     inference_full_accuracy = np.empty(pcount, dtype=np.float64)
+     pareto_rank = np.empty(pcount, dtype=np.int32)
+     pareto_crowding = np.empty(pcount, dtype=np.float64)
+     score_offsets = [0]
+     score_values: List[float] = []
++
++    # Survivors/HoF lineages share most immutable Rule objects. Persist each
++    # structural rule only once per group instead of repeating its token lists for
++    # every genome. Fall back to structural identity when two equal Rules happen
++    # to be distinct Python objects.
++    object_to_ref: dict[tuple[tuple[int, ...], int], int] = {}
++    struct_to_ref: dict[tuple, int] = {}
++
+     for gi, g in enumerate(genomes):
+         if len(g.rules) != rcount:
+             raise ValueError("checkpoint requires fixed rule count")
+         embeddings[gi] = np.asarray(g.embedding, dtype=np.int16)
+-        fitness[gi] = float(g.fitness)
++        if fitness is not None:
++            fitness[gi] = float(g.fitness)
+         inference_accuracy[gi] = float(g.inference_accuracy)
+         inference_full_accuracy[gi] = float(g.inference_full_accuracy)
+         pareto_rank[gi] = int(g.pareto_rank)
+         pareto_crowding[gi] = float(g.pareto_crowding)
+-        score_values.extend(map(float, g.case_scores))
+-        score_offsets.append(len(score_values))
++        if include_training_state:
++            score_values.extend(map(float, g.case_scores))
++            score_offsets.append(len(score_values))
++        embedding_key = tuple(map(int, g.embedding))
+         for ri, rule in enumerate(g.rules):
+-            pat_tokens.extend(map(int, rule.pattern)); pat_offsets.append(len(pat_tokens))
+-            rep_tokens.extend(map(int, rule.replacement)); rep_offsets.append(len(rep_tokens))
+-            if len(g.readout_weights) == rcount:
+-                weights[gi, ri] = float(g.readout_weights[ri])
+-            else:
+-                weights[gi, ri] = float(rule.weight)
++            # Anchor/filter choice is a performance cache tuned to an embedding's
++            # raw-byte frequencies. Share immutable structures only inside the
++            # same coordinate system so loading a checkpoint cannot make two
++            # differently embedded genomes inherit one another's anchor cache.
++            object_key = (embedding_key, id(rule))
++            ref = object_to_ref.get(object_key)
++            if ref is None:
++                key = (
++                    embedding_key,
++                    tuple(map(int, rule.pattern)),
++                    tuple(map(int, rule.replacement)),
++                )
++                ref = struct_to_ref.get(key)
++                if ref is None:
++                    ref = len(pat_offsets) - 1
++                    pat_tokens.extend(map(int, rule.pattern))
++                    pat_offsets.append(len(pat_tokens))
++                    rep_tokens.extend(map(int, rule.replacement))
++                    rep_offsets.append(len(rep_tokens))
++                    struct_to_ref[key] = int(ref)
++                object_to_ref[object_key] = int(ref)
++            rule_refs[gi, ri] = int(ref)
++            if weights is not None:
++                if len(g.readout_weights) == rcount:
++                    weights[gi, ri] = float(g.readout_weights[ri])
++                else:
++                    weights[gi, ri] = float(rule.weight)
++
+     arrays[prefix + "count"] = np.asarray([pcount], dtype=np.int32)
+     arrays[prefix + "rules"] = np.asarray([rcount], dtype=np.int32)
++    arrays[prefix + "rule_refs"] = rule_refs
+     arrays[prefix + "pat_offsets"] = np.asarray(pat_offsets, dtype=np.int64)
+     arrays[prefix + "rep_offsets"] = np.asarray(rep_offsets, dtype=np.int64)
+     arrays[prefix + "pat_tokens"] = np.asarray(pat_tokens, dtype=np.int16)
+     arrays[prefix + "rep_tokens"] = np.asarray(rep_tokens, dtype=np.int16)
+-    arrays[prefix + "weights"] = weights
++    if weights is not None:
++        arrays[prefix + "weights"] = weights
+     arrays[prefix + "embeddings"] = embeddings
+-    arrays[prefix + "fitness"] = fitness
++    if fitness is not None:
++        arrays[prefix + "fitness"] = fitness
+     arrays[prefix + "inference_accuracy"] = inference_accuracy
+     arrays[prefix + "inference_full_accuracy"] = inference_full_accuracy
+     arrays[prefix + "pareto_rank"] = pareto_rank
+     arrays[prefix + "pareto_crowding"] = pareto_crowding
+-    arrays[prefix + "score_offsets"] = np.asarray(score_offsets, dtype=np.int32)
+-    arrays[prefix + "score_values"] = np.asarray(score_values, dtype=np.float64)
++    if include_training_state:
++        arrays[prefix + "score_offsets"] = np.asarray(score_offsets, dtype=np.int32)
++        arrays[prefix + "score_values"] = np.asarray(score_values, dtype=np.float64)
+ 
+ 
+ def _unpack_genome_group(z, prefix: str) -> List[Genome]:
+@@ -7704,9 +7867,10 @@
+     ro = z[prefix + "rep_offsets"]
+     pt = z[prefix + "pat_tokens"]
+     rt = z[prefix + "rep_tokens"]
+-    weights = z[prefix + "weights"]
++    weights = z[prefix + "weights"] if prefix + "weights" in z.files else None
+     embeddings = z[prefix + "embeddings"]
+-    fitness = z[prefix + "fitness"]
++    fitness = (z[prefix + "fitness"] if prefix + "fitness" in z.files
++               else np.full(count, -np.inf, dtype=np.float64))
+     inference_accuracy = (z[prefix + "inference_accuracy"]
+                           if prefix + "inference_accuracy" in z.files
+                           else np.full(count, np.nan, dtype=np.float64))
+@@ -7719,24 +7883,42 @@
+     pareto_crowding = (z[prefix + "pareto_crowding"]
+                        if prefix + "pareto_crowding" in z.files
+                        else np.zeros(count, dtype=np.float64))
+-    so = z[prefix + "score_offsets"]
+-    sv = z[prefix + "score_values"]
++    so = z[prefix + "score_offsets"] if prefix + "score_offsets" in z.files else None
++    sv = z[prefix + "score_values"] if prefix + "score_values" in z.files else None
+     out: List[Genome] = []
++    refs = z[prefix + "rule_refs"] if prefix + "rule_refs" in z.files else None
++    pooled_rules: List[Rule] | None = None
++    if refs is not None:
++        pooled_rules = []
++        unique_count = max(0, len(po) - 1)
++        for qi in range(unique_count):
++            a = pt[int(po[qi]):int(po[qi + 1])].astype(np.int32).tolist()
++            b = rt[int(ro[qi]):int(ro[qi + 1])].astype(np.int32).tolist()
++            pooled_rules.append(Rule(a, b, 0.0))
++
+     q = 0
+     for gi in range(count):
+         rules: List[Rule] = []
+         for ri in range(rcount):
+-            a = pt[int(po[q]):int(po[q + 1])].astype(np.int32).tolist()
+-            b = rt[int(ro[q]):int(ro[q + 1])].astype(np.int32).tolist()
+-            rules.append(Rule(a, b, float(weights[gi, ri])))
+-            q += 1
+-        scores = sv[int(so[gi]):int(so[gi + 1])].astype(np.float64).tolist()
++            if refs is not None and pooled_rules is not None:
++                rules.append(pooled_rules[int(refs[gi, ri])])
++            else:
++                # v1/v2 checkpoints stored one structure per genome/rule row.
++                a = pt[int(po[q]):int(po[q + 1])].astype(np.int32).tolist()
++                b = rt[int(ro[q]):int(ro[q + 1])].astype(np.int32).tolist()
++                rules.append(Rule(a, b, float(weights[gi, ri]) if weights is not None else 0.0))
++                q += 1
++        scores = (
++            sv[int(so[gi]):int(so[gi + 1])].astype(np.float64).tolist()
++            if so is not None and sv is not None else []
++        )
+         out.append(Genome(
+             rules=rules,
+             embedding=embeddings[gi].astype(np.int32).tolist(),
+             fitness=float(fitness[gi]),
+             case_scores=scores,
+-            readout_weights=weights[gi].astype(np.float64).tolist(),
++            readout_weights=(weights[gi].astype(np.float64).tolist()
++                             if weights is not None else []),
+             inference_accuracy=float(inference_accuracy[gi]),
+             inference_full_accuracy=float(inference_full_accuracy[gi]),
+             pareto_rank=int(pareto_rank[gi]),
+@@ -7760,9 +7942,9 @@
+     if not path:
+         return
+     arrays: dict = {
+-        # v2 distinguishes the new semantic -2/-3 pattern tokens from the old
+-        # revisions where every negative pattern spelling meant plain wildcard.
+-        "version": np.asarray([2], dtype=np.int32),
++        # v2 introduced semantic -2/-3 pattern tokens. v3 deduplicates immutable
++        # rule structures inside checkpoint genome groups.
++        "version": np.asarray([3], dtype=np.int32),
+         "next_generation": np.asarray([int(next_generation)], dtype=np.int64),
+         "history": _bytes_array(list(history)),
+         "py_rng": _bytes_array(random.getstate()),
+@@ -7789,7 +7971,7 @@
+     # would be meaningless and could collide with the new rolling set.
+     _pack_genome_group(
+         [] if hof_archive is None else [e.genome for e in hof_archive],
+-        "hof_", arrays,
++        "hof_", arrays, include_training_state=False,
+     )
+     p = Path(path)
+     p.parent.mkdir(parents=True, exist_ok=True)
+@@ -7804,7 +7986,7 @@
+ def load_checkpoint(path: str, sampler: CorpusSampler):
+     with np.load(path, allow_pickle=False) as z:
+         version = int(z["version"][0])
+-        if version not in (1, 2):
++        if version not in (1, 2, 3):
+             raise ValueError(f"unsupported checkpoint version {version}")
+         next_generation = int(z["next_generation"][0])
+         population = _unpack_genome_group(z, "pop_")
+@@ -8147,15 +8329,25 @@
+     # case-score history restarts because the rolling evaluation serials restart.
+     args.hof_size = max(args.hof_size, len(loaded_hof_genomes))
+     hof_archive: List[HallOfFameEntry] = [
+-        HallOfFameEntry(clone_genome_deep(g), born_generation=start_generation - 1)
++        HallOfFameEntry(clone_genome_shallow(g), born_generation=start_generation - 1)
+         for g in loaded_hof_genomes[:max(0, int(args.hof_size))]
+     ]
+ 
+     for entry in hof_archive:
+-        entry.archive_score = float(entry.genome.fitness)
++        # Rolling case serials restart on resume, so an old scalar fitness is not
++        # comparable to the new evaluation set. Mark archive rankings unscored
++        # until each entry is refreshed on current serials.
++        entry.genome.case_scores = []
++        entry.genome.readout_weights = []
++        entry.genome._eval_case_serials = ()
++        entry.current_fitness = float("-inf")
++        entry.historical_fitness = float("-inf")
++        entry.archive_score = float("-inf")
++
++    # For the same reason, do not replay pre-resume plateau statistics against a
++    # freshly sampled rolling dataset: that can manufacture false stagnation or
++    # false progress solely from a change in case difficulty.
+     plateau = PlateauTracker(args.plateau_window, args.plateau_min_gain)
+-    for row in history[-2 * args.plateau_window:]:
+-        plateau.update(float(row["best"]))
+ 
+     # v58 controllers are runtime-only so v57 checkpoints remain directly
+     # loadable. Bandit cumulative statistics are restored from the last history
+@@ -8266,7 +8458,7 @@
+             # Exact structural dedupe for the remaining jobs. Reusable genomes
+             # seed the map too, so a nominally-new clone/crossover that is
+             # structurally identical to a survivor gets its exact score for free.
+-            owner = id(mps_evaluator)
++            owner = int(getattr(mps_evaluator, "_pool_owner", id(mps_evaluator)))
+             sig_to_reps: dict[tuple, List[int]] = {}
+             for i in reusable:
+                 sig = genome_eval_signature(eval_genomes[i], owner)
+@@ -8294,7 +8486,7 @@
+             if unique_pending:
+                 eval_batch = [eval_genomes[i] for i in unique_pending]
+                 all_features = mps_evaluator.evaluate_population(
+-                    eval_batch, pool_live_genomes=list(population) + [e.genome for e in hof_archive]
++                    eval_batch, pool_live_genomes=eval_genomes
+                 )
+                 mps_kernel_seconds = time.perf_counter() - tb
+                 mps_pack_seconds = mps_evaluator.last_pack_seconds
+@@ -8418,7 +8610,10 @@
+                 outer_evaluated_genomes=len(population),
+                 ensemble_size=args.inference_ensemble,
+             )
+-            live_pool_roots = list(population) + [e.genome for e in hof_archive]
++            # Inference evaluates current-population structures only. Keeping
++            # all persistent HoF entries as GC roots makes pool liveness grow with
++            # archive size and eventually defeats compaction.
++            live_pool_roots = list(population)
+             inference_stats = run_string_inference_ga(
+                 population, inference_set, sampler, inf_pop, inf_gens,
+                 args.inference_ensemble, args.backend, args.max_output,
+@@ -8616,9 +8811,6 @@
+         }
+         op_bandit.add_history(row)
+         history.append(row)
+-        append_history_csv(args.history_csv, row)
+-        if not args.no_plot and (generation % max(1, args.plot_every) == 0):
+-            write_plots(history, args.plot_prefix, args.plot_window)
+         print(
+             f"gen={generation:6d} best={champion.fitness:+.6f} "
+             f"mean={mean_fit:+.6f} median={med_fit:+.6f} "
+@@ -8704,7 +8896,7 @@
+                 break
+             if any(same_genome_structure(entry.genome, g) for g in next_pop):
+                 continue
+-            next_pop.append(clone_genome_deep(entry.genome))
++            next_pop.append(clone_genome_shallow(entry.genome))
+             hof_injected += 1
+ 
+         mutation_regime_counts = {"local": 0, "balanced": 0, "explore": 0}
+@@ -8737,7 +8929,9 @@
+             return tournament(population, args.tournament), False
+ 
+         def safe_base_clone(parent: Genome, from_hof: bool) -> Genome:
+-            return clone_genome_deep(parent) if from_hof else clone_genome_shallow(parent)
++            # Structural mutation is copy-on-write; HoF parents therefore do not
++            # require a 1500-Rule deep copy before every offspring.
++            return clone_genome_shallow(parent)
+ 
+         while len(next_pop) < args.population:
+             if random.random() < immigrant_rate:
+@@ -8759,11 +8953,8 @@
+                     # modules before the single normal offspring evaluation.
+                     mix_n = 1 + int(exploration_pressure > 0.55 and random.random() < 0.35)
+                     child, changed_mix = linkage_mix(p1, p2, linkage_model, mix_n)
+-                    if p1_hof:
+-                        # Detach untouched archive Rule objects. Same-embedding
+-                        # donor rows remain immutable/shareable inside normal pop,
+-                        # but a persistent HoF lineage must stay isolated.
+-                        child = clone_genome_deep(child)
++                    # linkage_mix and later mutation are copy-on-write, so an
++                    # archive parent can safely share untouched immutable rows.
+                     regime = "local" if arm == "mix_local" else "balanced"
+                     mutation_regime_counts[regime] += 1
+                     mutation_rows_changed += mutate_genome(
+@@ -8793,7 +8984,7 @@
+                             # apply (base -> donor) structural patches to target p1.
+                             base, _base_hof = pick_parent()
+                             donor, _donor_hof = pick_parent()
+-                            merge_target = clone_genome_deep(p1) if p1_hof else p1
++                            merge_target = p1
+                             child, merged_rows = diff_merge_crossover(
+                                 merge_target, base, donor, sampler,
+                                 0.0 if args.no_embedding else args.embedding_crossover_rate,
+@@ -8810,7 +9001,7 @@
+                                 credit_parent = p2
+                             elif p1_hof and p2_hof:
+                                 child = crossover(
+-                                    clone_genome_deep(p1), p2,
++                                    p1, p2,
+                                     0.0 if args.no_embedding else args.embedding_crossover_rate,
+                                 )
+                             else:
+@@ -8841,8 +9032,20 @@
+         if args.progress:
+             print(" " * 72, end="\r")
+         op_summary = "/".join(f"{a}:{operator_counts[a]}" for a in operator_arms)
++        # ``seconds`` is kept as the historical core/evaluation metric for CSV
++        # compatibility. Record breeding and actual pre-checkpoint wall time
++        # separately so performance regressions are no longer hidden after the
++        # main generation line has been printed.
++        row["core_seconds"] = float(elapsed)
++        row["breed_seconds"] = float(breed_seconds)
++        row["wall_seconds"] = float(time.perf_counter() - t0)
++        append_history_csv(args.history_csv, row)
++        if not args.no_plot and (generation % max(1, args.plot_every) == 0):
++            write_plots(history, args.plot_prefix, args.plot_window)
++
+         print(
+-            f"gen={generation}: breed={breed_seconds:.2f}s elite_keep={len(elite_sources)} "
++            f"gen={generation}: breed={breed_seconds:.2f}s wall={row['wall_seconds']:.2f}s "
++            f"elite_keep={len(elite_sources)} "
+             f"mut(local/bal/explore)={mutation_regime_counts['local']}/"
+             f"{mutation_regime_counts['balanced']}/{mutation_regime_counts['explore']} "
+             f"rows_changed={mutation_rows_changed} mix_rows={mixed_rows} "
+@@ -8952,10 +9155,10 @@
+     h0 = Genome([Rule([1], [1], 0.25), Rule([2], [2], -0.5)], fitness=0.8, case_scores=[0.7, 0.9])
+     e0 = make_hof_entry(h0, (10, 11), 0, 32, 0.70)
+     assert genome_structural_distance(h0, e0.genome) == 0.0
+-    h0.rules[0].weight = 99.0
+-    assert e0.genome.rules[0].weight != 99.0  # deep archive isolation
+-    h1 = clone_genome_deep(e0.genome)
++    assert h0.rules[0] is e0.genome.rules[0]  # immutable structure is shared COW
++    h1 = clone_genome_shallow(e0.genome)
+     h1.rules[0] = Rule([3], [3], 0.0)
++    assert e0.genome.rules[0].pattern == [1]  # replacing child row cannot alter archive
+     assert genome_structural_distance(h1, e0.genome) > 0.0
+     refresh_hof_entry(e0, (10, 11), 32, 0.70)
+     assert math.isfinite(e0.archive_score)
