@@ -9190,7 +9190,7 @@ def parse_args():
     # v60.5 string-side inference objective. Candidate width is preserved
     # before search depth; the smaller 32-model inference-aware ensemble lets the
     # same 0.75 equivalent-work budget resolve to about 3x16x29 inner rounds.
-    ap.add_argument("--inference-cases", type=int, default=3, help="independent noisy snippets optimized by the inner string GA")
+    ap.add_argument("--inference-cases", type=int, default=1, help="independent noisy snippets optimized by the inner string GA")
     ap.add_argument("--inference-population", type=int, default=16, help="candidate strings per inference case")
     ap.add_argument("--inference-generations", type=int, default=128, help="upper bound on inner GA generations; the work budget reduces depth before candidate-population width")
     ap.add_argument("--inference-elites", type=int, default=3, help="top candidate strings copied unchanged each inner GA generation; clamped to leave at least one offspring slot")
