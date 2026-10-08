@@ -1715,7 +1715,7 @@ def parse_args():
     ap.add_argument('--guided-probe-length',type=int,default=48,help='prefix byte count for lightweight Python error tracing')
     ap.add_argument('--elites',type=int,default=12)
     ap.add_argument('--tournament',type=int,default=5)
-    ap.add_argument('--hof-size',type=int,default=1024)
+    ap.add_argument('--hof-size',type=int,default=4096)
     ap.add_argument('--hof-inject',type=int,default=64)
     ap.add_argument('--hof-parent-rate',type=float,default=0.05)
     ap.add_argument('--crossover-rate',type=float,default=0.50)
