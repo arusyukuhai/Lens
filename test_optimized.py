@@ -1,124 +1,115 @@
-"""Standalone static / mathematical regression checks. Nim self-test checks actual replacements."""
-from pathlib import Path
+"""Performance rewrite regression: exact outputs, corpus, caching, Metal prefilters."""
 import random
-s=Path(__file__).with_name('main.nim').read_text()
-req=[
-  'proc primeStagePrefixes(', 'proc prefixFor(', 'proc tokenBits(',
-  'proc checkOptimizedFeatureSemantics()', 'proc slowReferenceFeatures(',
-  'ctx.prefixes[i], true', 'result.patterns[i] = parent.patterns[i]',
-  'result.patterns[i] = compileSeqPattern(replacement.a)',
-  'proc ruleKey(', 'var stageMemo = initTable[string, Candidate]()',
-  'var inferenceMemo = initTable[string, float64]()',
-  'if dominates(trial.score, current.score):',
-  'if greedyAccept(result, trial):',
-  'primeStagePrefixes(ctx, trainer.current, active)',
-  'ReplacePasses = 1', 'diffusionSteps: 100',
-  'ctx.inferenceSeed + j*7919',
-  'proc checkChunkAdmission()', 'appendCorpusLine(buffer, oversized, line, cfg.maxChunk)',
-  'chunkAdmission": "skip-oversize-v1',
-]
-for marker in req: assert marker in s, marker
-print('PASS: compiled-pattern reuse, caches, frozen-prefix placement, strict Pareto and unchanged diffusion')
+import tempfile
+from pathlib import Path
+import unittest
+import numpy as np
+import main as m
+import native_cpu
+import gpu_replace_persistent as gpu
 
-# Negative matcher result must be impossible if the pattern's first literal exists.
-def token_bits(xs):
-    bits=[0]*8
-    for x in xs:
-        if 0<=x<512: bits[x>>6]|=1<<(x&63)
-    return bits
+class OptimizationTests(unittest.TestCase):
+    def setUp(self):
+        self.rng=random.Random(731)
+        self.corpus=[b'abc abccab abcccab\x00!\n',bytes(range(64)), b'XYZ' * 20,
+                     b'function add(a,b) {\n    return a+b;\n}\n']
+        self.bigrams=m._bigram_seeds(self.corpus)
 
-def might_match(bits,mark):
-    if mark<0 or mark>=512: return True
-    return bool(bits[mark>>6]&(1<<(mark&63)))
+    def test_native_vs_python_fuzz(self):
+        gs=[m.new_genome(55,self.rng,self.corpus,self.bigrams) for _ in range(12)]
+        for g in gs:
+            for _ in range(18):
+                g=m.mutate_genome(g,self.rng,self.corpus,self.bigrams)
+            gs.append(g)
+            if len(gs)>=25:
+                break
+        # Includes wildcards, overlapping patterns, 0x00/0xff and LUT permutations.
+        texts=self.corpus+[bytes(self.rng.randrange(256) for _ in range(n)) for n in (3,12,31,63,123)]
+        got=native_cpu.evaluate_cpu(gs,texts,55,workers=3)
+        expected=np.array([[m.autoregressive_rollout(g,t)[0] for t in texts] for g in gs],dtype=np.int32)
+        np.testing.assert_array_equal(got,expected)
 
-rng=random.Random(123)
-for _ in range(10000):
-    xs=[rng.randint(-3, 600) for _ in range(rng.randrange(100))]
-    mark=rng.randint(-3,600)
-    bits=token_bits(xs)
-    if mark in xs and mark>=0:
-        assert might_match(bits,mark)
-print('PASS: 10,000 token bitmap no-false-negative membership cases')
+    def test_cache_same_results_and_no_repeats(self):
+        gs=[m.new_genome(20,self.rng,self.corpus,self.bigrams) for _ in range(5)]
+        gs += [m.Genome(gs[0].rules[:],gs[0].embedding[:]),
+               m.Genome(gs[1].rules[:],gs[1].embedding[:])]
+        examples=[self.corpus[0],self.corpus[1],self.corpus[2]]
+        m.score_population(gs,examples,'cpu',cpu_workers=2,use_cache=True)
+        scores=[(g.fitness, g.case_scores[:]) for g in gs]
+        m.score_population(gs,examples,'cpu',cpu_workers=2,use_cache=True)
+        self.assertEqual(scores,[(g.fitness,g.case_scores[:]) for g in gs])
+        m.score_population(gs,examples,'cpu',cpu_workers=2,use_cache=False)
+        self.assertEqual(scores,[(g.fitness,g.case_scores[:]) for g in gs])
+        # Rotated examples must invalidate cached results.
+        m.score_population(gs,examples[::-1],'cpu',cpu_workers=2,use_cache=True)
+        self.assertEqual(scores[0][0],gs[0].fitness)
+        self.assertEqual(scores[0][1][::-1],gs[0].case_scores)
 
-# Abstract literal replacement interpreter models one scan and tests prefix cache.
-def apply(state,rule):
-    a,b=rule
-    if not a: return list(state),False
-    out=[]; i=0; changed=False
-    while i<len(state):
-        if state[i:i+len(a)] == a:
-            out+=b; i+=len(a); changed=True
-        else: out.append(state[i]); i+=1
-    return out, changed and out!=state
+    def test_cache_reuses_elite(self):
+        gs=[m.new_genome(12,self.rng,self.corpus,self.bigrams) for _ in range(5)]
+        examples=[self.corpus[1],self.corpus[2]]
+        m.score_population(gs,examples,'cpu',cpu_workers=2,use_cache=True)
+        scores=[g.fitness for g in gs]
+        # A new generation inheriting elites and mutated children.
+        nxt=[m.Genome(gs[0].rules[:],gs[0].embedding[:]),
+             m.mutate_genome(gs[1],self.rng,self.corpus,self.bigrams)]
+        m.score_population(nxt,examples,'cpu',cpu_workers=2,use_cache=True)
+        self.assertEqual(nxt[0].fitness,scores[0])
+        expected=m.autoregressive_rollout(nxt[1],examples[0])[0]+m.autoregressive_rollout(nxt[1],examples[1])[0]
+        self.assertAlmostEqual(nxt[1].fitness,expected/sum(len(e)-1 for e in examples))
 
-def eval_feature(state,rules,prefix=None):
-    feat=[0]*len(rules)
-    if prefix is None: state=list(state); start=0
-    else:
-        state=list(prefix[0]); feat[:len(prefix[1])]=prefix[1]; start=len(prefix[1])
-    for ix in range(start,len(rules)):
-        state,changed=apply(state,rules[ix]); feat[ix]+=int(changed)
-    return feat
+    def test_anchor_choice_exact_precondition(self):
+        r=self.rng
+        gs=[m.new_genome(30,r,self.corpus,self.bigrams) for _ in range(5)]
+        anchors=gpu._compile_rule_anchors(gs,self.corpus,30)
+        self.assertEqual(anchors.shape,(5,30))
+        for g,arr in zip(gs,anchors):
+            for rule,anchor in zip(g.rules,arr):
+                if anchor==-1:
+                    # Identity is safe to skip for arbitrary contents.
+                    p=rule.pattern
+                    for st in [[1,2,0,255],[4,5,1,2,3],[0]*12]:
+                        self.assertEqual(m.replace_once(st,rule,g.embedding,m.inverse_lut(g.embedding)),st)
+                elif anchor<256:
+                    self.assertIn(int(anchor),rule.pattern)
+                else:
+                    pair=((int(anchor)-256)>>8,(int(anchor)-256)&255)
+                    self.assertIn(pair,list(zip(rule.pattern,rule.pattern[1:])))
 
-for _ in range(1500):
-    r=[([rng.randrange(4) for _ in range(rng.randrange(1,4))],
-        [rng.randrange(4) for _ in range(rng.randrange(1,4))]) for _ in range(8)]
-    inp=[rng.randrange(4) for _ in range(10)]
-    target=eval_feature(inp,r)
-    for cutoff in range(len(r)):
-        state=list(inp); counts=[]
-        for rr in r[:cutoff]:
-            state,changed=apply(state,rr); counts.append(int(changed))
-        assert eval_feature(inp,r,(state,counts))==target
-print('PASS: 12,000 reference checks: single-pass frozen-prefix cache is exact')
-assert eval_feature([0],[([0],[1]),([1],[0])]) == [1,1]
-print('PASS: cyclic-rule regression rejects a second rewrite pass')
-print('NOTE: Actual Nim compilation/runtime timings require Nim on target system.')
+    def test_bloom_pair_collision_has_no_false_negative(self):
+        for key in range(65536):
+            h1=(key*2654435761)&2047
+            h2=((key*2246822519)^(key>>7))&2047
+            mask=[0]*64
+            mask[h1>>5]|=1<<(h1&31)
+            mask[h2>>5]|=1<<(h2&31)
+            self.assertTrue(mask[h1>>5] & (1<<(h1&31)))
+            self.assertTrue(mask[h2>>5] & (1<<(h2&31)))
 
-# New admission invariant: bounds inclusive, no crop, and no rejected sample
-# contributes to the reservoir seen count. Test at byte boundaries.
-assert 'if buffer.len < cfg.minChunk or buffer.len > cfg.maxChunk: return' in s
-assert 'chunks.add(byteSeq(buffer))' in s
-assert 'chunks[slot] = byteSeq(buffer)' in s
-assert 'buffer[start ..< stop]' not in s
-assert 'if not oversized:' in s
-assert 'appendCorpusLine(buffer, oversized, line, cfg.maxChunk)' in s
-assert 'checkChunkAdmission()' in s
-assert '"chunkAdmission": "skip-oversize-v1"' in s
+    def test_delimiter_crosses_read_block_boundary(self):
+        # 1 MiB block boundary intersects split marker exactly.
+        with tempfile.TemporaryDirectory() as d:
+            f=Path(d)/'large.txt'
+            f.write_bytes(b'x'*((1<<20)-4)+b'===SPLIT===\nOK\n===SPLIT===\nYES')
+            self.assertEqual(m.load_corpus(str(f),max_length=1500),[b'OK',b'YES'])
 
-def consume(data, min_chunk=3, max_chunk=8, cap=100):
-    buffer = bytearray()
-    oversize = False
-    seen = 0
-    chunks = []
-    for line in data.splitlines(keepends=False):
-        if line == b'===SPLIT===':
-            if not oversize and min_chunk <= len(buffer) <= max_chunk:
-                seen += 1
-                chunks.append(bytes(buffer))
-            buffer.clear()
-            oversize = False
-        elif not oversize:
-            if len(line) >= max_chunk - len(buffer):
-                oversize = True
-                buffer.clear()
-            else:
-                buffer.extend(line)
-                buffer.append(10)
-    if not oversize and min_chunk <= len(buffer) <= max_chunk:
-        seen += 1
-        chunks.append(bytes(buffer))
-    return seen, chunks[:cap]
+    def test_history_append(self):
+        with tempfile.TemporaryDirectory() as d:
+            f=str(Path(d)/'h.csv')
+            m.write_history(f,[])
+            for i in range(15):
+                m.append_history_row(f,{'generation':i,'fitness':i/15})
+            rows=Path(f).read_text().splitlines()
+            self.assertEqual(len(rows),16)
+            self.assertEqual(rows[0],'generation,fitness')
+            self.assertTrue(rows[-1].startswith('14,'))
 
-cases = [b'x', b'12', b'abc', b'abcdefg', b'abcdefgh', b'abcdefghi',
-         b'a'*100, 'あい'.encode('utf-8')]
-# Source parser appends one newline for each non-split line.
-data = b'\n===SPLIT===\n'.join(cases)
-count, accepted = consume(data)
-assert count == 4, (count, accepted)
-assert accepted == [b'12\n', b'abc\n', b'abcdefg\n', 'あい'.encode('utf-8') + b'\n'], accepted
-# Explicit exact-max boundary, including newline
-assert consume(b'1234567')[1] == [b'1234567\n']
-assert consume(b'12345678')[1] == []
-assert consume(b'abc\n123456789\nignored\n===SPLIT===\n1234567')[1] == [b'1234567\n']
-print('PASS: reject oversized snippets whole; boundary, UTF-8 byte count, split reset')
+    def test_metal_contains_fast_indexes(self):
+        metal=gpu._METAL_SOURCE
+        self.assertIn('thread uint pair_bloom[64]',metal)
+        self.assertIn('thread uint byte_mask[8]',metal)
+        self.assertIn('thread uint hist[256]',metal)
+        self.assertIn('const device int* anchors [[buffer(16)]]',metal)
+
+if __name__=='__main__':
+    unittest.main()

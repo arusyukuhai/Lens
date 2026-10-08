@@ -1,0 +1,13 @@
+ABABABABABAB
+===SPLIT===
+ABCABCABCABC
+===SPLIT===
+HELLOHELLOHELLO
+===SPLIT===
+banana banana
+===SPLIT===
+science science
+===SPLIT===
+ABCABCABCABC
+===SPLIT===
+HELLOHELLOHELLO
