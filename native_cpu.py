@@ -53,7 +53,7 @@ def _get_library():
     arr32 = np.ctypeslib.ndpointer(dtype=np.int32,flags='C_CONTIGUOUS')
     arr8 = np.ctypeslib.ndpointer(dtype=np.uint8,flags='C_CONTIGUOUS')
     lib.lens_eval_cpu.argtypes=[arr16,arr16,arr32,arr32,arr8,
-                                 ctypes.c_int,ctypes.c_int,arr8,arr32,
+                                 ctypes.c_int,ctypes.c_int,ctypes.c_int,arr8,arr32,
                                  ctypes.c_int,arr32,ctypes.c_int]
     lib.lens_eval_cpu.restype=ctypes.c_int
     lib.lens_eval_cpu_progress.argtypes=lib.lens_eval_cpu.argtypes + [_PROGRESS_CALLBACK]
@@ -72,7 +72,9 @@ def evaluate_cpu(genomes, texts, rules: int, workers: int = 0,
     if not genomes or not texts:
         return np.zeros((len(genomes),len(texts)),dtype=np.int32)
     lib=_get_library()
-    G=len(genomes); T=len(texts); cap=rules*65
+    G=len(genomes); T=len(texts)
+    cap=max(1,max(max(sum(len(r.pattern) for r in g.rules),
+                        sum(len(r.replacement) for r in g.rules)) for g in genomes))
     pat=np.zeros((G,cap),dtype=np.int16)
     rep=np.zeros_like(pat)
     po=np.zeros((G,rules+1),dtype=np.int32)
@@ -85,7 +87,6 @@ def evaluate_cpu(genomes, texts, rules: int, workers: int = 0,
         pc=rc=0
         for i,r in enumerate(g.rules):
             pn=len(r.pattern); qn=len(r.replacement)
-            if pn>64 or qn>64: raise ValueError('Rule length exceeds 64')
             po[gi,i]=pc; ro[gi,i]=rc
             pat[gi,pc:pc+pn]=r.pattern
             rep[gi,rc:rc+qn]=r.replacement
@@ -97,7 +98,7 @@ def evaluate_cpu(genomes, texts, rules: int, workers: int = 0,
     packed=np.frombuffer(buf,dtype=np.uint8).copy()
     offs=np.asarray(offsets,dtype=np.int32)
     out=np.zeros((G,T),dtype=np.int32)
-    args=(pat,rep,po,ro,luts,G,rules,packed,offs,T,out,workers)
+    args=(pat,rep,po,ro,luts,G,rules,cap,packed,offs,T,out,workers)
     if on_genome_done is None:
         err=lib.lens_eval_cpu(*args)
     else:
@@ -105,6 +106,9 @@ def evaluate_cpu(genomes, texts, rules: int, workers: int = 0,
         # it for each callback. tqdm throttles the expensive terminal refresh.
         callback=_PROGRESS_CALLBACK(on_genome_done)
         err=lib.lens_eval_cpu_progress(*args, callback)
+    if err in (-3, -4):
+        raise MemoryError('Replacer state exceeded available/representable memory; '
+                          'no state was silently truncated')
     if err:
         raise RuntimeError(f'Native CPU evaluator returned {err}')
     return out

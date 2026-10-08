@@ -7,6 +7,7 @@
 #include <cstring>
 #include <thread>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -16,6 +17,7 @@ struct Rule {
     int pn = 0, qn = 0, wc = 0;
     int anchor_kind = 0, anchor_value = -1;
     bool always_identity = false;
+    bool can_expand = false;
 };
 struct Capture { int start = 0, length = 0; };
 
@@ -51,14 +53,14 @@ inline bool always_identity(const Rule &r) {
 }
 
 inline bool match_at(const token *s, int n, int start, const Rule &r,
-                     Capture (&caps)[16], int &end) {
+                     Capture *caps, int &end) {
     int i = 0, pos = start, c = 0;
     while (i < r.pn && r.p[i] >= 0) {
         if (pos >= n || s[pos] != r.p[i]) return false;
         ++i; ++pos;
     }
     while (i < r.pn) {
-        if (r.p[i] != -1 || c >= 16) return false;
+        if (r.p[i] != -1) return false;
         ++i;
         int begin = pos, lit = i;
         while (i < r.pn && r.p[i] >= 0) ++i;
@@ -116,6 +118,19 @@ Model compile_model(const int16_t *pat, const int16_t *rep,
         r.q = rep + ro[i]; r.qn = ro[i+1] - ro[i];
         for (int k = 0; k < r.pn; ++k) if (r.p[k] == -1) ++r.wc;
         r.always_identity = always_identity(r);
+        int literal_input = 0, literal_output = 0;
+        for (int k=0;k<r.pn;++k) literal_input += r.p[k]>=0;
+        bool seen[16] = {};
+        for (int k=0;k<r.qn;++k) {
+            int op=r.q[k];
+            if (op>=0) { ++literal_output; continue; }
+            int ci=(op >= -15 ? -op - 1 : ((-op-16)%16));
+            if (ci>=0 && ci<16) {
+                if (seen[ci]) r.can_expand=true;
+                seen[ci]=true;
+            }
+        }
+        if (literal_output > literal_input) r.can_expand = true;
         // Prefer the rarest necessary adjacent literal pair, not the first.
         // A zero-occurrence pair proves a rule cannot fire for these examples
         // until other rules create it; the dynamic table is still authoritative.
@@ -142,8 +157,7 @@ Model compile_model(const int16_t *pat, const int16_t *rep,
 
 int run(const Model &m, const token *txt, int L) {
     if (L < 2) return 0;
-    // State never expands during a sweep. Teacher forcing adds one byte at each
-    // step; thus the actual input length + 1 is sufficient, with no truncation.
+    // No arbitrary recurrent-state limit. Capacity grows only on demand.
     std::vector<token> buffer_a(static_cast<size_t>(L+1));
     std::vector<token> buffer_b(static_cast<size_t>(L+1));
     auto *a = &buffer_a, *b = &buffer_b;
@@ -166,68 +180,131 @@ int run(const Model &m, const token *txt, int L) {
             if (r.anchor_kind == 1 && marks.bytes[r.anchor_value] != epoch) continue;
             if (r.anchor_kind == 2 && marks.pairs[r.anchor_value] != epoch) continue;
             const token *src = a->data();
-            token *dst = b->data();
-            int scan = 0, prev = 0, out = 0;
+            int scan = 0, prev = 0;
             bool matched = false;
-            Capture captures[16];
-            while (scan < n) {
-                int ss = -1, finish = -1;
-                if (r.p[0] >= 0) {
-                    for (int k = scan; k < n; ++k) {
-                        if (src[k] != r.p[0]) continue;
-                        int f = 0;
-                        if (match_at(src,n,k,r,captures,f)) {ss=k; finish=f; break;}
-                    }
-                } else {
-                    int f = 0;
-                    if (match_at(src,n,scan,r,captures,f)) {ss=scan; finish=f;}
-                }
-                if (ss < 0) break;
-                matched = true;
-                if (ss > prev) { std::memcpy(dst+out,src+prev,size_t(ss-prev)); out += ss-prev; }
-                int emitted = 0, allowance = finish-ss;
-                for (int j = 0; j < r.qn; ++j) {
-                    int op = r.q[j];
-                    if (op >= 0) {
-                        if (emitted < allowance) {dst[out++] = static_cast<token>(op); ++emitted;}
-                        continue;
-                    }
-                    if (r.wc <= 0) continue;
-                    int kind = 0, ci = 0;
-                    if (op >= -15) {kind=0; ci=-op-1;}
-                    else if (op >= -31) {kind=2; ci=-op-16;}
-                    else if (op >= -47) {kind=1; ci=-op-32;}
-                    else if (op >= -111) {int off=-op-48; kind=3+off/16; ci=off%16;}
-                    else continue;
-                    if (ci >= r.wc) ci=0;
-                    const Capture &cap = captures[ci];
-                    int begin=cap.start, length=cap.length;
-                    if (emitted + length > allowance) continue;
-                    if (kind == 0) {
-                        if (length) std::memcpy(dst+out,src+begin,size_t(length));
-                    } else if (kind == 1) {
-                        for (int k=0; k<length; ++k) dst[out+k]=src[begin+length-k-1];
-                    } else if (kind == 2) {
-                        if (length) std::memcpy(dst+out,src+begin,size_t(length));
-                        std::sort(dst+out,dst+out+length,[&](token u,token v){return m.lut[u]<m.lut[v];});
+            Capture local_caps[16];
+            std::vector<Capture> extra_caps;
+            if (r.wc > 16) extra_caps.resize(static_cast<size_t>(r.wc));
+            Capture *captures = (r.wc > 16 ? extra_caps.data() : local_caps);
+            if (!r.can_expand) {
+                // Preserve the existing low-overhead flat-buffer fast path.
+                if (b->size() < static_cast<size_t>(n)) b->resize(static_cast<size_t>(n));
+                token *dst = b->data();
+                int out = 0;
+                while (scan < n) {
+                    int ss = -1, finish = -1;
+                    if (r.p[0] >= 0) {
+                        for (int k = scan; k < n; ++k) {
+                            if (src[k] != r.p[0]) continue;
+                            int f = 0;
+                            if (match_at(src,n,k,r,captures,f)) {ss=k; finish=f; break;}
+                        }
                     } else {
-                        const auto &map = m.transforms[kind-3];
-                        for (int k=0; k<length; ++k) dst[out+k]=map[src[begin+k]];
+                        int f = 0;
+                        if (match_at(src,n,scan,r,captures,f)) {ss=scan; finish=f;}
                     }
-                    out += length; emitted += length;
+                    if (ss < 0) break;
+                    matched = true;
+                    if (ss > prev) { std::memcpy(dst+out,src+prev,size_t(ss-prev)); out += ss-prev; }
+                    for (int j = 0; j < r.qn; ++j) {
+                        int op = r.q[j];
+                        if (op >= 0) {dst[out++] = static_cast<token>(op); continue;}
+                        if (r.wc <= 0) continue;
+                        int kind = 0, ci = 0;
+                        if (op >= -15) {kind=0; ci=-op-1;}
+                        else if (op >= -31) {kind=2; ci=-op-16;}
+                        else if (op >= -47) {kind=1; ci=-op-32;}
+                        else if (op >= -111) {int off=-op-48; kind=3+off/16; ci=off%16;}
+                        else continue;
+                        if (ci >= r.wc) ci=0;
+                        const Capture &cap = captures[ci];
+                        int begin=cap.start, length=cap.length;
+                        if (kind == 0) {
+                            if (length) std::memcpy(dst+out,src+begin,size_t(length));
+                        } else if (kind == 1) {
+                            for (int k=0;k<length;++k) dst[out+k]=src[begin+length-k-1];
+                        } else if (kind == 2) {
+                            if (length) std::memcpy(dst+out,src+begin,size_t(length));
+                            std::sort(dst+out,dst+out+length,[&](token u,token v){return m.lut[u]<m.lut[v];});
+                        } else {
+                            const auto &map = m.transforms[kind-3];
+                            for (int k=0;k<length;++k) dst[out+k]=map[src[begin+k]];
+                        }
+                        out += length;
+                    }
+                    prev = scan = finish;
                 }
-                prev = scan = finish;
+                if (!matched) continue;
+                if (n > prev) {std::memcpy(dst+out,src+prev,size_t(n-prev)); out+=n-prev;}
+                bool changed = out != n || std::memcmp(src,dst,size_t(out)) != 0;
+                n = out;
+                std::swap(a,b);
+                dirty = changed;
+            } else {
+                // Expansion path: grow output buffer without clipping any literals
+                // or captures. Keep source immutable until the full sweep finishes.
+                b->clear();
+                while (scan < n) {
+                    int ss = -1, finish = -1;
+                    if (r.p[0] >= 0) {
+                        for (int k=scan;k<n;++k) {
+                            if (src[k] != r.p[0]) continue;
+                            int f=0;
+                            if (match_at(src,n,k,r,captures,f)) {ss=k; finish=f; break;}
+                        }
+                    } else {
+                        int f=0;
+                        if (match_at(src,n,scan,r,captures,f)) {ss=scan; finish=f;}
+                    }
+                    if (ss<0) break;
+                    matched=true;
+                    b->insert(b->end(),src+prev,src+ss);
+                    for (int j=0;j<r.qn;++j) {
+                        int op = r.q[j];
+                        if (op>=0) { b->push_back(static_cast<token>(op)); continue; }
+                        if (r.wc==0) continue;
+                        int kind=0,ci=0;
+                        if (op>=-15) { kind=0;ci=-op-1; }
+                        else if (op>=-31) { kind=2;ci=-op-16; }
+                        else if (op>=-47) { kind=1;ci=-op-32; }
+                        else if (op>=-111) { int off=-op-48;kind=3+off/16;ci=off%16; }
+                        else continue;
+                        if (ci>=r.wc) ci=0;
+                        const Capture &c=captures[ci];
+                        int begin=c.start,length=c.length;
+                        if (kind==0) {
+                            b->insert(b->end(),src+begin,src+begin+length);
+                        } else if (kind==1) {
+                            for (int k=length-1;k>=0;--k) b->push_back(src[begin+k]);
+                        } else if (kind==2) {
+                            size_t off=b->size();
+                            b->insert(b->end(),src+begin,src+begin+length);
+                            std::sort(b->begin()+off,b->end(),[&](token u,token v){return m.lut[u]<m.lut[v];});
+                        } else {
+                            const auto &map=m.transforms[kind-3];
+                            for (int k=0;k<length;++k) b->push_back(map[src[begin+k]]);
+                        }
+                    }
+                    prev=scan=finish;
+                }
+                if (!matched) continue;
+                b->insert(b->end(),src+prev,src+n);
+                if (b->size()>static_cast<size_t>(std::numeric_limits<int>::max()-1))
+                    throw std::length_error("recurrent state exceeds int address range");
+                int out=static_cast<int>(b->size());
+                bool changed=out!=n || std::memcmp(src,b->data(),size_t(out)) != 0;
+                n=out;
+                std::swap(a,b);
+                dirty=changed;
             }
-            if (!matched) continue;
-            if (n > prev) {std::memcpy(dst+out,src+prev,size_t(n-prev)); out+=n-prev;}
-            bool changed = out != n || std::memcmp(src,dst,size_t(out)) != 0;
-            n = out;
-            std::swap(a,b);
-            dirty = changed;
         }
-        if (n==0) {(*a)[0]=0; n=1;}
+        if (n==0) {
+            if (a->empty()) a->resize(1);
+            (*a)[0]=0;n=1;
+        }
         if ((*a)[n-1] == txt[t]) ++correct;
         (*a)[n-1] = txt[t];
+        if (a->size() <= static_cast<size_t>(n)) a->resize(static_cast<size_t>(n)+1);
         (*a)[n++] = 0;
         dirty = true;
     }
@@ -235,12 +312,12 @@ int run(const Model &m, const token *txt, int L) {
 }
 } // namespace
 
-// Input arrays: G genomes, R rules, fixed token capacity R*65 per genome,
+// Input arrays: G genomes, R rules, dynamic token stride per genome,
 // concatenated sample records with offsets. out is [G, T] int32.
 static int lens_eval_cpu_impl(
     const int16_t *patterns, const int16_t *replacements,
     const int32_t *po, const int32_t *ro, const uint8_t *lut,
-    int G, int R, const uint8_t *texts, const int32_t *offsets,
+    int G, int R, int stride, const uint8_t *texts, const int32_t *offsets,
     int T, int32_t *out, int workers, void (*on_genome_done)(int)) {
     if (!patterns || !replacements || !po || !ro || !lut || !texts || !offsets || !out || G<0 || R<0 || T<0) return -1;
     if (G==0 || T==0) return 0;
@@ -255,14 +332,16 @@ static int lens_eval_cpu_impl(
             if (k+1<offsets[s+1]) ++freq_pairs[(b<<8)|texts[k+1]];
         }
     }
-    const int stride = R*65;
     const int offset_stride = R+1;
     std::atomic<int> cursor{0};
+    std::atomic<int> error{0};
     auto task = [&](){
+      try {
         for (;;) {
+            if (error.load(std::memory_order_relaxed)) break;
             int g = cursor.fetch_add(1,std::memory_order_relaxed);
             if (g >= G) break;
-            Model m = compile_model(patterns+g*stride,replacements+g*stride,
+            Model m = compile_model(patterns+static_cast<size_t>(g)*stride,replacements+static_cast<size_t>(g)*stride,
                                     po+g*offset_stride,ro+g*offset_stride,
                                     lut+g*256,R,freq_bytes,freq_pairs);
             for (int s=0; s<T; ++s) {
@@ -273,6 +352,13 @@ static int lens_eval_cpu_impl(
             // It cannot alter fitness or scheduling; nullptr is the fast path.
             if (on_genome_done) on_genome_done(1);
         }
+      } catch (const std::bad_alloc&) {
+        error.store(-3,std::memory_order_relaxed);
+      } catch (const std::length_error&) {
+        error.store(-4,std::memory_order_relaxed);
+      } catch (const std::exception&) {
+        error.store(-5,std::memory_order_relaxed);
+      }
     };
     int nthreads = workers > 0 ? workers : int(std::thread::hardware_concurrency());
     nthreads = std::max(1,std::min(nthreads,G));
@@ -281,16 +367,16 @@ static int lens_eval_cpu_impl(
     for(int j=1;j<nthreads;++j) jobs.emplace_back(task);
     task();
     for(auto &job:jobs) job.join();
-    return 0;
+    return error.load(std::memory_order_relaxed);
 }
 
 // Preserve the legacy C ABI for existing callers.
 extern "C" int lens_eval_cpu(
     const int16_t *patterns, const int16_t *replacements,
     const int32_t *po, const int32_t *ro, const uint8_t *lut,
-    int G, int R, const uint8_t *texts, const int32_t *offsets,
+    int G, int R, int stride, const uint8_t *texts, const int32_t *offsets,
     int T, int32_t *out, int workers) {
-    return lens_eval_cpu_impl(patterns, replacements, po, ro, lut, G, R,
+    return lens_eval_cpu_impl(patterns, replacements, po, ro, lut, G, R, stride,
                               texts, offsets, T, out, workers, nullptr);
 }
 
@@ -298,8 +384,8 @@ extern "C" int lens_eval_cpu(
 extern "C" int lens_eval_cpu_progress(
     const int16_t *patterns, const int16_t *replacements,
     const int32_t *po, const int32_t *ro, const uint8_t *lut,
-    int G, int R, const uint8_t *texts, const int32_t *offsets,
+    int G, int R, int stride, const uint8_t *texts, const int32_t *offsets,
     int T, int32_t *out, int workers, void (*on_genome_done)(int)) {
-    return lens_eval_cpu_impl(patterns, replacements, po, ro, lut, G, R,
+    return lens_eval_cpu_impl(patterns, replacements, po, ro, lut, G, R, stride,
                               texts, offsets, T, out, workers, on_genome_done);
 }

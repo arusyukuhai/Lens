@@ -1,46 +1,45 @@
-# Lens v10 — tqdm進捗表示を追加（v9高速化版ベース）
+# Lens v14 — variable-length Replacer + refined GA / three-parent diff3
 
-今回の変更は **進捗の可視化のみ** です。自己回帰、450ルール、256トークン、`===SPLIT===` 分割、1500バイト以上のチャンク除外、可逆LUT、遺伝的アルゴリズム、モデル/チェックポイント形式はv9と同じです。
+This build combines v13's improved mutation / crossover and v12's one-case-at-a-time rotation with a **variable-length rule and recurrent-state implementation**.
 
-## セットアップ
+## What changed
 
-ZIP内の `main.py`, `gpu_replace_persistent.py`, `native_cpu.py`, `replacer_native.cpp` を**すべて**同じフォルダへコピーしてください。`replacer_native.cpp` を入れ替えると、CPUでは初回評価時に変更を検出してC++を自動再コンパイルします。
+- **No hard 64-token rule limit for CPU/Python.** Patterns and replacements may exceed 64 tokens; the evolutionary operators can gradually grow them through insertion, context extension, duplication, and diff3 sequence merges. The original `MAX_RULE_TOKENS=64` restriction only remains as a compatibility limit **inside the legacy Metal fast path**.
+- **Output is no longer forced to be nonexpanding.** Literal outputs can exceed the number of input literals, and a capture may be emitted repeatedly. Rule evaluation never silently truncates a replacement to its matched span.
+- **Native C++ evaluator now supports dynamically growing recurrent-state buffers**, without the old `input_length+1` capacity assumption. Rule packing also uses variable row strides instead of the former fixed `rules × 65` layout. The reference Python evaluator uses identical semantics.
+- **Genome validation and saved-model loading** accept longer / expanding rules. Existing v12/v13 autoregressive checkpoints and models remain loadable (checkpoint version unchanged). Evaluation results for unchanged nonexpanding rules are preserved.
+- **Conservative evolution, expressive execution:** unrestricted expansion is valid for hand-written/saved programs, but the *random genetic operators* preferentially make small length increases in prediction-slot-conditioned rules and avoid creating repeated-capture exponential explosions accidentally. The ability to grow repeatedly over future generations is unlimited; this is not a hard rule-length cap.
+- **MPS fallback:** the pre-existing GPU kernel is fixed-stride and nonexpanding. When rules are too long or can expand, `--backend mps` automatically evaluates that generation on native CPU rather than risking a GPU buffer overflow or incorrect score. On Mac, `--backend cpu` is the default, also reflecting measured CPU superiority on this workload.
+- **Training log:** `ruleLen=<max-pattern-length>/<max-replacement-length>` shows the longest current rule in each generation.
 
-```bash
-python -m pip install tqdm
-python main.py --backend mps --local-corpus github-code.txt \
-    --population 450 --rules 450 --cases 8 --max-chunk 1500
-```
+## Preserved design
 
-CPUネイティブ並列評価:
+- 450 rules per genome by default, 450 population members, byte tokens 0..255 and reversible LUT within `sort/+1/-1/*2//2` only.
+- One ordered rule sweep per predicted byte; the resulting state is preserved, teacher-forced at the final prediction slot, then appended with a fresh slot.
+- No fixed recurrent-state/context length, no probability distribution, and no automatic truncation of the internal state.
+- `===SPLIT===` chunk delimiter; complete chunks of **1500 bytes or longer** are skipped (configurable with `--max-chunk`).
+- `case_rotate_every` replaces only one evaluation case at each boundary; its RNG state survives checkpoints.
+- tqdm evaluation/generation progress, caching, and refined mutation / two-parent and diff3 three-parent crossover from v13.
 
-```bash
-python main.py --backend cpu --cpu-workers 0 \
-    --local-corpus github-code.txt --population 450 --rules 450 --cases 8
-```
-
-進捗表示が不要なら `--no-tqdm` を指定してください（この場合は `tqdm` のインストールは不要です）。
-
-## 表示内容
-
-- **初期集団を生成**: 初回起動時に何個体を生成したか。
-- **Lens 学習 gen=N**: 世代数、世代/秒、直近のAccuracy、評価時間、世代全体の推定残り時間。
-- **gen=N 評価/mps / 評価/cpu**: 今世代に要求された個体のうち評価が終わった数、個体/秒、残り時間。
-- **gen=N 次世代作成**: 次の世代の子個体生成進捗。
-- 通常の `gen=... acc=... mean=... seconds=...` ログも維持します。
-
-CPUでは **C++側のスレッドが1個体の全文評価を終えたごとに** tqdmへ通知します。既存のC++全個体一括並列処理を細かな小バッチへ分割しません。正確にキャッシュから再利用した個体も進捗に加算します。
-
-MPSでは **1バッチの計算結果をGPUから読み戻した後** tqdmを更新します。GPUカーネルの実行途中までは計測できないため、バッチが長時間かかる場合は進捗がその間止まります。さらに細かな表示にしたい場合は、`--mps-batch 16` や `--mps-batch 8` を試せますが、実行速度が遅くなる可能性があります。進捗表示自体のためにGPUを余分に同期させる処理は入れていません。
-
-速度が異常に遅い場合は、数世代の `seconds=` を比較し、`--backend mps` と `--backend cpu` の実測値を比べてください。tqdmは処理速度を表示するだけで学習を自動高速化するものではありません。
-
-## テスト
+## Install and run
 
 ```bash
-python -m unittest -v test_progress test_optimized test_autoregressive test_fastfix test_corpus_split
+python -m pip install numpy tqdm
+python main.py --backend cpu --local-corpus github-code.txt \
+    --rules 450 --population 450 --cases 8 --case-rotate-every 3
 ```
 
-38件の回帰テストを実行: C++並列コールバック、同一ゲノムのキャッシュ計数、Pythonフォールバック、模擬MPSバッチ、tqdmの有効/無効によるモデル一致、旧来の自己回帰評価テストなど。
+For an existing Lens directory, replace **`main.py`, `native_cpu.py`, and `replacer_native.cpp` together**. The `gpu_replace_persistent.py` in this archive is the unchanged compatible Metal implementation. Keep all four in the same directory. Native CPU uses a locally available C++17 compiler and caches its compiled binary by a source hash.
 
-Apple MPS実機でのシェーダーコンパイル・実時間測定は未検証です。
+## Verify
+
+```bash
+python -m unittest discover -q
+python main.py --self-test
+```
+
+The additional `test_dynamic_lengths.py` covers 170+ token patterns, 220+ token replacements, repeated captures, native CPU/Python equality with expanding state, save/load, and MPS fallback.
+
+## Resource note
+
+"No artificial memory limit" does **not** imply physically infinite memory. A rule that duplicates a long capture can grow a state exponentially and exhaust RAM / take arbitrarily long; it will not be silently clipped. Such a manual rule is valid but should be used cautiously. When C++ allocations fail, a Python `MemoryError` is reported where possible. By design, the ordinary evolutionary operators discourage explosive rules without imposing a model-level state ceiling.

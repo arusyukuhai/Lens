@@ -14,9 +14,11 @@ string-side GA, fixed hidden memory, context window or sequence truncation.
 All visible tokens are 0..255. Embedding is a 256-element permutation LUT used
 *only* within sort/+1/-1/*2//2, immediately undone by its inverse LUT.
 
-A one-pass nonexpanding network ensures memory grows at most with the context,
-without an arbitrary max-memory setting. GPU buffers are dynamically sized to
-the actual training examples and thus limited only by physical resources.
+The one-pass network permits output longer than the matched input. Rule lengths
+and recurrent state lengths have no imposed model-level ceiling; they are only
+limited by physical memory and representable allocation sizes. The legacy fixed-
+capacity Metal kernel is used only for compatible nonexpanding 64-token rules;
+otherwise the native CPU evaluator is selected automatically.
 """
 from __future__ import annotations
 
@@ -44,13 +46,14 @@ except ImportError:
 
 TOKEN_COUNT = 256
 RULE_COUNT = 450
-MAX_RULE_TOKENS = 64
+MPS_MAX_RULE_TOKENS = 64  # Metal fast path only; CPU/Python have no rule-length cap
 MAX_WILDCARDS = 16
 PREDICTION_SLOT = 0  # byte NUL is used as the slot placeholder, not a 257th token
 CHECKPOINT_VERSION = 4
 _MPS_CROSSCHECK_DONE = False
 _NATIVE_CROSSCHECK_DONE = False
 _NATIVE_UNAVAILABLE_WARNED = False
+_EXPANSION_FALLBACK_WARNED = False
 # One-generation reuse of exact evaluation scores on identical training cases.
 # Checkpoint formats are unaffected (this cache is never persisted).
 _SCORE_CACHE_KEY = None
@@ -91,70 +94,108 @@ def inverse_lut(lut: Sequence[int]) -> list[int]:
     return inverse
 
 
-def is_nonexpanding(rule: Rule) -> bool:
-    """Sufficient and necessary condition for ANY capture lengths."""
-    p = rule.pattern
-    q = rule.replacement
-    if not p or len(p) > MAX_RULE_TOKENS or len(q) > MAX_RULE_TOKENS:
+def is_valid_rule(rule: Rule) -> bool:
+    """Structural legality; do NOT impose rule length or output growth caps."""
+    p, q = rule.pattern, rule.replacement
+    if not p or all(v == -1 for v in p):
         return False
-    if any(v != -1 and not 0 <= v < 256 for v in p):
+    if any(v != -1 and not 0 <= v < TOKEN_COUNT for v in p):
         return False
     wc = p.count(-1)
-    if wc > MAX_WILDCARDS or all(v == -1 for v in p):
-        return False
-    lit_budget = sum(v >= 0 for v in p)
-    if sum(v >= 0 for v in q) > lit_budget:
-        return False
-    used = set()
     for op in q:
         if op >= 0:
-            if op > 255:
+            if op >= TOKEN_COUNT:
                 return False
-            continue
-        if op < -111:
+        elif op < -111 or not wc:
             return False
-        if wc < 1:
-            return False
-        ci = ((-op - 16) % 16 + 1) if op <= -16 else -op
-        if not 1 <= ci <= wc or ci in used:
-            return False
-        used.add(ci)
+        else:
+            ci = ((-op - 16) % 16 + 1) if op <= -16 else -op
+            if ci > wc:
+                return False
+    return True
+
+
+def is_nonexpanding(rule: Rule) -> bool:
+    """Legacy Metal fast-path test, not a constraint on legal genomes."""
+    if not is_valid_rule(rule):
+        return False
+    p, q = rule.pattern, rule.replacement
+    if len(p) > MPS_MAX_RULE_TOKENS or len(q) > MPS_MAX_RULE_TOKENS:
+        return False
+    if p.count(-1) > MAX_WILDCARDS:
+        return False
+    remaining = sum(v >= 0 for v in p)
+    if sum(v >= 0 for v in q) > remaining:
+        return False
+    seen = set()
+    for op in q:
+        if op < 0:
+            ci = ((-op - 16) % 16 + 1) if op <= -16 else -op
+            if ci in seen:
+                return False
+            seen.add(ci)
     return True
 
 
 def repair_rule(rule: Rule, rnd: random.Random | None = None) -> Rule:
-    """Normalize old tokens and guarantee hard nonexpanding invariant."""
+    """Clean invalid tokens without clipping length, captures or output growth."""
     rng = rnd or random
-    pattern = [(v if 0 <= v < TOKEN_COUNT else -1) for v in rule.pattern[:MAX_RULE_TOKENS]]
+    pattern = [(int(v) if 0 <= int(v) < TOKEN_COUNT else -1)
+               for v in rule.pattern]
     if not pattern:
-        pattern = [rng.randrange(256)]
-    cnt = 0
-    for i, v in enumerate(pattern):
-        if v == -1:
-            cnt += 1
-            if cnt > MAX_WILDCARDS:
-                pattern[i] = rng.randrange(256)
-    if all(t == -1 for t in pattern):
-        pattern[0] = rng.randrange(256)
+        pattern = [rng.randrange(TOKEN_COUNT)]
+    if all(v == -1 for v in pattern):
+        pattern[0] = rng.randrange(TOKEN_COUNT)
     wc = pattern.count(-1)
-    remaining = sum(t >= 0 for t in pattern)
-    captured = set()
     replacement = []
-    for op in rule.replacement[:MAX_RULE_TOKENS]:
+    for raw in rule.replacement:
+        op = int(raw)
         if op >= 0:
-            if remaining > 0:
-                replacement.append(op % 256)
-                remaining -= 1
+            replacement.append(op % TOKEN_COUNT)
         elif -111 <= op < 0 and wc:
             ci = ((-op - 16) % 16 + 1) if op <= -16 else -op
-            if ci <= wc and ci not in captured:
+            if ci <= wc:
                 replacement.append(op)
-                captured.add(ci)
     if not replacement:
         replacement = [-1] if wc else [pattern[0]]
     out = Rule(pattern, replacement)
-    assert is_nonexpanding(out)
+    assert is_valid_rule(out)
     return out
+
+def repair_evolved_rule(rule: Rule, rnd: random.Random | None = None) -> Rule:
+    """Keep new mutations usable instead of producing exponential blow-ups.
+
+    NOT a model length/memory cap: manually authored rules, saved models, and
+    outputs may expand arbitrarily. Mutation and crossover preferentially
+    introduce one extra literal at a time, *only* for a trailing prediction-slot
+    context of length >=3. Repeated captures, which can duplicate the entire
+    recurrent state on every step, are not created automatically.
+    """
+    r = repair_rule(rule, rnd)
+    wc = r.pattern.count(-1)
+    used = set()
+    filtered = []
+    for op in r.replacement:
+        if op < 0:
+            ci = ((-op - 16) % 16 + 1) if op <= -16 else -op
+            if ci in used:
+                continue
+            used.add(ci)
+        filtered.append(op)
+    lit_in = sum(v >= 0 for v in r.pattern)
+    lit_out = sum(v >= 0 for v in filtered)
+    # Expansion is allowed through a predictive guard; its state can keep
+    # growing over arbitrarily many steps, with no fixed context window.
+    extra = 1 if (len(r.pattern) >= 3 and r.pattern[-1] == PREDICTION_SLOT) else 0
+    if lit_out > lit_in + extra:
+        needed = lit_out - lit_in - extra
+        for i in range(len(filtered)-1,-1,-1):
+            if filtered[i] >= 0:
+                del filtered[i]
+                needed -= 1
+                if not needed:
+                    break
+    return repair_rule(Rule(r.pattern, filtered), rnd)
 
 
 def _match_at(state: Sequence[int], pattern: Sequence[int], start: int):
@@ -198,12 +239,11 @@ def _match_at(state: Sequence[int], pattern: Sequence[int], start: int):
 
 
 def _emit_replacement(rep: Sequence[int], caps: Sequence[Sequence[int]],
-                      lut: Sequence[int], inverse: Sequence[int], allowance: int) -> list[int]:
+                      lut: Sequence[int], inverse: Sequence[int]) -> list[int]:
     out = []
     for op in rep:
         if op >= 0:
-            if len(out) < allowance:
-                out.append(op)
+            out.append(op)
             continue
         if not caps:
             continue
@@ -219,9 +259,6 @@ def _emit_replacement(rep: Sequence[int], caps: Sequence[Sequence[int]],
         if ci >= len(caps):
             ci = 0
         vals = list(caps[ci])
-        # Never partially emit a capture: matches original semantics.
-        if len(out) + len(vals) > allowance:
-            continue
         if kind == 1:
             vals.reverse()
         elif kind == 2:
@@ -271,14 +308,12 @@ def replace_once(state: Sequence[int], rule: Rule, lut: Sequence[int], inverse: 
         s, finish, caps = found
         matched = True
         out.extend(state[prev:s])
-        out.extend(_emit_replacement(rule.replacement, caps, lut, inverse, finish-s))
+        out.extend(_emit_replacement(rule.replacement, caps, lut, inverse))
         prev = finish
         scan = finish
     if not matched:
         return list(state)
     out.extend(state[prev:])
-    if len(out) > n:
-        raise AssertionError('Nonexpanding invariant broken')
     return out
 
 
@@ -533,7 +568,8 @@ def make_rule(rng: random.Random, corpus: Sequence[bytes], bigrams: Sequence[tup
         return Rule([a,-1,PREDICTION_SLOT],[a,-1,b])
     if choice<0.72:
         x=rng.choice(corpus)
-        size=rng.randint(1,min(5,len(x)))
+        size=(log_uniform_count(rng,min(len(x),48)) if rng.random()<0.28
+              else rng.randint(1,min(7,len(x))))
         start=rng.randrange(len(x)-size+1)
         p=list(x[start:start+size])
         rep=p.copy()
@@ -545,7 +581,7 @@ def make_rule(rng: random.Random, corpus: Sequence[bytes], bigrams: Sequence[tup
         return Rule([a,-1,PREDICTION_SLOT],[a,opcode,PREDICTION_SLOT])
     if choice<0.92:
         return Rule([a,-1,PREDICTION_SLOT],[a,-16,b])  # sort($1)
-    p=[rng.randrange(256) for _ in range(rng.randint(1,6))]
+    p=[rng.randrange(256) for _ in range(log_uniform_count(rng,40))]
     if len(p)>=3 and rng.random()<0.4:
         p[rng.randrange(len(p))]=-1
     rep=[rng.randrange(256) for _ in range(len(p))]
@@ -559,102 +595,375 @@ def new_genome(rules: int, rng: random.Random, corpus, bigrams, enable_embedding
         for _ in range(rng.randint(0,6)):
             x,y=rng.sample(range(256),2)
             lut[x],lut[y]=lut[y],lut[x]
-    return Genome([repair_rule(make_rule(rng,corpus,bigrams),rng) for _ in range(rules)], lut)
+    return Genome([repair_evolved_rule(make_rule(rng,corpus,bigrams),rng) for _ in range(rules)], lut)
 
 
 def log_uniform_count(rng: random.Random, maximum: int) -> int:
     return max(1,min(maximum,int(round(math.exp(rng.uniform(0,math.log(max(1,maximum))))))))
 
 
+def _mutation_radius(rng: random.Random, n: int, *, local: int = 6,
+                     balanced: int = 32) -> int:
+    """Heavy-tailed search, but favor small steps that preserve useful programs.
+
+    The older implementation applied a log-uniform draw over all 450 rows for
+    *every* child: its typical disruption was unnecessarily large. This uses
+    three regimes with rare full-length explorations instead.
+    """
+    if n <= 1:
+        return max(0, n)
+    u = rng.random()
+    maximum = min(n, local if u < 0.72 else balanced if u < 0.95 else n)
+    return log_uniform_count(rng, maximum)
+
+
 def mutate_lut(lut: list[int], rng: random.Random, enabled: bool) -> list[int]:
-    if not enabled or rng.random()>=0.25:
+    """Permutation-preserving, mostly-local mutation (swap/cycle/inversion)."""
+    if not enabled or rng.random() >= 0.25:
         return list(lut)
-    out=list(lut)
-    k=log_uniform_count(rng,256)
-    for _ in range(k):
-        x,y=rng.sample(range(256),2)
-        out[x],out[y]=out[y],out[x]
+    out = list(lut)
+    k = _mutation_radius(rng, 256, local=4, balanced=24)
+    op = rng.random()
+    if op < 0.70:
+        for _ in range(k):
+            x, y = rng.sample(range(256), 2)
+            out[x], out[y] = out[y], out[x]
+    elif op < 0.90:
+        indices = rng.sample(range(256), min(256, max(2, k)))
+        values = [out[i] for i in indices]
+        out[indices[0]] = values[-1]
+        for i, value in zip(indices[1:], values[:-1]):
+            out[i] = value
+    else:
+        left = rng.randrange(255)
+        right = min(256, left + max(2, k))
+        out[left:right] = reversed(out[left:right])
     return out
 
 
 def crossover_lut(a: Sequence[int], b: Sequence[int], rng: random.Random) -> list[int]:
-    """Cycle-safe partial permutation crossover."""
-    out=list(a)
-    inverse={v:i for i,v in enumerate(out)}
-    for i in rng.sample(range(256),log_uniform_count(rng,256)):
-        want=b[i]
-        if out[i]==want:
+    """Permutation-preserving partial donor transplant via value swaps."""
+    out = list(a)
+    inverse = {v: i for i, v in enumerate(out)}
+    for i in rng.sample(range(256), _mutation_radius(rng, 256, local=8, balanced=48)):
+        want = b[i]
+        if out[i] == want:
             continue
-        j=inverse[want]
-        inverse[out[i]]=j
-        inverse[want]=i
-        out[i],out[j]=out[j],out[i]
+        j = inverse[want]
+        inverse[out[i]] = j
+        inverse[want] = i
+        out[i], out[j] = out[j], out[i]
     return out
 
 
 def mutate_rule(rule: Rule, rng: random.Random, corpus, bigrams) -> Rule:
-    if rng.random()<0.12:
-        return repair_rule(make_rule(rng,corpus,bigrams),rng)
-    p=rule.pattern.copy()
-    q=rule.replacement.copy()
-    for _ in range(log_uniform_count(rng,max(1,len(p)+len(q)))):
-        action=rng.randrange(11)
-        s = p if rng.random()<0.5 else q
-        if action<=4 and s:
-            pos=rng.randrange(len(s))
+    """Mostly 1-4 token edits; occasionally rebuild/reshape whole small rules."""
+    if rng.random() < 0.07:
+        return repair_evolved_rule(make_rule(rng, corpus, bigrams), rng)
+    p = rule.pattern.copy()
+    q = rule.replacement.copy()
+    edits = _mutation_radius(rng, max(1, len(p) + len(q)), local=4, balanced=12)
+    for _ in range(edits):
+        action = rng.randrange(16)
+        s = p if rng.random() < 0.52 else q
+        if action <= 5 and s:
+            pos = rng.randrange(len(s))
             if s is p:
-                s[pos]=(-1 if rng.random()<0.10 else rng.choice(bigrams)[rng.randrange(2)])
+                # Preserve the common last-byte prediction-slot guard in many
+                # local variants, without forcing this convention on all rules.
+                if pos == len(p) - 1 and p[pos] == PREDICTION_SLOT and rng.random() < 0.65:
+                    continue
+                s[pos] = (-1 if rng.random() < 0.12 else
+                          rng.choice(bigrams)[rng.randrange(2)])
             else:
-                wc=p.count(-1)
-                if wc and rng.random()<0.35:
-                    family=rng.randrange(7)
-                    cap=rng.randint(1,min(15 if family==0 else 16,wc))
-                    s[pos]=-(cap if family==0 else 16+(family-1)*16+cap-1)
+                wc = p.count(-1)
+                if wc and rng.random() < 0.46:
+                    family = rng.randrange(7)
+                    cap = rng.randint(1, min(15 if family == 0 else 16, wc))
+                    s[pos] = -(cap if family == 0 else 16 + (family - 1)*16 + cap - 1)
                 else:
-                    s[pos]=rng.randrange(256)
-        elif action==5 and len(s)>1:
-            x,y=rng.sample(range(len(s)),2)
-            s[x],s[y]=s[y],s[x]
-        elif action==6 and len(s)<MAX_RULE_TOKENS:
-            s.insert(rng.randrange(len(s)+1),rng.randrange(256))
-        elif action==7 and len(s)>1:
+                    s[pos] = rng.choice(bigrams)[rng.randrange(2)] if rng.random() < 0.65 else rng.randrange(256)
+        elif action == 6 and len(s) > 1:
+            i, j = rng.sample(range(len(s)), 2)
+            s[i], s[j] = s[j], s[i]
+        elif action in (7, 8):
+            pos = rng.randrange(len(s) + 1)
+            if s is p and rng.random() < 0.15:
+                s.insert(pos, -1)
+            else:
+                s.insert(pos, rng.choice(bigrams)[rng.randrange(2)])
+        elif action == 9 and len(s) > 1:
             s.pop(rng.randrange(len(s)))
-        elif action==8 and s:
-            x=rng.randrange(len(s))
-            y=rng.randrange(x,len(s))
-            s[x:y+1]=reversed(s[x:y+1])
-        elif action==9 and rng.random()<0.3:
-            p[:]=make_rule(rng,corpus,bigrams).pattern
-        elif action==10 and rng.random()<0.3:
-            q[:]=make_rule(rng,corpus,bigrams).replacement
-    return repair_rule(Rule(p,q),rng)
+        elif action == 10 and len(s) > 1:
+            i, j = sorted(rng.sample(range(len(s)), 2))
+            s[i:j+1] = reversed(s[i:j+1])
+        elif action == 11 and len(s) > 2:
+            i, j = sorted(rng.sample(range(len(s)), 2))
+            block = s[i:j+1]
+            del s[i:j+1]
+            to = rng.randrange(len(s) + 1)
+            s[to:to] = block
+        elif action == 12 and len(p) > 1 and rng.random() < 0.35:
+            p[:] = make_rule(rng, corpus, bigrams).pattern
+        elif action == 13 and rng.random() < 0.35:
+            q[:] = make_rule(rng, corpus, bigrams).replacement
+        elif action == 14 and s is p:
+            # Extend a locally matched literal context with a corpus bigram.
+            a, b = rng.choice(bigrams)
+            i = rng.randrange(len(p)+1)
+            p[i:i] = [a, b]
+        elif action == 15 and s is q and q:
+            # Promote/demote a capture operation without changing the pattern.
+            wc = p.count(-1)
+            if wc:
+                i = rng.randrange(len(q))
+                family = rng.randrange(7)
+                ci = rng.randint(1, min(15 if family == 0 else 16, wc))
+                q[i] = -(ci if family == 0 else 16+(family-1)*16+ci-1)
+    # Rare geometric expansion / duplication of a meaningful rule fragment.
+    # Step size is finite; there is no upper bound across generations.
+    if rng.random() < 0.035:
+        s = p if rng.random() < 0.58 else q
+        if s:
+            start = rng.randrange(len(s))
+            width = min(len(s)-start, log_uniform_count(rng, max(1, len(s))))
+            block = s[start:start+width]
+            at = rng.randrange(len(s)+1)
+            s[at:at] = block
+    out = repair_evolved_rule(Rule(p, q), rng)
+    return out
 
 
-def mutate_genome(parent: Genome,rng: random.Random,corpus,bigrams,enabled=True) -> Genome:
-    rows=parent.rules.copy()
-    n=len(rows)
+def _rule_signature(r: Rule) -> tuple:
+    return (tuple(r.pattern), tuple(r.replacement))
+
+
+def _diff3_sequence(base: Sequence, donor: Sequence, target: Sequence,
+                    rng: random.Random, *, signatures=None,
+                    prefer_target: float = 0.94) -> list:
+    """3-way sequence merge, not position-wise 'mutation by another parent'.
+
+    Extract insertion/deletion/replacement hunks A->X and A->Y with Myers-like
+    alignment (SequenceMatcher), apply non-overlapping changes from both sides,
+    and explicitly resolve overlapping hunks. No edits are discarded merely
+    because lengths change; this is important inside pattern/replacement lists.
+    """
+    from difflib import SequenceMatcher
+    base = list(base)
+    donor = list(donor)
+    target = list(target)
+    if signatures is None:
+        sb, sd, st = base, donor, target
+    else:
+        sb = [signatures(v) for v in base]
+        sd = [signatures(v) for v in donor]
+        st = [signatures(v) for v in target]
+    if sd == sb:
+        return target
+    if st == sb:
+        return donor
+    if sd == st:
+        return target
+
+    def edits(src_keys, dst_keys, dst):
+        return [(i1,i2,list(dst[j1:j2]))
+                for tag,i1,i2,j1,j2 in SequenceMatcher(
+                    None,src_keys,dst_keys,autojunk=False).get_opcodes()
+                if tag != 'equal']
+    dx = edits(sb, sd, donor)
+    dy = edits(sb, st, target)
+    ix = iy = pos = 0
+    merged = []
+
+    def render(lo, hi, hunks):
+        out = []
+        cursor = lo
+        for start, end, rep in hunks:
+            out.extend(base[cursor:start])
+            out.extend(rep)
+            cursor = end
+        out.extend(base[cursor:hi])
+        return out
+
+    while ix < len(dx) or iy < len(dy):
+        start = min(dx[ix][0] if ix < len(dx) else len(base)+1,
+                    dy[iy][0] if iy < len(dy) else len(base)+1)
+        merged.extend(base[pos:start])
+        end = start
+        hx, hy = [], []
+        # Closed boundaries deliberately coalesce insertions at the same point.
+        # The loop always consumes at least one hunk, including zero-length ones.
+        while True:
+            advanced = False
+            while ix < len(dx) and dx[ix][0] <= end:
+                h = dx[ix]; hx.append(h); ix += 1
+                end = max(end, h[1]); advanced = True
+            while iy < len(dy) and dy[iy][0] <= end:
+                h = dy[iy]; hy.append(h); iy += 1
+                end = max(end, h[1]); advanced = True
+            if not advanced:
+                break
+        old = base[start:end]
+        candidate_x = render(start, end, hx)
+        candidate_y = render(start, end, hy)
+        if not hx or candidate_x == old:
+            merged.extend(candidate_y)
+        elif not hy or candidate_y == old or candidate_x == candidate_y:
+            merged.extend(candidate_x)
+        else:
+            # On a genuine conflict prefer the target being improved. Very rare
+            # donor/base choices let evolution escape over-conservative merges.
+            roll = rng.random()
+            if roll < prefer_target:
+                merged.extend(candidate_y)
+            elif roll < prefer_target + (1.0-prefer_target)*0.8:
+                merged.extend(candidate_x)
+            else:
+                merged.extend(old)
+        pos = end
+    merged.extend(base[pos:])
+    return merged
+
+
+def _diff3_lut(base: Sequence[int], donor: Sequence[int], target: Sequence[int],
+               rng: random.Random) -> list[int]:
+    """Transfer a bounded number of permutation edits using reciprocal swaps."""
+    out = list(target)
+    inverse = {v:i for i,v in enumerate(out)}
+    loci = [i for i,(x,y) in enumerate(zip(base,donor)) if x != y]
+    if not loci:
+        return out
+    for i in rng.sample(loci, min(len(loci), _mutation_radius(rng, len(loci), local=4, balanced=16))):
+        if target[i] != base[i] and rng.random() < 0.95:
+            continue
+        wanted = donor[i]
+        j = inverse[wanted]
+        if j == i:
+            continue
+        old = out[i]
+        out[i], out[j] = out[j], out[i]
+        inverse[wanted] = i
+        inverse[old] = j
+    return out
+
+
+def _move_rule_block(rows: list[Rule], rng: random.Random) -> None:
+    """Reorder a short coadapted block without changing its internal order."""
+    if len(rows) < 3:
+        return
+    span = min(len(rows) - 1, _mutation_radius(rng, len(rows), local=4, balanced=16))
+    start = rng.randrange(len(rows) - span + 1)
+    block = rows[start:start+span]
+    del rows[start:start+span]
+    destination = rng.randrange(len(rows) + 1)
+    rows[destination:destination] = block
+
+
+def mutate_genome(parent: Genome, rng: random.Random, corpus, bigrams,
+                  enabled=True) -> Genome:
+    rows = parent.rules.copy()
+    n = len(rows)
     if n:
-        k=min(n,log_uniform_count(rng,n))
-        for ri in rng.sample(range(n),k):
-            rows[ri]=mutate_rule(rows[ri],rng,corpus,bigrams)
-        if n>1 and rng.random()<0.12:
-            i,j=rng.sample(range(n),2)
-            rows[i],rows[j]=rows[j],rows[i]
+        k = _mutation_radius(rng, n, local=6, balanced=36)
+        if k > 1 and rng.random() < 0.23:
+            # Cluster neighboring changes (coadapted rules) in a small segment.
+            start = rng.randrange(n-k+1)
+            indices = range(start,start+k)
+        else:
+            indices = rng.sample(range(n),k)
+        for ri in indices:
+            rows[ri] = mutate_rule(rows[ri],rng,corpus,bigrams)
+        if n > 1 and rng.random() < 0.16:
+            if rng.random() < 0.58:
+                i,j = rng.sample(range(n),2)
+                rows[i],rows[j] = rows[j],rows[i]
+            else:
+                _move_rule_block(rows,rng)
     return Genome(rows,mutate_lut(parent.embedding,rng,enabled))
 
 
-def breed(a: Genome,b: Genome,rng: random.Random,corpus,bigrams,embedding_enabled: bool) -> Genome:
-    n=len(a.rules)
-    if n<=1:
-        rows=a.rules.copy()
-    elif rng.random()<0.5:
-        i,j=sorted(rng.sample(range(n+1),2))
-        rows=a.rules[:i]+b.rules[i:j]+a.rules[j:]
+def _relative_rule_distance(a: Genome, b: Genome) -> int:
+    """Exact structural Hamming distance; shared Rule objects are a fast path."""
+    return sum((x is not y and (x.pattern != y.pattern or x.replacement != y.replacement))
+               for x, y in zip(a.rules, b.rules)) + abs(len(a.rules)-len(b.rules))
+
+
+def _choose_diff3_base(donor: Genome, target: Genome, candidates: Sequence[Genome]) -> Genome:
+    """Prefer a related pseudo-ancestor so A->X means a *small* useful patch.
+
+    The GA doesn't retain a genealogy; taking three unrelated genomes at random
+    often makes every row one giant 'replace' hunk. Select the nearest available
+    candidate to both donor and target instead, without introducing a fitness
+    evaluation or changing any model semantics.
+    """
+    return min(candidates,key=lambda c: (_relative_rule_distance(c, donor) +
+                                          _relative_rule_distance(c, target),
+                                          _relative_rule_distance(c, donor)))
+
+
+def breed_three(base: Genome, donor: Genome, target: Genome, rng: random.Random,
+                corpus, bigrams, embedding_enabled: bool) -> Genome:
+    """Differential diff3 crossover: transplant base->donor edits onto target.
+
+    Rule order matters, so combine a short aligned sequence merge with rule-local
+    pattern/replacement diff3. Incompatible edits preferentially keep target.
+    Unlike DE arithmetic, this transfers *categorical edits* with no numeric
+    interpolation. Subsequent mutation allows exploration around the merged child.
+    """
+    n = len(target.rules)
+    if len(base.rules) != n or len(donor.rules) != n:
+        raise ValueError('diff3 parents must have equal rule counts')
+    rows = target.rules.copy()
+    changed = [i for i in range(n) if _rule_signature(base.rules[i]) != _rule_signature(donor.rules[i])]
+    if changed:
+        # Merge a short RULE SEQUENCE as an edit script, allowing shifts to be
+        # aligned rather than treating each position as an unrelated gene.
+        span = min(n, _mutation_radius(rng,n,local=8,balanced=24))
+        center = rng.choice(changed)
+        start = min(max(0,center-rng.randrange(span)), n-span)
+        stop = start+span
+        merged = _diff3_sequence(base.rules[start:stop],donor.rules[start:stop],
+                                 rows[start:stop],rng,signatures=_rule_signature)
+        if len(merged) == span:
+            rows[start:stop] = merged
+        # Differentiate within individual rules as well; here edit insertion and
+        # deletion in a pattern *are allowed*, then repair enforces exact legality.
+        picks = rng.sample(changed, min(len(changed), _mutation_radius(
+            rng,len(changed),local=5,balanced=16)))
+        for i in picks:
+            b,d,t = base.rules[i], donor.rules[i], rows[i]
+            p = _diff3_sequence(b.pattern,d.pattern,t.pattern,rng)
+            q = _diff3_sequence(b.replacement,d.replacement,t.replacement,rng)
+            merged_rule = repair_evolved_rule(Rule(p,q),rng)
+            if _rule_signature(merged_rule) != _rule_signature(t):
+                rows[i] = merged_rule
+        if all(x is y for x,y in zip(rows,target.rules)):
+            # When unrelated parents offer no compatible patch, make a bounded
+            # donor-row transplant; normal mutation will still run afterward.
+            i = rng.choice(changed)
+            rows[i] = donor.rules[i]
+    lut = ( _diff3_lut(base.embedding,donor.embedding,target.embedding,rng)
+           if embedding_enabled and rng.random() < 0.30 else list(target.embedding) )
+    child = Genome(rows,lut)
+    return mutate_genome(child,rng,corpus,bigrams,embedding_enabled)
+
+
+def breed(a: Genome,b: Genome,rng: random.Random,corpus,bigrams,
+          embedding_enabled: bool) -> Genome:
+    """Two-parent crossover with block or sparse, then smaller mutation."""
+    n = len(a.rules)
+    if n <= 1:
+        rows = a.rules.copy()
+    elif rng.random() < 0.60:
+        # Preserve the order of interacting groups instead of mixing all loci.
+        span = _mutation_radius(rng,n,local=8,balanced=64)
+        start = rng.randrange(n-span+1)
+        rows = a.rules.copy()
+        rows[start:start+span] = b.rules[start:start+span]
     else:
-        # Position-wise sparse donor transplant, then regular mutation.
-        rows=a.rules.copy()
-        for i in rng.sample(range(n),log_uniform_count(rng,n)):
-            rows[i]=b.rules[i]
+        rows = a.rules.copy()
+        for i in rng.sample(range(n),_mutation_radius(rng,n,local=6,balanced=40)):
+            rows[i] = b.rules[i]
     lut = crossover_lut(a.embedding,b.embedding,rng) if embedding_enabled and rng.random()<0.25 else a.embedding.copy()
     return mutate_genome(Genome(rows,lut),rng,corpus,bigrams,embedding_enabled)
 
@@ -682,6 +991,17 @@ def score_population(population: Sequence[Genome], examples: Sequence[bytes], ba
     original_population = population
     # Reuse only when the same exact ordered set of byte examples is evaluated.
     # Checkpoints never carry this cache, and rotated examples invalidate it.
+    if backend == 'mps' and any(not is_nonexpanding(r)
+                                for g in population for r in g.rules):
+        # The Metal kernel is fixed-stride and nonexpanding by construction.
+        # Never pass an expanding or long rule into it: use identical native CPU
+        # semantics rather than dropping, clipping or corrupting output.
+        backend = 'cpu'
+        global _EXPANSION_FALLBACK_WARNED
+        if not _EXPANSION_FALLBACK_WARNED:
+            print('Lens: MPS kernel cannot represent expanding/long rules; '
+                  'using native CPU evaluator for these generations.', flush=True)
+            _EXPANSION_FALLBACK_WARNED = True
     cache_enabled = use_cache and backend in ('mps','cpu')
     cache_key = (backend, tuple(bytes(x) for x in examples))
     prior = _SCORE_CACHE_ROWS if cache_enabled and _SCORE_CACHE_KEY==cache_key else {}
@@ -860,7 +1180,7 @@ def plot_history(history: Sequence[dict], prefix: str, window: int) -> None:
     ax.plot(x,y,alpha=.5,label='Generation best next-byte accuracy')
     ax.plot(x,avg,label='Moving average')
     ax.plot(x,np.maximum.accumulate(y),label='Best observed')
-    ax.set(xlabel='Generation',ylabel='Teacher-forced next-byte accuracy',title='Lens autoregressive training')
+    ax.set(xlabel='Generation',ylabel='Teacher-forced next-byte accuracy',ylim=(0,1),title='Lens autoregressive training')
     ax.legend(); fig.tight_layout()
     out=Path(prefix+'_accuracy.png')
     out.parent.mkdir(parents=True,exist_ok=True)
@@ -879,7 +1199,7 @@ def genome_from_object(v: dict) -> Genome:
         raise ValueError('Only v4 autoregressive genomes are loadable; old 512-token checkpoints use incompatible semantics')
     rules=[Rule(list(r['a']),list(r['b'])) for r in v['rules']]
     g=Genome(rules,list(v['embedding_lut']),float(v.get('fitness',-1)),list(v.get('case_scores',[])))
-    if not valid_lut(g.embedding) or not all(map(is_nonexpanding,g.rules)):
+    if not valid_lut(g.embedding) or not all(map(is_valid_rule,g.rules)):
         raise ValueError('invalid genome: LUT/rule invariant')
     return g
 
@@ -928,6 +1248,8 @@ def evolve(args) -> Genome:
     show_progress = not getattr(args, 'no_tqdm', False)
     if show_progress and tqdm is None:
         raise RuntimeError('tqdm が必要です: python -m pip install tqdm （または --no-tqdm を指定）')
+    if not 0 <= args.diff3_rate <= 1:
+        raise ValueError('--diff3-rate must be in [0,1]')
     rng=random.Random(args.seed)
     corpus=load_corpus(args.local_corpus,args.min_chunk,args.corpus_chunks,args.max_chunk)
     bigrams=_bigram_seeds(corpus)
@@ -1017,10 +1339,13 @@ def evolve(args) -> Genome:
                  (rolling.rotations_done-1)%args.cases if generation and
                  generation%args.case_rotate_every == 0 else -1)}
         history.append(row)
+        longest_pattern=max(map(lambda rule: len(rule.pattern), current.rules), default=0)
+        longest_replacement=max(map(lambda rule: len(rule.replacement), current.rules), default=0)
         summary=(f"gen={generation:6d} acc={current.fitness:.5f} mean={mean_fit:.5f} "
                  f"ever={best_ever.fitness:.5f} tested={row['evaluated_bytes']} "
                  f"seconds={elapsed:.2f} backend={args.backend} "
-                 f"rotate={rolling.rotations_done} slot={row['rotated_case']}")
+                 f"rotate={rolling.rotations_done} slot={row['rotated_case']} "
+                 f"ruleLen={longest_pattern}/{longest_replacement}")
         if generation_bar is not None:
             generation_bar.set_postfix_str(f'acc={current.fitness:.5f} eval={elapsed:.1f}s',refresh=False)
             tqdm.write(summary)
@@ -1049,7 +1374,15 @@ def evolve(args) -> Genome:
                 if rng.random()<args.immigrant_rate:
                     child=new_genome(args.rules,rng,corpus,bigrams,not args.no_embedding)
                 elif rng.random()<args.crossover_rate:
-                    child=breed(pick(),pick(),rng,corpus,bigrams,not args.no_embedding)
+                    if rng.random()<args.diff3_rate:
+                        # Pick a structurally related pseudo-ancestor A;
+                        # transplant its A->X edit script into target Y.
+                        donor, target = pick(), pick()
+                        base = _choose_diff3_base(donor,target,[pick() for _ in range(3)])
+                        child=breed_three(base,donor,target,rng,corpus,bigrams,
+                                          not args.no_embedding)
+                    else:
+                        child=breed(pick(),pick(),rng,corpus,bigrams,not args.no_embedding)
                 else:
                     child=mutate_genome(pick(),rng,corpus,bigrams,not args.no_embedding)
                 next_pop.append(child)
@@ -1077,8 +1410,8 @@ def evolve(args) -> Genome:
 def self_test() -> None:
     lut=list(range(256))
     inv=inverse_lut(lut)
-    assert is_nonexpanding(Rule([65,0],[65,66]))
-    assert not is_nonexpanding(Rule([65,0],[65,66,67]))
+    assert is_valid_rule(Rule([65,0],[65,66]))
+    assert is_valid_rule(Rule([65,0],[65,66,67]))
     assert replace_once([65,0],Rule([65,0],[65,66]),lut,inv)==[65,66]
     assert replace_once([65,0],Rule([65,0],[65,66]),lut,inv)==[65,66]
     assert replace_once([1,10,3],Rule([1,-1,3],[-16]),lut,inv)==[10]
@@ -1100,15 +1433,16 @@ def self_test() -> None:
     for _ in range(100):
         p=repair_rule(Rule([r.randrange(256),-1,r.randrange(256)],
                            [-1,r.randrange(256),-48]),r)
-        assert is_nonexpanding(p)
+        assert is_valid_rule(p)
     assert valid_lut(mutate_lut(lut,r,True))
-    print('PASS: autoregressive teacher-forcing, one sweep, 256 token LUT, sort, mutations, no memory truncation')
+    print('PASS: autoregressive teacher-forcing, expanding state, unbounded rule length, 256 LUT')
 
 
 def parse_args():
     ap=argparse.ArgumentParser(description='Lens: stateful byte-level autoregressive Replacer GA')
-    auto_backend = ('mps' if gpu_backend is not None and getattr(gpu_backend, 'torch', None) is not None
-        and gpu_backend.torch.backends.mps.is_available() else 'cpu')
+    # CPU was substantially faster for the real Lens workload, and supports
+    # every legal expanding / variable-length program.
+    auto_backend = 'cpu'
     ap.add_argument('--backend',choices=['cpu','mps','python'],default="cpu",
                     help='cpu uses a locally compiled C++ accelerator if available; python is the reference')
     ap.add_argument('--local-corpus',default='github-code.txt')
@@ -1117,7 +1451,8 @@ def parse_args():
     ap.add_argument('--max-chunk',type=int,default=1500,
                     help='exclusive maximum chunk length in bytes: skip entire chunks of 1500 bytes or more (never crop)')
     ap.add_argument('--cases',type=int,default=8,help='whole-text examples evaluated per generation')
-    ap.add_argument('--case-rotate-every',type=int,default=3)
+    ap.add_argument('--case-rotate-every',type=int,default=3,
+                    help='rotate exactly one case per N generations (round-robin; default 3)')
     ap.add_argument('--population',type=int,default=450)
     ap.add_argument('--rules',type=int,default=1500)
     ap.add_argument('--generations',type=int,default=1000000)
@@ -1127,9 +1462,11 @@ def parse_args():
     ap.add_argument('--hof-inject',type=int,default=2)
     ap.add_argument('--hof-parent-rate',type=float,default=0.10)
     ap.add_argument('--crossover-rate',type=float,default=0.50)
+    ap.add_argument('--diff3-rate',type=float,default=0.35,
+                    help='share of crossover offspring using 3-parent categorical diff3 (0..1)')
     ap.add_argument('--immigrant-rate',type=float,default=0.02)
     ap.add_argument('--no-embedding',action='store_true',help='disable evolution of the 256-element operator LUT')
-    ap.add_argument('--mps-batch',type=int,default=512,
+    ap.add_argument('--mps-batch',type=int,default=64,
                     help='independent genome evaluations per Metal batch (default 64, was 16)')
     ap.add_argument('--no-eval-cache',action='store_true',
                     help='disable exact duplicate and cross-generation score reuse')
@@ -1147,7 +1484,7 @@ def parse_args():
     ap.add_argument('--plot-window',type=int,default=30)
     ap.add_argument('--plot-every',type=int,default=1)
     ap.add_argument('--no-plot',action='store_true')
-    ap.add_argument('--generate',default='',help='path to a saved v4 model; generate without teacher forcing')
+    ap.add_argument('--generate',default='',help='saved autoregressive model; generate without teacher forcing')
     ap.add_argument('--prompt',default='Hello')
     ap.add_argument('--output-bytes',type=int,default=64)
     ap.add_argument('--self-test',action='store_true')

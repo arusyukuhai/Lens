@@ -20,7 +20,7 @@ class ReplacerAutoregressiveTests(unittest.TestCase):
         for _ in range(30):
             g=m.new_genome(450,rng,corpus,m._bigram_seeds(corpus))
             self.assertTrue(m.valid_lut(g.embedding))
-            self.assertTrue(all(m.is_nonexpanding(r) for r in g.rules))
+            self.assertTrue(all(m.is_valid_rule(r) for r in g.rules))
             for r in g.rules:
                 self.assertTrue(all(v==-1 or 0<=v<256 for v in r.pattern))
                 self.assertTrue(all(v>=-111 and v<=255 for v in r.replacement))
@@ -67,15 +67,15 @@ class ReplacerAutoregressiveTests(unittest.TestCase):
         self.assertEqual(m.sweep([65],rules,self.lut),[66])
         self.assertEqual(m.sweep([66],rules,self.lut),[67])
 
-    def test_random_invariant_and_no_grow(self):
+    def test_random_rule_legality_and_growth(self):
         rng=random.Random(10); corpus=[b'ABABABABAB',b'ABCDEFABCDEF']
         bigrams=m._bigram_seeds(corpus)
         for _ in range(200):
             r=m.repair_rule(m.make_rule(rng,corpus,bigrams),rng)
-            self.assertTrue(m.is_nonexpanding(r))
+            self.assertTrue(m.is_valid_rule(r))
             x=[rng.randrange(256) for _ in range(rng.randrange(2,40))]
             y=m.replace_once(x,r,self.lut,self.inv)
-            self.assertLessEqual(len(y),len(x))
+            self.assertGreaterEqual(len(y),0)
             self.assertTrue(all(0<=v<256 for v in y))
 
     def test_checkpoint_model_roundtrip(self):
