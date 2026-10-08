@@ -1,4 +1,4 @@
-## Lens / Replacer -- incremental single-path elitist Pareto genetic algorithm.
+## Lens / Replacer -- incremental single-path greedy diff3 differential evolution.
 ## Depends only on replace.nim, ridge.nim, and the Nim standard library.
 ## Run: nim c -d:release main.nim && ./main --corpus github-code.txt
 
@@ -24,7 +24,7 @@ type
   Candidate = object
     model: Model
     score: Evaluation
-    # Compiled immutable patterns are carried across GA offspring; only the
+    # Compiled immutable patterns are carried across DE offspring; only the
     # single modified index is recompiled.
     patterns: seq[SeqPattern]
     literalTriggers: seq[int]
@@ -49,7 +49,7 @@ type
     ridgeLambda: float64
     inferCases, inferSpan, inferPopulation, inferGenerations, inferMaxLoci: int
     inferNoise, inferWeight: float64
-    mutationRate: float64  # Extra mutation probability per offspring (not per token).
+    mutationRate: float64  # Extra mutation probability per DE trial (not per token).
     maxRuleLen: int
     seed, checkpointEvery, printEvery, plotEvery: int
     resume, selfTest: bool
@@ -72,18 +72,18 @@ type
 proc defaults(): Config =
   result = Config(
     corpus: DefaultCorpus, outdir: ".", ruleCount: 1500,
-    population: 40, iterations: 40, stagePatience: 40,
+    population: 30, iterations: 40, stagePatience: 40,
     minChunk: 16, maxChunk: 2000, maxChunks: 16384,
-    diffusionSteps: 120, ridgeRows: 256, maxRidgeFeatures: 1024,
+    diffusionSteps: 100, ridgeRows: 256, maxRidgeFeatures: 1024,
     ridgeLambda: 4.0, inferCases: 2, inferSpan: 2000,
-    inferPopulation: 10, inferGenerations: 15, inferMaxLoci: 24,
+    inferPopulation: 10, inferGenerations: 20, inferMaxLoci: 24,
     inferNoise: 0.10, inferWeight: 1.0, mutationRate: 0.5, maxRuleLen: 64,
     seed: 0, checkpointEvery: 1, printEvery: 1, plotEvery: 1,
     resume: false, selfTest: false
   )
 
 proc usage() =
-  echo """Incremental Lens trainer -- single-path elitist Pareto genetic algorithm.
+  echo """Incremental Lens trainer -- single-path greedy differential evolution.
   nim c -d:release main.nim
   ./main --corpus github-code.txt --rules 1500 --population 40 --iterations 40
 
@@ -91,8 +91,8 @@ Options (both --key=VALUE and --key VALUE):
   --corpus PATH            Corpus: ===SPLIT=== separated snippets (default github-code.txt)
   --outdir DIR             Graphs, CSV, greedy checkpoint (default .)
   --rules N               Total rules (default 1500; number of stages N*(N+1)/2)
-  --population N          GA population size (default 40, minimum 4)
-  --iterations N          GA generations per stage (default 40)
+  --population N          Single DE population size (default 40, minimum 4)
+  --iterations N          DE iterations per stage (default 40)
   --stage-patience N      Stop stage after N iterations without a new max rho (default 5; 0 disables)
   --max-chunk N           Ignore snippets longer than N bytes (default 256)
   --min-chunk N           Skip shorter snippets (default 16)
@@ -109,11 +109,11 @@ Options (both --key=VALUE and --key VALUE):
   --infer-noise X         Corrupted positions fraction (default .10)
   --infer-weight X        Weight on accuracy for reporting joint only (default .5)
   --max-rule-len N        Max length of each pattern/replacement (default 16)
-  --mutation-rate X       Additional mutation chance per offspring (default .05; 0..1)
+  --mutation-rate X       Additional mutation chance per DE trial (default .05; 0..1)
   --seed N                RNG seed; 0 uses time
   --checkpoint-every N    Save after N stage updates (default 1)
   --plot-every N          Redraw PNG every N stage updates (default 1)
-  --print-every N         Progress every N GA generations (default 5)
+  --print-every N         Progress every N DE iterations (default 5)
   --resume                Resume greedy_checkpoint.json (can migrate v2 beam checkpoint)
   --self-test             Small built-in corpus and short training smoke run
   --help                  Show this message
@@ -420,11 +420,11 @@ proc mutateRuleOnce(r: Rule, cfg: Config, vocab: seq[int]): Rule =
       result.b[pos] = randomOther(result.b[pos], vocab)
 
 proc trialRule(a, b, c: Rule, cfg: Config, vocab: seq[int]): Rule =
-  ## GA crossover: transfer donor edit (b -> c) onto the target rule a.
+  ## DE core: transfer donor edit (b -> c) onto the target rule a.
   result.a = diff3Mix(a.a, b.a, c.a, cfg.maxRuleLen)
   result.b = diff3Mix(a.b, b.b, c.b, cfg.maxRuleLen)
   ## Rare, independent local mutation. The old 85% per-side mutations and
-  ## 9% random restarts overwhelmed the crossover operation.
+  ## 9% random restarts overwhelmed the differential-evolution operation.
   if cfg.mutationRate >= 1.0 or
       (cfg.mutationRate > 0.0 and rand(1.0) < cfg.mutationRate):
     result = mutateRuleOnce(result, cfg, vocab)
@@ -674,8 +674,7 @@ proc evaluateInferenceOne(c: InferenceCase, m: Model,
   result /= float64(c.loci.len)
 
 proc objective(rho, infAcc: float64, cfg: Config): float64 =
-  ## Joint scalar used to select the single stage representative; Pareto sorting
-  ## itself uses rho and inference separately.
+  ## Reporting ONLY. Neither DE acceptance nor greedy selection uses this score.
   (1.0-cfg.inferWeight) * clamp((rho+1.0)*0.5, 0.0, 1.0) +
       cfg.inferWeight * clamp(infAcc, 0.0, 1.0)
 
@@ -768,143 +767,85 @@ proc greedyAccept(incumbent: var Candidate, proposal: Candidate): bool =
     return true
   false
 
-proc paretoOrder(pool: seq[Candidate]): seq[int] =
-  ## Non-dominated sorting + NSGA-II crowding distance, deterministic ties.
-  let n = pool.len
-  var dominated = newSeq[seq[int]](n)
-  var remaining = newSeq[int](n)
-  var ranks = newSeq[int](n)
-  var crowd = newSeq[float64](n)
-  for i in 0..<n:
-    for j in i+1..<n:
-      if dominates(pool[i].score, pool[j].score):
-        dominated[i].add(j)
-        inc remaining[j]
-      elif dominates(pool[j].score, pool[i].score):
-        dominated[j].add(i)
-        inc remaining[i]
-  var front: seq[int] = @[]
-  for i in 0..<n:
-    if remaining[i] == 0: front.add(i)
-  var rank = 0
-  while front.len > 0:
-    for axis in 0..1:
-      var sorted = front
-      sorted.sort(proc (a, b: int): int =
-        let x = if axis == 0: pool[a].score.rho else: pool[a].score.inference
-        let y = if axis == 0: pool[b].score.rho else: pool[b].score.inference
-        result = cmp(x, y))
-      crowd[sorted[0]] = Inf
-      crowd[sorted[^1]] = Inf
-      if sorted.len > 2:
-        let lo = if axis == 0: pool[sorted[0]].score.rho else: pool[sorted[0]].score.inference
-        let hi = if axis == 0: pool[sorted[^1]].score.rho else: pool[sorted[^1]].score.inference
-        if hi > lo:
-          for j in 1..<sorted.high:
-            let previous = if axis == 0: pool[sorted[j-1]].score.rho else: pool[sorted[j-1]].score.inference
-            let following = if axis == 0: pool[sorted[j+1]].score.rho else: pool[sorted[j+1]].score.inference
-            crowd[sorted[j]] += (following - previous) / (hi - lo)
-    var nextFront: seq[int] = @[]
-    for i in front:
-      ranks[i] = rank
-      for j in dominated[i]:
-        dec remaining[j]
-        if remaining[j] == 0: nextFront.add(j)
-    front = nextFront
-    inc rank
-  result = toSeq(0..<n)
-  result.sort(proc (a, b: int): int =
-    result = cmp(ranks[a], ranks[b])
-    if result == 0: result = cmp(crowd[b], crowd[a])
-    if result == 0: result = cmp(pool[b].score.combined, pool[a].score.combined)
-    if result == 0: result = cmp(a, b))
-
 proc evolveGreedy(seed: Candidate, ruleIndex: int, ctx: Context,
                   cfg: Config, revisiting: bool): Candidate =
-  ## Generational GA, one editable rule, fully active frozen rules.
-  ## Variation operators (diff3 transfer, segment crossover, mutation) unchanged.
+  ## One local differential-evolution population for exactly ONE rule.
+  ## The model's other rules stay fixed AND active during full evaluation.
+  ## The global incumbent follows a monotonic chain of Pareto improvements,
+  ## independent of which population member discovers each improvement.
   var population = newSeq[Candidate](cfg.population)
+  # Cache only inside this stage: the evaluated chunk, frozen rules and
+  # inner-GA seed change between stages. A fixed cap limits memory usage.
   var stageMemo = initTable[string, Candidate]()
   var cacheHits = 0
+  # Reserved elite: the original rule survives this entire stage unchanged.
   population[0] = seed
   stageMemo[ruleKey(seed.model.rules[ruleIndex])] = seed
   result = seed
-
-  proc evaluateRule(r: Rule): Candidate =
-    let key = ruleKey(r)
-    if stageMemo.hasKey(key):
-      inc cacheHits
-      return stageMemo[key]
-    let candidate = candidateWithEditedRule(seed, ruleIndex, r, ctx, cfg)
-    if stageMemo.len >= max(128, 4 * cfg.population): stageMemo.clear()
-    stageMemo[key] = candidate
-    candidate
-
   for j in 1..<population.len:
     var r: Rule
     if not revisiting and j mod 5 == 0:
+      # Preserve broad exploration only when introducing a genuinely new rule.
       r = randomRule(ctx.trajectory[0], cfg, ctx.vocabulary)
     else:
       r = seed.model.rules[ruleIndex]
       r.a = mutateSeq(r.a, cfg.maxRuleLen, ctx.vocabulary, true)
       r.b = mutateSeq(r.b, cfg.maxRuleLen, ctx.vocabulary, false)
-    population[j] = evaluateRule(r)
+    let key = ruleKey(r)
+    if stageMemo.hasKey(key):
+      population[j] = stageMemo[key]
+      inc cacheHits
+    else:
+      population[j] = candidateWithEditedRule(seed, ruleIndex, r, ctx, cfg)
+      if stageMemo.len >= 128: stageMemo.clear()
+      stageMemo[key] = population[j]
+    discard greedyAccept(result, population[j])
 
-  proc selectParent(pool: seq[Candidate], order: seq[int]): int =
-    ## Rank-biased tournament among the NSGA-II ordered parents.
-    let x = rand(order.high)
-    let y = rand(order.high)
-    order[min(x, y)]
-
-  var highestRho = seed.score.rho
+  var highestRho = result.score.rho
   var staleIterations = 0
   for iter in 1..cfg.iterations:
-    let parentOrder = paretoOrder(population)
-    var combinedPool = population
-    for j in 0..<cfg.population:
-      let ia = selectParent(population, parentOrder)
-      let ib = selectParent(population, parentOrder)
-      let ic = selectParent(population, parentOrder)
-      let r = trialRule(population[ia].model.rules[ruleIndex],
-        population[ib].model.rules[ruleIndex],
-        population[ic].model.rules[ruleIndex], cfg, ctx.vocabulary)
-      combinedPool.add(evaluateRule(r))
-    # True (mu + lambda) elitism: retain the best Pareto fronts and
-    # use crowding distance at front boundaries, not greedy DE replacement.
-    # The source rule is reserved in index zero throughout the stage.
-    let order = paretoOrder(combinedPool)
-    var nextPopulation: seq[Candidate] = @[seed]
-    var seen = initTable[string, bool]()
-    seen[ruleKey(seed.model.rules[ruleIndex])] = true
-    for ix in order:
-      if nextPopulation.len == cfg.population: break
-      let key = ruleKey(combinedPool[ix].model.rules[ruleIndex])
-      if not seen.hasKey(key):
-        nextPopulation.add(combinedPool[ix])
-        seen[key] = true
-    # Fill duplicates only when the stage has insufficient unique candidates.
-    for ix in order:
-      if nextPopulation.len == cfg.population: break
-      nextPopulation.add(combinedPool[ix])
-    population = nextPopulation
-    # Final stage representative: best joint score among the Pareto front,
-    # but never replace the stage seed by a lower joint score.
-    for individual in population:
-      if individual.score.combined > result.score.combined:
-        result = individual
-    var generationMax = highestRho
-    for individual in population:
-      generationMax = max(generationMax, individual.score.rho)
-    if generationMax > highestRho + 1e-12:
-      highestRho = generationMax
+    ## Asynchronous DE: accepted trials are immediately available as donors.
+    var accepted = 0
+    var greedyAdvances = 0
+    for i in 1..<population.len:
+      # Index 0 is the immutable source-rule elite, but remains a DE donor.
+      var ids: seq[int] = @[]
+      for j in 0..<population.len:
+        if j != i: ids.add(j)
+      shuffle(ids)
+      let current = population[i]
+      let r = trialRule(current.model.rules[ruleIndex],
+        population[ids[0]].model.rules[ruleIndex],
+        population[ids[1]].model.rules[ruleIndex], cfg, ctx.vocabulary)
+      let key = ruleKey(r)
+      var trial: Candidate
+      if stageMemo.hasKey(key):
+        trial = stageMemo[key]
+        inc cacheHits
+      else:
+        trial = candidateWithEditedRule(current, ruleIndex, r, ctx, cfg)
+        if stageMemo.len >= 128: stageMemo.clear()
+        stageMemo[key] = trial
+      # Each DE individual can improve ONLY by strict Pareto dominance.
+      if dominates(trial.score, current.score):
+        population[i] = trial
+        inc accepted
+        # Global incumbent is greedily updated on exactly the SAME criterion.
+        if greedyAccept(result, trial):
+          inc greedyAdvances
+    # Count complete DE iterations, not individual trial evaluations.
+    # The stage-local maximum includes the initial population, and is reset
+    # only by a strictly higher rho (an inference-only improvement is not enough).
+    if result.score.rho > highestRho:
+      highestRho = result.score.rho
       staleIterations = 0
     else:
       inc staleIterations
-    let earlyStop = cfg.stagePatience > 0 and staleIterations >= cfg.stagePatience
+    let earlyStop = cfg.stagePatience > 0 and staleIterations >= cfg.stagePatience and highestRho > 0
     if iter mod cfg.printEvery == 0 or iter == cfg.iterations or earlyStop:
-      echo &"  GA gen={iter}/{cfg.iterations} rho={result.score.rho:.6f} infer={result.score.inference:.4f} joint={result.score.combined:.6f} pool={population.len} cacheHits={cacheHits} staleRho={staleIterations}"
+      echo &"  greedy iter={iter}/{cfg.iterations} rho={result.score.rho:.6f} infer={result.score.inference:.4f} joint={result.score.combined:.6f} accepted={accepted} advances={greedyAdvances} cacheHits={cacheHits} staleRho={staleIterations}"
     if earlyStop:
-      echo &"  stage early stop: max rho did not improve for {staleIterations} consecutive GA generations (best={highestRho:.6f})"
+      echo &"  stage early stop: max rho did not improve for {staleIterations} consecutive DE iterations (best={highestRho:.6f})"
       break
 
 proc averageLast(history: seq[HistoryPoint], width: int, inference: bool): float64 =
@@ -1075,7 +1016,7 @@ set y2label 'Reconstruction accuracy (corrupted positions only)'
 set y2tics
 set yrange [0:*]
 set y2range [0:1]
-set title 'Lens -- elitist Pareto GA / 1-pass Replacer'
+set title 'Lens -- single-path greedy DE / 1-pass Replacer'
 # log transforms AFTER raw-score 5-point averaging and running max.
 trans(x) = -log( (1.0 - ((x >= 0.999999999999) ? 0.999999999999 : x)) )/log(2.0)
 plot '""" & csvName & """' using 1:(trans(column(6))) with lines lw 1 lc rgb '#999999' title 'Spearman current', \
@@ -1237,7 +1178,7 @@ proc train(cfg: Config) =
   if not dirExists(cfg.outdir): createDir(cfg.outdir)
   let seed = if cfg.seed == 0: int(epochTime()) else: cfg.seed
   randomize(seed)
-  echo &"seed={seed} passes={ReplacePasses} beam={SearchWidth} mode=pareto-ga mutationRate={cfg.mutationRate:.3f}"
+  echo &"seed={seed} passes={ReplacePasses} beam={SearchWidth} mode=greedy mutationRate={cfg.mutationRate:.3f}"
   let chunks = loadChunks(cfg)
   let vocabulary = vocabularyFrom(chunks)
   var trainer: Trainer
