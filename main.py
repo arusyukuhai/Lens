@@ -2637,7 +2637,7 @@ def trajectory_features_cpu(
         # budget per side.  The visible system is non-expanding, so this bound
         # remains valid for every later capture in the trajectory.
         memory = HiddenMemory(token_capacity=max(1, len(inp)))
-        limit = 1#max(1, int(math.ceil(2.0 * math.sqrt(max(1, len(inp))))))
+        limit = max(1, int(math.ceil(2.0 * math.sqrt(max(1, len(inp))))))
         seen = {(tuple(state), memory.signature())}
         for rnd in range(limit):
             rewrote = False
@@ -5389,7 +5389,7 @@ class MpsPopulationEvaluator:
         self.pool_gc_ratio = max(1.05, float(pool_gc_ratio))
         self.pool_gc_min_dead = max(0, int(pool_gc_min_dead))
         self.hidden_rewrite_phases = max(1, min(int(hidden_rewrite_phases), self.rule_count))
-        self.max_rounds = 1#max(1, int(math.ceil(2.0 * math.sqrt(self.raw_stride))))
+        self.max_rounds = max(1, int(math.ceil(2.0 * math.sqrt(self.raw_stride))))
         if self.max_rounds > 255:
             raise ValueError("uint8 firing counters require ceil(2*sqrt(max_chunk)) <= 255")
         jobs = self.sample_count * self.genome_batch
@@ -8992,7 +8992,7 @@ def parse_args():
     ap.add_argument("--inference-generations", type=int, default=256, help="upper bound on inner GA generations; the work budget reduces depth before candidate-population width")
     ap.add_argument("--inference-elites", type=int, default=3, help="top candidate strings copied unchanged each inner GA generation; clamped to leave at least one offspring slot")
     ap.add_argument("--inference-span", type=int, default=2000, help="maximum bytes in each inference snippet")
-    ap.add_argument("--inference-noise", type=float, default=0.01, help="fraction of snippet bytes deliberately corrupted and mutable")
+    ap.add_argument("--inference-noise", type=float, default=0.03, help="fraction of snippet bytes deliberately corrupted and mutable")
     ap.add_argument("--inference-ensemble", type=int, default=32, help="small inference-aware voting ensemble; inherited Pareto/inference specialists are mixed with current Spearman leaders")
     ap.add_argument("--inference-rotate-every", type=int, default=2, help="replace one inference case every N outer generations")
     ap.add_argument("--inference-budget-ratio", type=float, default=0.75, help="extra unique trajectory work relative to one outer evaluation; hard-capped at 0.85")
