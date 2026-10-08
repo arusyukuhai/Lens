@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import math
 import os
@@ -426,11 +427,92 @@ def load_corpus(path: str, min_length: int = 2, max_examples: int = 10000, max_l
 
 
 def make_training_examples(corpus: Sequence[bytes], cases: int, seed: int) -> list[bytes]:
-    """Sample full corpus records, not truncated prefixes; rotate each generation."""
+    """Legacy independent sampler; evolve() now uses RollingTrainingCases."""
     rng=random.Random(seed)
     if len(corpus)>=cases:
         return rng.sample(list(corpus),cases)
     return [rng.choice(corpus) for _ in range(cases)]
+
+
+class RollingTrainingCases:
+    """A fixed-size evaluation set with exactly one replacement per rotation.
+
+    Uses a dedicated RNG, independent of GA operations, so resuming and toggling
+    tqdm do not perturb evolutionary randomness. Surviving slots retain order.
+    """
+
+    def __init__(self, corpus: Sequence[bytes], cases: int, seed: int,
+                 period: int, saved: dict | None = None):
+        if not corpus:
+            raise ValueError('Cannot rotate cases from an empty corpus')
+        if cases < 1 or period < 1:
+            raise ValueError('--cases and --case-rotate-every must both be positive')
+        self.corpus = corpus
+        self.period = int(period)
+        self.rng = random.Random(seed)
+        self.corpus_digest = self._digest(corpus)
+        if saved is None:
+            n = len(corpus)
+            self.indices = (self.rng.sample(range(n), cases) if n >= cases
+                            else [self.rng.randrange(n) for _ in range(cases)])
+            self.rotations_done = 0
+        else:
+            if (saved.get('corpus_digest') != self.corpus_digest
+                    or saved.get('period') != period
+                    or saved.get('cases') != cases):
+                raise ValueError('Checkpoint case rotation state differs from corpus, '
+                                 '--cases, or --case-rotate-every; restore matching settings')
+            self.indices = list(saved['indices'])
+            if len(self.indices) != cases or not all(0 <= i < len(corpus) for i in self.indices):
+                raise ValueError('Checkpoint has invalid rolling case indices')
+            self.rotations_done = int(saved['rotations_done'])
+            self.rng.setstate(saved['rng'])
+
+    @staticmethod
+    def _digest(corpus: Sequence[bytes]) -> str:
+        h = hashlib.blake2b(digest_size=16)
+        for sample in corpus:
+            h.update(len(sample).to_bytes(8, 'little'))
+            h.update(sample)
+        return h.hexdigest()
+
+    def _replace_one(self) -> None:
+        slot = self.rotations_done % len(self.indices)
+        old = self.indices[slot]
+        n = len(self.corpus)
+        in_use = set(self.indices)
+        if n > len(in_use):
+            # Choose uniformly from unoccupied corpus records, without scanning
+            # or copying the entire corpus on every rotation.
+            index = self.rng.randrange(n - len(in_use))
+            for occupied in sorted(in_use):
+                if occupied <= index:
+                    index += 1
+                else:
+                    break
+        elif n > 1:
+            # No unused record exists (e.g. corpus size == cases). Change one
+            # slot anyway, allowing duplicated records when unavoidable.
+            index = self.rng.randrange(n - 1)
+            if index >= old:
+                index += 1
+        else:
+            index = old
+        self.indices[slot] = index
+        self.rotations_done += 1
+
+    def for_generation(self, generation: int) -> list[bytes]:
+        target = generation // self.period
+        if target < self.rotations_done:
+            raise ValueError('Rolling cases cannot rewind without a checkpoint')
+        while self.rotations_done < target:
+            self._replace_one()
+        return [self.corpus[i] for i in self.indices]
+
+    def snapshot(self) -> dict:
+        return {'indices': list(self.indices), 'rotations_done': self.rotations_done,
+                'rng': self.rng.getstate(), 'corpus_digest': self.corpus_digest,
+                'period': self.period, 'cases': len(self.indices)}
 
 
 def _bigram_seeds(corpus: Sequence[bytes], limit: int=500000) -> list[tuple[int,int]]:
@@ -742,7 +824,8 @@ def write_history(path: str, history: Sequence[dict]) -> None:
     p=Path(path)
     p.parent.mkdir(parents=True,exist_ok=True)
     with p.open('w',newline='',encoding='utf-8') as f:
-        writer=csv.DictWriter(f,fieldnames=list(history[0]))
+        fields=list(dict.fromkeys(key for record in history for key in record))
+        writer=csv.DictWriter(f,fieldnames=fields)
         writer.writeheader()
         writer.writerows(history)
 
@@ -777,7 +860,7 @@ def plot_history(history: Sequence[dict], prefix: str, window: int) -> None:
     ax.plot(x,y,alpha=.5,label='Generation best next-byte accuracy')
     ax.plot(x,avg,label='Moving average')
     ax.plot(x,np.maximum.accumulate(y),label='Best observed')
-    ax.set(xlabel='Generation',ylabel='Teacher-forced next-byte accuracy',title='Lens autoregressive training')
+    ax.set(xlabel='Generation',ylabel='Teacher-forced next-byte accuracy',ylim=(0,1),title='Lens autoregressive training')
     ax.legend(); fig.tight_layout()
     out=Path(prefix+'_accuracy.png')
     out.parent.mkdir(parents=True,exist_ok=True)
@@ -811,13 +894,15 @@ def save_model(path: str,g: Genome) -> None:
 
 
 def save_checkpoint(path:str, generation:int,population: Sequence[Genome],best:Genome,
-                    history:list[dict],rng:random.Random, archive: Sequence[Genome] = ()) -> None:
+                    history:list[dict],rng:random.Random, archive: Sequence[Genome] = (),
+                    rolling_cases: RollingTrainingCases | None = None) -> None:
     if not path:
         return
     payload={'version':CHECKPOINT_VERSION,'generation':generation,
              'population':[genome_object(g) for g in population],
              'best':genome_object(best),'history':history,'rng':rng.getstate(),
-             'archive':[genome_object(g) for g in archive]}
+             'archive':[genome_object(g) for g in archive],
+             'rolling_cases': rolling_cases.snapshot() if rolling_cases is not None else None}
     dest=Path(path);dest.parent.mkdir(parents=True,exist_ok=True)
     tmp=dest.with_suffix(dest.suffix+'.tmp')
     with tmp.open('wb') as f:
@@ -825,7 +910,7 @@ def save_checkpoint(path:str, generation:int,population: Sequence[Genome],best:G
     os.replace(tmp,dest)
 
 
-def load_checkpoint(path:str):
+def load_checkpoint(path:str, *, include_rotation_state: bool = False):
     with open(path,'rb') as f:
         v=pickle.load(f)
     if v.get('version')!=CHECKPOINT_VERSION:
@@ -833,7 +918,10 @@ def load_checkpoint(path:str):
     # IMPORTANT: Only open checkpoint files from trusted sources (pickle).
     rng=random.Random()
     rng.setstate(v['rng'])
-    return v['generation'], [genome_from_object(g) for g in v['population']], genome_from_object(v['best']),v['history'],rng,[genome_from_object(g) for g in v.get('archive',[])]
+    result = (v['generation'], [genome_from_object(g) for g in v['population']],
+              genome_from_object(v['best']), v['history'], rng,
+              [genome_from_object(g) for g in v.get('archive', [])])
+    return (*result, v.get('rolling_cases')) if include_rotation_state else result
 
 
 def evolve(args) -> Genome:
@@ -846,10 +934,12 @@ def evolve(args) -> Genome:
     if not bigrams:
         raise ValueError('Training corpus needs adjacent token pairs')
     if args.load:
-        first,population,best_ever,history,rng,archive=load_checkpoint(args.load)
+        first,population,best_ever,history,rng,archive,rotation_state=load_checkpoint(
+            args.load, include_rotation_state=True)
         args.population=len(population)
         args.rules=len(population[0].rules)
     else:
+        rotation_state=None
         first=0
         history=[]
         best_ever=None
@@ -865,6 +955,16 @@ def evolve(args) -> Genome:
         finally:
             if init_bar is not None:
                 init_bar.close()
+    rolling = RollingTrainingCases(corpus, args.cases, args.seed * 1000003,
+                                   args.case_rotate_every, rotation_state)
+    # Old v10 checkpoints do not contain rolling-case state. Reconstruct a
+    # deterministic rolling schedule from generation 0, without touching GA RNG.
+    if rotation_state is None and first:
+        rolling.for_generation(first - 1)
+    if history:
+        for old_row in history:
+            old_row.setdefault('case_rotation', '')
+            old_row.setdefault('rotated_case', '')
     if args.history_csv:
         # On a resumed run, restore the completed rows once. Thereafter append
         # only the new row, including when started from generation zero.
@@ -875,8 +975,8 @@ def evolve(args) -> Genome:
                     if show_progress else None)
     for generation in range(first,args.generations):
         t0=time.perf_counter()
-        # Evaluation rotation is explicit; identical input sets in same generation.
-        train=make_training_examples(corpus,args.cases,args.seed*1000003+generation//max(1,args.case_rotate_every))
+        # Replace exactly one case on each rotation boundary; keep all others.
+        train=rolling.for_generation(generation)
         if generation_bar is not None:
             generation_bar.set_description_str(f'Lens 学習 gen={generation}')
         eval_bar=(tqdm(total=len(population),desc=f'gen={generation} 評価/{args.backend}',
@@ -912,11 +1012,15 @@ def evolve(args) -> Genome:
              'best_ever_accuracy':best_ever.fitness,
              'correct_bytes':round(current.fitness*sum(len(s)-1 for s in train)),
              'evaluated_bytes':sum(len(s)-1 for s in train),'eval_seconds':elapsed,
-             'rules':args.rules,'tokens':256,'backend':args.backend}
+             'rules':args.rules,'tokens':256,'backend':args.backend,
+             'case_rotation':rolling.rotations_done,'rotated_case':(
+                 (rolling.rotations_done-1)%args.cases if generation and
+                 generation%args.case_rotate_every == 0 else -1)}
         history.append(row)
         summary=(f"gen={generation:6d} acc={current.fitness:.5f} mean={mean_fit:.5f} "
                  f"ever={best_ever.fitness:.5f} tested={row['evaluated_bytes']} "
-                 f"seconds={elapsed:.2f} backend={args.backend}")
+                 f"seconds={elapsed:.2f} backend={args.backend} "
+                 f"rotate={rolling.rotations_done} slot={row['rotated_case']}")
         if generation_bar is not None:
             generation_bar.set_postfix_str(f'acc={current.fitness:.5f} eval={elapsed:.1f}s',refresh=False)
             tqdm.write(summary)
@@ -955,7 +1059,7 @@ def evolve(args) -> Genome:
             if breed_bar is not None:
                 breed_bar.close()
         if args.checkpoint and args.checkpoint_every>0 and (generation+1)%args.checkpoint_every==0:
-            save_checkpoint(args.checkpoint,generation+1,next_pop,best_ever,history,rng,archive)
+            save_checkpoint(args.checkpoint,generation+1,next_pop,best_ever,history,rng,archive,rolling)
         population=next_pop
         if generation_bar is not None:
             generation_bar.update(1)
@@ -964,7 +1068,7 @@ def evolve(args) -> Genome:
     if best_ever is None:
         raise ValueError('no generations evaluated')
     if args.checkpoint:
-        save_checkpoint(args.checkpoint,args.generations,population,best_ever,history,rng,archive)
+        save_checkpoint(args.checkpoint,args.generations,population,best_ever,history,rng,archive,rolling)
     if not args.no_plot:
         plot_history(history,args.plot_prefix,args.plot_window)
     return best_ever
