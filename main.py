@@ -860,7 +860,7 @@ def plot_history(history: Sequence[dict], prefix: str, window: int) -> None:
     ax.plot(x,y,alpha=.5,label='Generation best next-byte accuracy')
     ax.plot(x,avg,label='Moving average')
     ax.plot(x,np.maximum.accumulate(y),label='Best observed')
-    ax.set(xlabel='Generation',ylabel='Teacher-forced next-byte accuracy',ylim=(0,1),title='Lens autoregressive training')
+    ax.set(xlabel='Generation',ylabel='Teacher-forced next-byte accuracy',title='Lens autoregressive training')
     ax.legend(); fig.tight_layout()
     out=Path(prefix+'_accuracy.png')
     out.parent.mkdir(parents=True,exist_ok=True)
