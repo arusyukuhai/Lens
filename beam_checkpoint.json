@@ -1,0 +1,682 @@
+{
+  "version": 2,
+  "completed": 27,
+  "base_seed": 1791435384,
+  "config": {
+    "corpus": "github-code.txt",
+    "population": 40,
+    "iterations": 20,
+    "minChunk": 16,
+    "maxChunk": 8192,
+    "maxChunks": 16384,
+    "diffusionSteps": 100,
+    "ridgeRows": 256,
+    "maxRidgeFeatures": 1024,
+    "ridgeLambda": 4.0,
+    "inferCases": 2,
+    "inferSpan": 8192,
+    "inferPopulation": 10,
+    "inferGenerations": 5,
+    "inferMaxLoci": 64,
+    "inferNoise": 0.1,
+    "inferWeight": 1.0,
+    "maxRuleLen": 64,
+    "rules": 1500,
+    "selfTest": false
+  },
+  "target_rules": 1500,
+  "beams": [
+    [
+      {
+        "a": [
+          -3,
+          111,
+          114
+        ],
+        "b": [
+          105,
+          65,
+          114
+        ]
+      },
+      {
+        "a": [
+          105
+        ],
+        "b": [
+          41,
+          114,
+          32
+        ]
+      },
+      {
+        "a": [
+          32,
+          32,
+          116
+        ],
+        "b": [
+          116,
+          99,
+          32
+        ]
+      },
+      {
+        "a": [
+          -1,
+          101,
+          10
+        ],
+        "b": [
+          32,
+          41,
+          32
+        ]
+      },
+      {
+        "a": [
+          114,
+          -2,
+          32
+        ],
+        "b": [
+          59,
+          -2,
+          101,
+          -2,
+          32,
+          -1,
+          -2,
+          110,
+          115
+        ]
+      },
+      {
+        "a": [
+          47,
+          -2,
+          117
+        ],
+        "b": [
+          32,
+          10
+        ]
+      },
+      {
+        "a": [
+          112,
+          95
+        ],
+        "b": [
+          112,
+          39
+        ]
+      }
+    ],
+    [
+      {
+        "a": [
+          -3,
+          111,
+          114
+        ],
+        "b": [
+          105,
+          65,
+          114
+        ]
+      },
+      {
+        "a": [
+          10,
+          -1,
+          32
+        ],
+        "b": [
+          47,
+          100,
+          32
+        ]
+      },
+      {
+        "a": [
+          10,
+          -3,
+          -1,
+          48,
+          -3
+        ],
+        "b": [
+          -3,
+          -2,
+          41,
+          -3,
+          -2,
+          32
+        ]
+      },
+      {
+        "a": [
+          101,
+          -3,
+          100
+        ],
+        "b": [
+          116,
+          121,
+          95,
+          9
+        ]
+      },
+      {
+        "a": [
+          114,
+          -2,
+          32
+        ],
+        "b": [
+          59,
+          -2,
+          101,
+          -2,
+          32,
+          -1,
+          -2,
+          110,
+          115
+        ]
+      },
+      {
+        "a": [
+          47,
+          -2,
+          117
+        ],
+        "b": [
+          32,
+          10
+        ]
+      },
+      {
+        "a": [
+          112,
+          95
+        ],
+        "b": [
+          112,
+          39
+        ]
+      }
+    ],
+    [
+      {
+        "a": [
+          -3,
+          111,
+          114
+        ],
+        "b": [
+          105,
+          65,
+          114
+        ]
+      },
+      {
+        "a": [
+          32,
+          101
+        ],
+        "b": [
+          -1,
+          115,
+          109,
+          109,
+          47
+        ]
+      },
+      {
+        "a": [
+          32,
+          32,
+          116
+        ],
+        "b": [
+          116,
+          99,
+          32
+        ]
+      },
+      {
+        "a": [
+          -1,
+          101,
+          10
+        ],
+        "b": [
+          32,
+          41,
+          32
+        ]
+      },
+      {
+        "a": [
+          114,
+          -2,
+          32
+        ],
+        "b": [
+          59,
+          -2,
+          101,
+          -2,
+          32,
+          -1,
+          -2,
+          110,
+          115
+        ]
+      },
+      {
+        "a": [
+          47,
+          -2,
+          117
+        ],
+        "b": [
+          32,
+          10
+        ]
+      },
+      {
+        "a": [
+          112,
+          95
+        ],
+        "b": [
+          112,
+          39
+        ]
+      }
+    ]
+  ],
+  "history": [
+    {
+      "step": 1,
+      "ruleCount": 1,
+      "ruleIndex": 0,
+      "chunkIndex": 12880,
+      "seconds": 2.1754348278045654,
+      "rho": 0.7836565874532183,
+      "rhoMA": 0.7836565874532183,
+      "rhoBestMA": -1.0,
+      "inference": 0.0546875,
+      "inferMA": 0.0546875,
+      "inferBestMA": 0.0,
+      "combined": 0.0546875
+    },
+    {
+      "step": 2,
+      "ruleCount": 2,
+      "ruleIndex": 1,
+      "chunkIndex": 6021,
+      "seconds": 3.8360259532928467,
+      "rho": 0.8433127952238335,
+      "rhoMA": 0.8134846913385259,
+      "rhoBestMA": -1.0,
+      "inference": 0.0390625,
+      "inferMA": 0.046875,
+      "inferBestMA": 0.0,
+      "combined": 0.0390625
+    },
+    {
+      "step": 3,
+      "ruleCount": 2,
+      "ruleIndex": 0,
+      "chunkIndex": 16201,
+      "seconds": 8.996186971664429,
+      "rho": 0.8639852939924927,
+      "rhoMA": 0.8303182255565148,
+      "rhoBestMA": -1.0,
+      "inference": 0.0390625,
+      "inferMA": 0.044270833333333336,
+      "inferBestMA": 0.0,
+      "combined": 0.0390625
+    },
+    {
+      "step": 4,
+      "ruleCount": 3,
+      "ruleIndex": 2,
+      "chunkIndex": 14232,
+      "seconds": 18.716781854629517,
+      "rho": 0.8564633160647955,
+      "rhoMA": 0.8368544981835849,
+      "rhoBestMA": -1.0,
+      "inference": 0.0078125,
+      "inferMA": 0.03515625,
+      "inferBestMA": 0.0,
+      "combined": 0.0078125
+    },
+    {
+      "step": 5,
+      "ruleCount": 3,
+      "ruleIndex": 1,
+      "chunkIndex": 9541,
+      "seconds": 2.1225569248199463,
+      "rho": 0.9340388935318319,
+      "rhoMA": 0.8562913772532343,
+      "rhoBestMA": 0.8562913772532343,
+      "inference": 0.014705882352941176,
+      "inferMA": 0.031066176470588236,
+      "inferBestMA": 0.031066176470588236,
+      "combined": 0.014705882352941176
+    },
+    {
+      "step": 6,
+      "ruleCount": 3,
+      "ruleIndex": 0,
+      "chunkIndex": 5599,
+      "seconds": 2.8830840587615967,
+      "rho": 0.8595281174812299,
+      "rhoMA": 0.8714656832588366,
+      "rhoBestMA": 0.8714656832588366,
+      "inference": 0.08035714285714285,
+      "inferMA": 0.0362001050420168,
+      "inferBestMA": 0.0362001050420168,
+      "combined": 0.08035714285714285
+    },
+    {
+      "step": 7,
+      "ruleCount": 4,
+      "ruleIndex": 3,
+      "chunkIndex": 13582,
+      "seconds": 2.1907079219818115,
+      "rho": 0.9372321982094471,
+      "rhoMA": 0.8902495638559594,
+      "rhoBestMA": 0.8902495638559594,
+      "inference": 0.037037037037037035,
+      "inferMA": 0.035795012449424214,
+      "inferBestMA": 0.0362001050420168,
+      "combined": 0.037037037037037035
+    },
+    {
+      "step": 8,
+      "ruleCount": 4,
+      "ruleIndex": 2,
+      "chunkIndex": 2173,
+      "seconds": 10.155098915100098,
+      "rho": 0.7551030045407787,
+      "rhoMA": 0.8684731059656166,
+      "rhoBestMA": 0.8902495638559594,
+      "inference": 0.03125,
+      "inferMA": 0.03423251244942421,
+      "inferBestMA": 0.0362001050420168,
+      "combined": 0.03125
+    },
+    {
+      "step": 9,
+      "ruleCount": 4,
+      "ruleIndex": 1,
+      "chunkIndex": 5232,
+      "seconds": 9.069630861282349,
+      "rho": 0.676930789754497,
+      "rhoMA": 0.8325666007035568,
+      "rhoBestMA": 0.8902495638559594,
+      "inference": 0.0390625,
+      "inferMA": 0.04048251244942421,
+      "inferBestMA": 0.04048251244942421,
+      "combined": 0.0390625
+    },
+    {
+      "step": 10,
+      "ruleCount": 4,
+      "ruleIndex": 0,
+      "chunkIndex": 15866,
+      "seconds": 12.535489082336426,
+      "rho": 0.4677857729899069,
+      "rhoMA": 0.7393159765951719,
+      "rhoBestMA": 0.8902495638559594,
+      "inference": 0.0546875,
+      "inferMA": 0.048478835978835975,
+      "inferBestMA": 0.048478835978835975,
+      "combined": 0.0546875
+    },
+    {
+      "step": 11,
+      "ruleCount": 5,
+      "ruleIndex": 4,
+      "chunkIndex": 4855,
+      "seconds": 7.720736980438232,
+      "rho": 0.923942200815861,
+      "rhoMA": 0.7521987932620982,
+      "rhoBestMA": 0.8902495638559594,
+      "inference": 0.015625,
+      "inferMA": 0.03553240740740741,
+      "inferBestMA": 0.048478835978835975,
+      "combined": 0.015625
+    },
+    {
+      "step": 12,
+      "ruleCount": 5,
+      "ruleIndex": 3,
+      "chunkIndex": 11812,
+      "seconds": 34.45402002334595,
+      "rho": 0.9401916804777651,
+      "rhoMA": 0.7527906897157618,
+      "rhoBestMA": 0.8902495638559594,
+      "inference": 0.03125,
+      "inferMA": 0.034375,
+      "inferBestMA": 0.048478835978835975,
+      "combined": 0.03125
+    },
+    {
+      "step": 13,
+      "ruleCount": 5,
+      "ruleIndex": 2,
+      "chunkIndex": 858,
+      "seconds": 5.606057167053223,
+      "rho": 0.9653700996182973,
+      "rhoMA": 0.7948441087312654,
+      "rhoBestMA": 0.8902495638559594,
+      "inference": 0.046875,
+      "inferMA": 0.0375,
+      "inferBestMA": 0.048478835978835975,
+      "combined": 0.046875
+    },
+    {
+      "step": 14,
+      "ruleCount": 5,
+      "ruleIndex": 1,
+      "chunkIndex": 2369,
+      "seconds": 1.8029510974884033,
+      "rho": 0.9499563181570628,
+      "rhoMA": 0.8494492144117787,
+      "rhoBestMA": 0.8902495638559594,
+      "inference": 0.07692307692307693,
+      "inferMA": 0.045072115384615384,
+      "inferBestMA": 0.048478835978835975,
+      "combined": 0.07692307692307693
+    },
+    {
+      "step": 15,
+      "ruleCount": 5,
+      "ruleIndex": 0,
+      "chunkIndex": 8370,
+      "seconds": 3.3930890560150146,
+      "rho": 0.9401385210537876,
+      "rhoMA": 0.9439197640245547,
+      "rhoBestMA": 0.9439197640245547,
+      "inference": 0.1,
+      "inferMA": 0.05413461538461539,
+      "inferBestMA": 0.05413461538461539,
+      "combined": 0.1
+    },
+    {
+      "step": 16,
+      "ruleCount": 6,
+      "ruleIndex": 5,
+      "chunkIndex": 11196,
+      "seconds": 18.325679063796997,
+      "rho": 0.9308158632237031,
+      "rhoMA": 0.9452944965061232,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0234375,
+      "inferMA": 0.055697115384615394,
+      "inferBestMA": 0.055697115384615394,
+      "combined": 0.0234375
+    },
+    {
+      "step": 17,
+      "ruleCount": 6,
+      "ruleIndex": 4,
+      "chunkIndex": 3915,
+      "seconds": 22.939532995224,
+      "rho": 0.8675204491890732,
+      "rhoMA": 0.9307602502483847,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0546875,
+      "inferMA": 0.06038461538461539,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.0546875
+    },
+    {
+      "step": 18,
+      "ruleCount": 6,
+      "ruleIndex": 3,
+      "chunkIndex": 14609,
+      "seconds": 26.09057092666626,
+      "rho": 0.0,
+      "rhoMA": 0.7376862303247254,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0,
+      "inferMA": 0.05100961538461539,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.0
+    },
+    {
+      "step": 19,
+      "ruleCount": 6,
+      "ruleIndex": 2,
+      "chunkIndex": 7053,
+      "seconds": 9.182358026504517,
+      "rho": 0.8433127952238335,
+      "rhoMA": 0.7163575257380794,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0234375,
+      "inferMA": 0.0403125,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.0234375
+    },
+    {
+      "step": 20,
+      "ruleCount": 6,
+      "ruleIndex": 1,
+      "chunkIndex": 1163,
+      "seconds": 23.02237582206726,
+      "rho": 0.9715222910601644,
+      "rhoMA": 0.7226342797393549,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0234375,
+      "inferMA": 0.025,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.0234375
+    },
+    {
+      "step": 21,
+      "ruleCount": 6,
+      "ruleIndex": 0,
+      "chunkIndex": 7238,
+      "seconds": 3.770833969116211,
+      "rho": 0.8978522227301029,
+      "rhoMA": 0.7160415516406349,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.03225806451612903,
+      "inferMA": 0.026764112903225806,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.03225806451612903
+    },
+    {
+      "step": 22,
+      "ruleCount": 7,
+      "ruleIndex": 6,
+      "chunkIndex": 8081,
+      "seconds": 13.17906403541565,
+      "rho": 0.853711619583431,
+      "rhoMA": 0.7132797857195063,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0,
+      "inferMA": 0.015826612903225807,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.0
+    },
+    {
+      "step": 23,
+      "ruleCount": 7,
+      "ruleIndex": 5,
+      "chunkIndex": 3812,
+      "seconds": 6.584787130355835,
+      "rho": 0.8588638185553805,
+      "rhoMA": 0.8850525494305824,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0625,
+      "inferMA": 0.028326612903225808,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.0625
+    },
+    {
+      "step": 24,
+      "ruleCount": 7,
+      "ruleIndex": 4,
+      "chunkIndex": 882,
+      "seconds": 9.694790840148926,
+      "rho": 0.714966062542996,
+      "rhoMA": 0.8593832028944149,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0,
+      "inferMA": 0.023639112903225807,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.0
+    },
+    {
+      "step": 25,
+      "ruleCount": 7,
+      "ruleIndex": 3,
+      "chunkIndex": 2582,
+      "seconds": 6.132202863693237,
+      "rho": 0.29405881764588204,
+      "rhoMA": 0.7238905082115586,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0390625,
+      "inferMA": 0.026764112903225806,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.0390625
+    },
+    {
+      "step": 26,
+      "ruleCount": 7,
+      "ruleIndex": 2,
+      "chunkIndex": 4736,
+      "seconds": 33.52582597732544,
+      "rho": 0.8517992878553693,
+      "rhoMA": 0.714679921236612,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.0703125,
+      "inferMA": 0.034375,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.0703125
+    },
+    {
+      "step": 27,
+      "ruleCount": 7,
+      "ruleIndex": 1,
+      "chunkIndex": 10658,
+      "seconds": 4.349242925643921,
+      "rho": 0.4094472601245848,
+      "rhoMA": 0.6258270493448425,
+      "rhoBestMA": 0.9452944965061232,
+      "inference": 0.015625,
+      "inferMA": 0.0375,
+      "inferBestMA": 0.06038461538461539,
+      "combined": 0.015625
+    }
+  ]
+}
