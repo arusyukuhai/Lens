@@ -72,12 +72,12 @@ type
 proc defaults(): Config =
   result = Config(
     corpus: DefaultCorpus, outdir: ".", ruleCount: 1500,
-    population: 30, iterations: 40, stagePatience: 40,
+    population: 10, iterations: 20, stagePatience: 20,
     minChunk: 16, maxChunk: 2000, maxChunks: 16384,
-    diffusionSteps: 100, ridgeRows: 256, maxRidgeFeatures: 1024,
+    diffusionSteps: 150, ridgeRows: 256, maxRidgeFeatures: 1024,
     ridgeLambda: 4.0, inferCases: 2, inferSpan: 2000,
     inferPopulation: 10, inferGenerations: 20, inferMaxLoci: 24,
-    inferNoise: 0.10, inferWeight: 1.0, mutationRate: 0.5, maxRuleLen: 64,
+    inferNoise: 0.10, inferWeight: 1.0, mutationRate: 0.25, maxRuleLen: 64,
     seed: 0, checkpointEvery: 1, printEvery: 1, plotEvery: 1,
     resume: false, selfTest: false
   )
