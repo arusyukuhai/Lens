@@ -1,91 +1,15 @@
 #!/usr/bin/env python3
 """
-Replacement-rule genetic programming core (v64 hidden phrase memory + v60.5 inference-consensus repair).
+Replacement-rule genetic programming core (single-pass ordinary replacement network).
 
-v64 adds a second interacting state space beside the visible rewrite stream.
-Pattern -1 remains the ordinary wildcard; -2/-3 are wildcard captures that also
-write phrase pairs to the top/bottom of two persistent hidden lists. A disjoint
-24-op replacement bank (-128..-151) can read/pop/delete top/bottom, first/second,
-left/right entries. v64.2 splits each ordered rule sweep into
---hidden-rewrite-phases evenly spaced segments (for 1500 rules: 2 => 750/1500,
-3 => 500/1000/1500); at every boundary the current left/right list is applied
-exactly once as persistent non-expanding literal rewrite pairs. v64.3 makes the
-hidden arena bound identical on CPU/MPS, makes MPS cycle hashing order-sensitive,
-and removes several avoidable empty/identity hidden-memory scans. Cycle identity
-includes both visible state and hidden memory, preventing false early termination
-when text repeats while memory is still evolving. Legacy v1 checkpoints normalize
-their formerly-equivalent negative pattern spellings to -1.
+Each trajectory applies the genome's ordered rules exactly once. Patterns use
+-1 as their only wildcard; replacement opcodes are -1..-111 (capture, reverse,
+arithmetic transforms; sort is unsupported by the MPS fused path). There is no
+hidden stack/queue, persistent phrase memory, secondary rewrite phase, cycle
+search, or repeated complete network traversal.
 
-v60.5 makes the inner inference vote smaller and inference-aware: the default voting ensemble is 32 instead of 128, half of its available slots preferentially preserve inherited inference specialists / previous Pareto-front survivors, candidate fitness combines robust consensus with a top-quartile specialist signal, and inner elites / cross-generation seeds are kept with mutable-locus diversity.  Under the same 0.75 equivalent-work cap, the default plan becomes about 3x16x29 instead of 3x16x7, so model-job cost stays similar while the string GA gets substantially more sequential repair steps.  This targets runs where infEns lagged far behind inferBest/infOracle despite a healthy 16-wide candidate pool.
-
-v60.4 repairs the string-side search geometry: the inference work budget now preserves candidate-population width and reduces inner generations first; initial candidates are single-locus counterfactuals; ordinary inference mutation is local-heavy with rare wide jumps; the voting ensemble reserves slots for inherited inference-strong Pareto survivors; and the context proposal table is strengthened by a bounded deterministic corpus sample. This directly addresses runs where infOracle == inferBest but the candidate pool itself recovers only ~5-16% of corrupted bytes.
-
-v60.3 adds a three-parent categorical differential/git-style crossover: for base A, donor X, and target Y, non-conflicting A->X rule-sequence edits are applied to Y. It probabilistically shares the existing crossover budget with legacy two-point crossover.
-
-v60.2 changes the string-side mutation radius to round(exp(uniform(0, log(k))))
-for k known-corrupted loci. The scheduled focus locus is guaranteed to be included
-without collapsing the radius to one. v60 adds a bounded string-side genetic inference phase. A small shared candidate
-population edits only synthetically corrupted byte positions and is selected by
-the current Replace ensemble. Per-genome final-pool recovery accuracy becomes a
-second NSGA-II-style Pareto objective beside Spearman. The checked revision uses
-ensemble-only inner search + one full-population final scoring pass, reuses MPS
-rule/index packs across inner generations, fixes tie handling/GC roots/corpus edge
-cases, and keeps a conservative inference-work cap well below the requested ~2x
-wall-time envelope. v57/v59 ranking and Metal rewrite kernels are retained.
-CPU path can run without PyTorch. Metal rewrite kernels are unchanged.
-
-Original engine lineage (v51 len1-word-prefix v50 len1-direct v45 match-bitset v38 literal-3gram-bloom v55 rule-pack-memo v56 recode-pack-memo v33 dual-anchor-bloom v31 narrow-state wc1-inplace fused-hash v30 wc1-general-fast v28 inplace-literal anchor-guided score-reuse direct-diff variable-length GPU-index incremental-candidate rolling-HoF rolling-evaluation bounded-workload compacting-GC precise-mutation/nonexpanding cooperative MPS), ported from
-at_jev(20261002-082442).nim.
-
-v19 keeps the v18 Nim-style mutation geometry (local/balanced/explore row budgets,
-mutually exclusive structural mutation classes, guided weak-row targeting and
-log-uniform segment edits) and adds a hard non-expanding rewrite invariant.
-Every rule is repaired so replacement literals <= pattern literals and every
-wildcard capture is emitted at most once. Therefore each rewrite satisfies
-output_length <= consumed_length for every possible capture length, eliminating
-evolutionary state-length blow-up by construction rather than by a fitness penalty.
-
-Kept on purpose:
-  * codeparrot/github-code (streaming) OR local github-code.txt chunks
-  * cumulative noisy trajectories built from clean code
-  * ordered rewrite rules with wildcard captures / transforms
-  * repeated sweeps until fixed point, cycle, overflow, or ceil(2*sqrt(LEN))
-  * per-rule firing counts as linear-regression features
-  * sparse pairwise rank-ridge readout fitted on all trajectories
-  * in-sample per-case Spearman correlation against cleanliness (= 1 - noise rate)
-  * elite selection, tournament selection, two-point crossover, mutation,
-    random immigrants
-  * per-genome learned 256-byte -> 512-token injective embedding
-  * CSV/PNG training plots (fitness + embedding evolution)
-
-Deliberately removed:
-  FAST/FULL, rolling timescales, race/rejection, lexicase,
-  full mutation bandits/probes, Jev/fusion, genealogy, Pareto runtime pressure,
-  checkpoint migration and most diagnostics.
-
-GPU path:
-  MPS maps one whole trajectory to one cooperative Metal threadgroup. Threads
-  jointly build the exact candidate bitmap, search match starts, emit replacements,
-  compare outputs, and hash states; lane 0 only controls ordered rule execution.
-
-The GPU helper file `gpu_replace_persistent.py` must be beside this script.
-Raw noisy bytes are mapped through each genome's evolved injective embedding before rewrite evaluation.
-
-v19 uses a compacting Global Rule Pool: immutable pattern/replacement structures
-are interned across generations, but unreachable structures are periodically traced
-from the live population and removed. The MPS backing buffers are genuinely shrunk
-at GC instead of merely resetting logical ids. A lightweight
-trajectory profiler reports rounds/candidates/index rebuilds/scan work/rewrites.
-The training moving average uses an expanding prefix and becomes a fixed-width
-window once enough generations exist, so it is visible from generation 0.
-
-Example (small smoke run):
-  python minimal_replacer_gp.py --backend cpu --population 8 --rules 32 \
-      --cases 2 --samples 12 --generations 3 --local-corpus github-code.txt
-
-Mac MPS run:
-  python minimal_replacer_gp.py --backend mps --population 450 --rules 1500 \
-      --cases 8 --samples 20 --case-rotate-every 2 --hof-size 24 --generations 100000
+The genetic algorithm, embedding, Spearman readout, inference objective,
+non-expanding rule invariant and CPU/MPS evaluators are retained.
 """
 
 from __future__ import annotations
@@ -108,6 +32,12 @@ from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
+try:
+    # SciPy is optional; its triangular SPD solve avoids two generic NxN LU
+    # factorizations for each genome's rank ridge readout.
+    from scipy.linalg import cho_solve as _fast_cho_solve
+except ImportError:
+    _fast_cho_solve = None
 try:
     import torch
 except ModuleNotFoundError as exc:
@@ -134,12 +64,6 @@ VOCAB = 512
 MAX_WILDCARDS = 16
 MAX_RULE_TOKENS = 64
 MAX_OUTPUT = 32768
-HIDDEN_MEMORY_MAX_ITEMS = 2048
-HIDDEN_REWRITE_DEFAULT_PHASES = 2
-# Existing replacement opcodes occupy -1..-111.  Hidden-memory operations live
-# in a disjoint 24-opcode bank so old capture/transform programs stay valid.
-HIDDEN_OPCODE_BASE = 128
-HIDDEN_OPCODE_COUNT = 24
 RIDGE_LAMBDA = 4.0
 TRAIN_MOD = 3  # legacy-holdout only
 PAIRWISE_RANK_MAX_FEATURES = 256
@@ -158,42 +82,6 @@ BALANCED_MUTATION_MAX_RULES = 64
 TRANSFORM_FAMILIES = ("capture", "reverse", "plus1", "minus1", "times2", "div2")
 
 
-def is_hidden_opcode(op: int) -> bool:
-    x = -int(op) - HIDDEN_OPCODE_BASE
-    return 0 <= x < HIDDEN_OPCODE_COUNT
-
-
-def encode_hidden_opcode(*, from_bottom: bool, second: bool,
-                         right: bool, action: int) -> int:
-    """Encode one of 24 hidden-list instructions.
-
-    action: 0=read, 1=pop(read+remove), 2=delete(remove without reading).
-    Selection dimensions are top/bottom, first/second, and left/right list.
-    """
-    action = max(0, min(2, int(action)))
-    idx = action + 3 * (int(bool(right)) + 2 * (int(bool(second)) + 2 * int(bool(from_bottom))))
-    return -(HIDDEN_OPCODE_BASE + idx)
-
-
-def decode_hidden_opcode(op: int) -> tuple[bool, bool, bool, int]:
-    if not is_hidden_opcode(op):
-        raise ValueError(f"not a hidden opcode: {op}")
-    idx = -int(op) - HIDDEN_OPCODE_BASE
-    action = idx % 3
-    q = idx // 3
-    right = bool(q & 1)
-    second = bool((q >> 1) & 1)
-    from_bottom = bool((q >> 2) & 1)
-    return from_bottom, second, right, action
-
-
-def random_hidden_opcode() -> int:
-    return encode_hidden_opcode(
-        from_bottom=bool(random.getrandbits(1)),
-        second=bool(random.getrandbits(1)),
-        right=bool(random.getrandbits(1)),
-        action=random.randrange(3),
-    )
 
 
 @dataclass(slots=True)
@@ -431,6 +319,52 @@ def make_hof_entry(
     return entry
 
 
+def _nearest_hof_below_threshold(
+    candidate: Genome, archive: Sequence[HallOfFameEntry], threshold: float
+) -> int:
+    """Find the EXACT nearest entry closer than threshold; otherwise -1.
+
+    A threshold as small as the default 0.015 admits at most ~25 different
+    rule rows among 1500. Once >25 mismatches have been counted, that archive
+    entry provably cannot be a near duplicate: stop comparing early. Unlike
+    approximate fingerprints this has zero false negatives and keeps nearest-
+    lineage and tie behavior. The fallback handles large user thresholds.
+    """
+    if threshold <= 0.0:
+        return -1
+    nearest = -1
+    best = threshold
+    a_rules = candidate.rules
+    for idx, entry in enumerate(archive):
+        b = entry.genome
+        n = min(len(a_rules), len(b.rules))
+        if n <= 0 or best >= 0.89:
+            dist = genome_structural_distance(candidate, b)
+        else:
+            length_penalty = abs(len(a_rules) - len(b.rules)) / max(1, max(len(a_rules), len(b.rules)))
+            # Rule contribution alone is a valid lower bound on full distance.
+            # Tiny allowance only for floating-point rounding at the bound;
+            # acceptance still uses the original strict distance comparison.
+            budget = n * (best / 0.90 - length_penalty) + 1.0e-10
+            if budget < 0:
+                continue
+            mismatches = 0
+            for ra, rb in zip(a_rules, b.rules):
+                if ra.pattern != rb.pattern or ra.replacement != rb.replacement:
+                    mismatches += 1
+                    if mismatches > budget:
+                        break
+            if mismatches > budget:
+                continue
+            rule_distance = min(1.0, 1.0 - (n - mismatches) / float(n) + length_penalty)
+            m = min(len(candidate.embedding), len(b.embedding))
+            emb_distance = (sum(x != y for x, y in zip(candidate.embedding, b.embedding)) / float(m)) if m else 0.0
+            dist = min(1.0, 0.90 * rule_distance + 0.10 * emb_distance)
+        if dist < best:
+            nearest, best = idx, dist
+    return nearest
+
+
 def update_hall_of_fame(
     archive: List[HallOfFameEntry],
     candidates: Sequence[Genome],
@@ -458,9 +392,8 @@ def update_hall_of_fame(
         cand = make_hof_entry(genome, case_serials, generation, history_cases, current_weight)
         if not archive:
             archive.append(cand); admitted += 1; continue
-        distances = [genome_structural_distance(cand.genome, e.genome) for e in archive]
-        nearest = int(np.argmin(np.asarray(distances, dtype=np.float64)))
-        if distances[nearest] < threshold:
+        nearest = _nearest_hof_below_threshold(cand.genome, archive, threshold)
+        if nearest >= 0:
             incumbent = archive[nearest]
             # For the same lineage, require a genuinely better current test score.
             # Historical cache belongs to the old structure and must not be copied.
@@ -1171,10 +1104,6 @@ def wildcard_count(pattern: Sequence[int]) -> int:
     return sum(1 for x in pattern if x < 0)
 
 
-def hidden_capture_count(pattern: Sequence[int]) -> int:
-    return sum(1 for x in pattern if x in (-2, -3))
-
-
 def capture_number(op: int) -> int:
     if op >= -15:
         return -op
@@ -1190,9 +1119,7 @@ def opcode_with_capture(op: int, capture: int) -> int:
 def random_replacement_opcode(wc: int) -> int:
     wc = max(1, min(MAX_WILDCARDS, wc))
     r = random.random()
-    if r < 0.18:
-        return random_hidden_opcode()
-    if r < 0.61:
+    if r < 0.52:
         return -random.randint(1, min(15, wc))
     # sort bank is omitted; family bank numbers in the Nim opcode layout:
     # reverse=1, +1=2, -1=3, *2=4, //2=5 after the sort bank.
@@ -1202,16 +1129,12 @@ def random_replacement_opcode(wc: int) -> int:
 
 
 def sanitize_rule(rule: Rule, sampler: CorpusSampler, embedding: Sequence[int] | None = None) -> None:
-    # v64 pattern language: -1 is an ordinary wildcard, -2 captures into the
-    # top of hidden memory, and -3 captures into the bottom.  Older revisions
-    # generated -4..-16 even though all negative pattern values had identical
-    # matching semantics; normalize those legacy spellings to -1.
+    # Ordinary Replace: every negative legacy pattern token is plain -1.
     seen = 0
     for i, v in enumerate(rule.pattern):
         if v < 0:
-            if v not in (-1, -2, -3):
-                v = -1
-                rule.pattern[i] = v
+            if v != -1:
+                rule.pattern[i] = -1
             seen += 1
             if seen > MAX_WILDCARDS:
                 rule.pattern[i] = sampler.literal(embedding)
@@ -1219,29 +1142,29 @@ def sanitize_rule(rule: Rule, sampler: CorpusSampler, embedding: Sequence[int] |
         rule.pattern[:] = [sampler.literal(embedding)]
 
     wc = wildcard_count(rule.pattern)
-    for i, t in enumerate(rule.replacement):
-        if t >= 0:
-            rule.replacement[i] = t % VOCAB
-            continue
-        if is_hidden_opcode(t):
-            rule.replacement[i] = int(t)
-            continue
-        # Never emit the unsupported sort bank in the minimal MPS core.
-        if -31 <= t <= -16:
-            t = -(32 + random.randrange(16))  # reverse family
+    repaired_ops: List[int] = []
+    for t in rule.replacement:
         if t < -111:
-            rule.replacement[i] = sampler.literal(embedding)
+            # Obsolete hidden-list instructions are removed, not converted
+            # into arbitrary visible tokens when loading old checkpoints.
             continue
+        if t >= 0:
+            repaired_ops.append(t % VOCAB)
+            continue
+        # The old fused MPS path never implemented sort($capture).
+        if -31 <= t <= -16:
+            t = -(32 + random.randrange(16))
         if wc <= 0:
-            rule.replacement[i] = sampler.literal(embedding)
             continue
         cap = capture_number(t)
         if cap > wc or cap <= 0:
             max_cap = min(15 if t >= -15 else 16, wc)
             t = opcode_with_capture(t, random.randint(1, max_cap))
-        rule.replacement[i] = t
+        repaired_ops.append(t)
+    rule.replacement[:] = repaired_ops
     if not rule.replacement:
-        rule.replacement[:] = [sampler.literal(embedding)]
+        # Non-expanding repair picks an existing literal or capture if needed.
+        rule.replacement[:] = [-1] if wc else [rule.pattern[0]]
     if len(rule.pattern) > MAX_RULE_TOKENS:
         del rule.pattern[MAX_RULE_TOKENS:]
     if len(rule.replacement) > MAX_RULE_TOKENS:
@@ -1280,7 +1203,7 @@ def rule_growth_signature(rule: Rule) -> Tuple[int, int, Tuple[int, ...]]:
     wc = wildcard_count(rule.pattern)
     refs = [0] * wc
     for t in rule.replacement:
-        if t < 0 and not is_hidden_opcode(t) and wc > 0:
+        if -111 <= t < 0 and wc > 0:
             ci = capture_number(t) - 1
             if 0 <= ci < wc:
                 refs[ci] += 1
@@ -1314,12 +1237,6 @@ def enforce_nonexpanding_rule(
                 repaired.append(t)
                 literal_budget -= 1
             continue
-        if is_hidden_opcode(t):
-            # Hidden reads are runtime-capped by the consumed match width; pop
-            # and delete operations may emit nothing.  They therefore do not
-            # consume the static literal/capture budget here.
-            repaired.append(t)
-            continue
         if wc <= 0:
             continue
         ci = capture_number(t)
@@ -1348,7 +1265,10 @@ def stabilize_genome_nonexpanding(g: Genome, sampler: CorpusSampler) -> int:
     changed = 0
     changed_rows = []
     for i, old in enumerate(g.rules):
-        if is_rule_nonexpanding(old):
+        if (is_rule_nonexpanding(old)
+                and all(x >= 0 or x == -1 for x in old.pattern)
+                and all(x >= 0 or (-111 <= x < 0 and not -31 <= x <= -16)
+                        for x in old.replacement)):
             continue
         r = clone_rule(old)
         sanitize_rule(r, sampler, g.embedding)
@@ -1379,7 +1299,7 @@ def random_rule(
     lb = max(1, min(MAX_RULE_TOKENS, int(lb)))
     a = sampler.seeded_pattern(la, embedding)
     if a and random.random() < 0.15:
-        a[random.randrange(len(a))] = random.choices((-1, -2, -3), weights=(0.72, 0.14, 0.14), k=1)[0]
+        a[random.randrange(len(a))] = -1
     b = [sampler.literal(embedding) for _ in range(lb)]
     wc = wildcard_count(a)
     if wc and b and random.random() < 0.20:
@@ -1515,7 +1435,7 @@ def mutate_sequence(
     """
     if not seq:
         if is_pattern and random.random() < 0.60:
-            seq.append(random.choices((-1, -2, -3), weights=(0.72, 0.14, 0.14), k=1)[0])
+            seq.append(-1)
         elif (not is_pattern) and random.random() < 0.20:
             seq.append(random_replacement_opcode(max(1, wc_hint)))
         else:
@@ -1536,7 +1456,7 @@ def mutate_sequence(
     if op == 0:  # substitute exactly one token/opcode
         p = random.randrange(len(seq))
         if is_pattern and random.random() < 0.20:
-            seq[p] = random.choices((-1, -2, -3), weights=(0.72, 0.14, 0.14), k=1)[0]
+            seq[p] = -1
         elif (not is_pattern) and random.random() < 0.20:
             seq[p] = random_replacement_opcode(max(1, wc_hint))
         else:
@@ -1544,7 +1464,7 @@ def mutate_sequence(
     elif op == 1 and len(seq) < MAX_RULE_TOKENS:  # insert one token
         p = random.randrange(len(seq) + 1)
         if is_pattern and random.random() < 0.15:
-            v = random.choices((-1, -2, -3), weights=(0.72, 0.14, 0.14), k=1)[0]
+            v = -1
         elif (not is_pattern) and random.random() < 0.20:
             v = random_replacement_opcode(max(1, wc_hint))
         else:
@@ -2282,118 +2202,6 @@ def tournament(pop: Sequence[Genome], k: int) -> Genome:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
-class HiddenMemory:
-    """Two persistent phrase lists used by v64's attention-like side channel.
-
-    ``token_capacity`` mirrors the per-trajectory MPS hidden arena.  Training
-    trajectories set it to the original visible length, which is safe because
-    the rewrite system is non-expanding.  Keeping the same bound on CPU and
-    MPS prevents long captures from causing backend-dependent hidden-list
-    eviction/order.
-    """
-
-    left: List[List[int]] = field(default_factory=list)
-    right: List[List[int]] = field(default_factory=list)
-    token_capacity: int | None = None
-
-    def signature(self) -> tuple:
-        return (
-            tuple(tuple(map(int, x)) for x in self.left),
-            tuple(tuple(map(int, x)) for x in self.right),
-        )
-
-    def _bounded_insert(self, dst: List[List[int]], phrase: Sequence[int], *, front: bool) -> None:
-        item = list(map(int, phrase))
-        cap = None if self.token_capacity is None else max(0, int(self.token_capacity))
-        # The MPS arena stores at most one original-input-length worth of tokens
-        # per side.  If one capture alone is longer, retain the prefix that fits;
-        # this branch is mostly defensive because captures come from a
-        # non-expanding state whose length never exceeds the initial length.
-        if cap is not None and len(item) > cap:
-            item = item[:cap]
-
-        def total_tokens() -> int:
-            return sum(len(x) for x in dst)
-
-        # Evict from the opposite end until both descriptor and token budgets fit.
-        # Left/right lists are intentionally independent: pop/delete opcodes can
-        # desynchronise them by design, so each side obeys the same deterministic
-        # deque policy on both CPU and MPS.
-        while dst and (len(dst) >= HIDDEN_MEMORY_MAX_ITEMS or
-                       (cap is not None and total_tokens() + len(item) > cap)):
-            if front:
-                dst.pop()
-            else:
-                del dst[0]
-        if cap is not None and len(item) > cap:
-            return
-        if front:
-            dst.insert(0, item)
-        else:
-            dst.append(item)
-
-    def insert_pair(self, left_phrase: Sequence[int], right_phrase: Sequence[int], *, front: bool) -> None:
-        self._bounded_insert(self.left, left_phrase, front=front)
-        self._bounded_insert(self.right, right_phrase, front=front)
-
-    @staticmethod
-    def _select_index(items: Sequence[Sequence[int]], *, from_bottom: bool, second: bool) -> int | None:
-        n = len(items)
-        if n <= 0:
-            return None
-        offset = 1 if second and n >= 2 else 0
-        return (n - 1 - offset) if from_bottom else offset
-
-    def execute(self, op: int) -> tuple[List[int], bool]:
-        """Return (read phrase, memory_changed) for one hidden opcode."""
-        from_bottom, second, right, action = decode_hidden_opcode(op)
-        items = self.right if right else self.left
-        idx = self._select_index(items, from_bottom=from_bottom, second=second)
-        if idx is None:
-            return [], False
-        phrase = list(items[idx])
-        if action == 0:  # read
-            return phrase, False
-        del items[idx]
-        if action == 1:  # pop = read + remove
-            return phrase, True
-        return [], True  # delete = remove only
-
-
-def _record_hidden_captures_cpu(
-    state: Sequence[int], pattern: Sequence[int], caps: Sequence[Tuple[int, int]], memory: HiddenMemory
-) -> bool:
-    """Store the first two -2 and -3 captures as left/right pairs.
-
-    -2 inserts at the top, -3 at the bottom.  If a bank has only one capture,
-    its right partner is the empty phrase.  Further captures still participate
-    in ordinary wildcard references but are ignored by the memory write.
-    """
-    changed = False
-    capture_i = 0
-    front_vals: List[List[int]] = []
-    back_vals: List[List[int]] = []
-    for t in pattern:
-        if t >= 0:
-            continue
-        if capture_i >= len(caps):
-            break
-        s, ln = caps[capture_i]
-        if t == -2 and len(front_vals) < 2:
-            front_vals.append(list(state[s:s + ln]))
-        elif t == -3 and len(back_vals) < 2:
-            back_vals.append(list(state[s:s + ln]))
-        capture_i += 1
-    if front_vals:
-        memory.insert_pair(front_vals[0], front_vals[1] if len(front_vals) > 1 else [], front=True)
-        changed = True
-    if back_vals:
-        memory.insert_pair(back_vals[0], back_vals[1] if len(back_vals) > 1 else [], front=False)
-        changed = True
-    return changed
-
-
 def _match_at_cpu(state: Sequence[int], pattern: Sequence[int], start: int):
     n = len(state)
     pos = start
@@ -2422,7 +2230,7 @@ def _match_at_cpu(state: Sequence[int], pattern: Sequence[int], start: int):
             continue
         found = -1
         for cand in range(pos, n - len(lit) + 1):
-            if state[cand : cand + len(lit)] == list(lit):
+            if state[cand : cand + len(lit)] == lit:
                 found = cand
                 break
         if found < 0:
@@ -2436,27 +2244,14 @@ def _emit_replacement_cpu(
     state: Sequence[int],
     rep: Sequence[int],
     caps: Sequence[Tuple[int, int]],
-    memory: HiddenMemory | None = None,
     max_emit_len: int | None = None,
-) -> tuple[List[int], bool]:
+) -> List[int]:
     out: List[int] = []
-    memory_changed = False
     wc = len(caps)
     for t in rep:
         if t >= 0:
             if max_emit_len is None or len(out) < max_emit_len:
                 out.append(t)
-            continue
-        if is_hidden_opcode(t):
-            vals: List[int] = []
-            changed = False
-            if memory is not None:
-                vals, changed = memory.execute(t)
-                memory_changed = memory_changed or changed
-            if vals:
-                room = len(vals) if max_emit_len is None else max(0, max_emit_len - len(out))
-                if room >= len(vals):
-                    out.extend(vals)
             continue
         if wc <= 0:
             continue
@@ -2492,21 +2287,20 @@ def _emit_replacement_cpu(
         room = len(vals) if max_emit_len is None else max(0, max_emit_len - len(out))
         if room >= len(vals):
             out.extend(vals)
-    return out, memory_changed
+    return out
 
 
 def replace_once_cpu(
-    state: Sequence[int], rule: Rule, max_output: int, memory: HiddenMemory | None = None
-) -> Tuple[List[int], bool, bool, bool]:
+    state: Sequence[int], rule: Rule, max_output: int, *, copy_on_miss: bool = True
+) -> Tuple[List[int], bool, bool]:
     pattern = rule.pattern
     if not pattern or not state:
-        return list(state), False, False, False
+        return (list(state) if copy_on_miss else state), False, False
     leading = pattern[0] >= 0
     out: List[int] = []
     prev = 0
     scan = 0
     matched = False
-    memory_changed = False
     while scan < len(state):
         chosen = None
         if leading:
@@ -2526,166 +2320,84 @@ def replace_once_cpu(
             break
         s, finish, caps = chosen
         matched = True
-        if memory is not None:
-            memory_changed = _record_hidden_captures_cpu(state, pattern, caps, memory) or memory_changed
         out.extend(state[prev:s])
-        # Preserve the engine's non-expanding invariant dynamically even when a
-        # hidden-memory read has unknown length at rule-construction time.
-        emitted, mem_changed = _emit_replacement_cpu(
-            state, rule.replacement, caps, memory=memory, max_emit_len=max(0, finish - s)
+        emitted = _emit_replacement_cpu(
+            state, rule.replacement, caps, max_emit_len=max(0, finish - s)
         )
-        memory_changed = memory_changed or mem_changed
         out.extend(emitted)
         if len(out) > max_output:
-            return list(state), True, True, memory_changed
+            return list(state), True, True
         prev = finish
         scan = finish
     if not matched:
-        return list(state), False, False, memory_changed
+        return (list(state) if copy_on_miss else state), False, False
     out.extend(state[prev:])
     if len(out) > max_output:
-        return list(state), True, True, memory_changed
-    return out, True, False, memory_changed
+        return list(state), True, True
+    return out, True, False
 
 
-def _replace_phrase_nonexpanding_cpu(
-    state: Sequence[int], needle: Sequence[int], repl: Sequence[int], max_output: int
-) -> tuple[List[int], bool, bool]:
-    """Replace all non-overlapping literal occurrences, never expanding state.
+def _cpu_rule_necessary_anchors(rules: Sequence[Rule]):
+    """Select one sound, inexpensive literal/pair match prerequisite per rule.
 
-    Empty right-hand phrases are deliberately skipped: a hidden-memory sweep
-    may rewrite but never uses an empty entry as a deletion instruction.
+    A positive adjacent pair in the *pattern* must appear contiguously in the
+    current state for that rule to fire. A single positive literal also works.
+    Negative wildcards are never included. No heuristics or Bloom false negatives.
     """
-    if not needle or not repl or len(repl) > len(needle) or len(needle) > len(state):
-        return list(state), False, False
-    if list(needle) == list(repl):
-        return list(state), False, False
-    n = len(state)
-    k = len(needle)
-    out: List[int] = []
-    i = 0
-    changed = False
-    while i <= n - k:
-        if list(state[i:i + k]) == list(needle):
-            out.extend(repl)
-            changed = changed or list(needle) != list(repl)
-            i += k
+    anchors = []
+    for rule in rules:
+        pat = rule.pattern
+        pair = next(((int(a), int(b)) for a, b in zip(pat, pat[1:])
+                     if a >= 0 and b >= 0), None)
+        if pair is not None:
+            anchors.append((2, pair))
         else:
-            out.append(int(state[i]))
-            i += 1
-        if len(out) > max_output:
-            return list(state), changed, True
-    out.extend(map(int, state[i:]))
-    if len(out) > max_output:
-        return list(state), changed, True
-    return out, changed, False
-
-
-def hidden_rewrite_cpu(
-    state: Sequence[int], memory: HiddenMemory, max_output: int
-) -> tuple[List[int], bool, bool]:
-    """Apply one persistent left->right hidden-memory rewrite phase.
-
-    Every stored left/right pair is considered exactly once, in list order.
-    Repeating the phase within one rule sweep is controlled separately by
-    ``hidden_rewrite_phases``; pair count must not implicitly multiply the
-    number of phases.  The memory itself is never consumed by this operation.
-    """
-    current = list(state)
-    pair_count = min(len(memory.left), len(memory.right))
-    if pair_count <= 0:
-        return current, False, False
-    any_changed = False
-    for i in range(pair_count):
-        current, changed, overflow = _replace_phrase_nonexpanding_cpu(
-            current, memory.left[i], memory.right[i], max_output
-        )
-        if overflow:
-            return list(state), any_changed or changed, True
-        any_changed = any_changed or changed
-    return current, any_changed, False
-
-
-def _hidden_phase_ends(rule_count: int, phases: int) -> List[int]:
-    """Return 1-based rule-scan boundaries for evenly spaced hidden phases.
-
-    Example: 1500 rules and 2 phases -> [750, 1500]; 3 phases ->
-    [500, 1000, 1500].  Ceil division keeps the intervals as even as possible
-    when the rule count is not divisible by the requested phase count.
-    """
-    rc = max(0, int(rule_count))
-    if rc <= 0:
-        return []
-    n = max(1, min(int(phases), rc))
-    return [((k * rc) + n - 1) // n for k in range(1, n + 1)]
+            lit = next((int(t) for t in pat if t >= 0), None)
+            anchors.append((1, lit) if lit is not None else (0, None))
+    return anchors
 
 
 def trajectory_features_cpu(
     inputs: Sequence[Sequence[int]], genome: Genome, max_output: int,
-    hidden_rewrite_phases: int = HIDDEN_REWRITE_DEFAULT_PHASES,
 ):
+    """Exact single sweep, with sound incremental CPU candidate prefiltering.
+
+    Build the state's literal/pair presence sets only when an earlier rule
+    actually *changes* its output. Most rules cannot possibly match. This
+    avoids scanning the entire state for each such rule, without dropping any
+    valid match or changing features, baseline or ordered rewrite semantics.
+    """
     inputs = embed_inputs(inputs, genome.embedding)
     b = len(inputs)
     rcount = len(genome.rules)
     features = np.zeros((b, rcount), dtype=np.float32)
     baselines = np.zeros(b, dtype=np.float64)
-    stats = np.zeros((b, 4), dtype=np.int32)  # rounds, total fires, overflow, cycle
+    stats = np.zeros((b, 4), dtype=np.int32)
+    anchors = _cpu_rule_necessary_anchors(genome.rules)
     final_states: List[List[int]] = []
     for j, inp in enumerate(inputs):
         state = list(inp)
-        # Match the MPS hidden arena exactly: one original-state-length token
-        # budget per side.  The visible system is non-expanding, so this bound
-        # remains valid for every later capture in the trajectory.
-        memory = HiddenMemory(token_capacity=max(1, len(inp)))
-        limit = max(1, int(math.ceil(2.0 * math.sqrt(max(1, len(inp))))))
-        seen = {(tuple(state), memory.signature())}
-        for rnd in range(limit):
-            rewrote = False
-            overflow = False
-            memory_changed = False
-            phase_ends = _hidden_phase_ends(rcount, hidden_rewrite_phases)
-            phase_idx = 0
-            for ri, rule in enumerate(genome.rules):
-                next_state, matched, of, mem_changed = replace_once_cpu(
-                    state, rule, max_output, memory=memory
-                )
-                if matched:
-                    features[j, ri] += 1.0
-                    stats[j, 1] += 1
-                    rewrote = True
-                memory_changed = memory_changed or mem_changed
-                if of:
-                    baselines[j] -= 1.0
-                    stats[j, 2] = 1
-                    overflow = True
-                    break
+        stats[j, 0] = 1
+        tokens = set(state)
+        pairs = set(zip(state, state[1:]))
+        for ri, rule in enumerate(genome.rules):
+            kind, anchor = anchors[ri]
+            if (kind == 2 and anchor not in pairs) or (kind == 1 and anchor not in tokens):
+                continue
+            next_state, matched, overflow = replace_once_cpu(
+                state, rule, max_output, copy_on_miss=False
+            )
+            if matched:
+                features[j, ri] = 1.0
+                stats[j, 1] += 1
+            if overflow:
+                baselines[j] -= 1.0
+                stats[j, 2] = 1
+                break
+            if next_state is not state and next_state != state:
                 state = next_state
-
-                # A phase fires immediately after crossing its rule-scan
-                # boundary.  Thus 1500 rules / 2 phases fires after rule 750
-                # and after rule 1500, rather than doing two rewrites at the end.
-                processed = ri + 1
-                while phase_idx < len(phase_ends) and processed >= phase_ends[phase_idx]:
-                    state, hidden_changed, hidden_overflow = hidden_rewrite_cpu(
-                        state, memory, max_output
-                    )
-                    if hidden_overflow:
-                        baselines[j] -= 1.0
-                        stats[j, 2] = 1
-                        overflow = True
-                        break
-                    rewrote = rewrote or hidden_changed
-                    phase_idx += 1
-                if overflow:
-                    break
-            stats[j, 0] = rnd + 1
-            if overflow or (not rewrote and not memory_changed):
-                break
-            key = (tuple(state), memory.signature())
-            if key in seen:
-                stats[j, 3] = 1
-                break
-            seen.add(key)
+                tokens = set(state)
+                pairs = set(zip(state, state[1:]))
         final_states.append(state)
     return features, baselines, stats, final_states
 
@@ -2719,21 +2431,9 @@ constant int GP_MAX_RULES = 2048;
 typedef short gp_token_t;
 constant int GP_RULE_WORDS = 64;
 constant int GP_INDEX_TOKENS = 513;
-constant int GP_META_WIDTH = 8;
+constant int GP_META_WIDTH = 7;
 constant int GP_ANCHOR_WIDTH = 5;
 constant int GP_PAIR_BLOOM_WORDS = 128;
-constant int GP_HIDDEN_MAX_ITEMS = 32;
-constant int GP_HIDDEN_OPCODE_BASE = 128;
-constant int GP_HIDDEN_OPCODE_COUNT = 24;
-
-inline uint gp_mix32(uint x) {
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
-    x ^= x >> 16;
-    return x;
-}
 
 inline int gp_pair_key(int a, int b) {
     return a * GP_INDEX_TOKENS + b;
@@ -2818,10 +2518,7 @@ inline void gp_build_candidates(
     uint tg_size,
     threadgroup atomic_uint* candidate_bits,
     threadgroup atomic_uint* token_seen,
-    threadgroup atomic_uint* pair_bloom,
-    threadgroup uint* hash_part1,
-    threadgroup uint* hash_part2,
-    threadgroup uint* hash_out)
+    threadgroup atomic_uint* pair_bloom)
 {
     int words = (rule_count + 31) >> 5;
     for (int w = (start_rule >> 5) + int(tid); w < words; w += int(tg_size)) {
@@ -2838,14 +2535,8 @@ inline void gp_build_candidates(
 
     int h1base = genome * GP_INDEX_TOKENS;
     int nrbase = genome * rule_count;
-    uint state_h1 = 0u;
-    uint state_h2 = 0u;
-
     for (int i = int(tid); i < n; i += int(tg_size)) {
         int a = int(state[base + i]);
-        uint hv = uint(a);
-        state_h1 ^= gp_mix32(hv ^ (uint(i) * 0x9e3779b9u));
-        state_h2 += gp_mix32(hv + (uint(i) * 0x85ebca6bu) + 0x27d4eb2du);
         if (a >= 0 && a < GP_INDEX_TOKENS) {
             int word = a >> 5;
             uint bit = 1u << (a & 31);
@@ -2896,23 +2587,10 @@ inline void gp_build_candidates(
             }
         }
     }
-    hash_part1[tid] = state_h1;
-    hash_part2[tid] = state_h2;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        uint a = gp_mix32(uint(n) ^ 0x243f6a88u);
-        uint b = gp_mix32(uint(n) ^ 0x9e3779b9u);
-        for (uint q = 0; q < tg_size; ++q) {
-            a ^= hash_part1[q];
-            b += hash_part2[q];
-        }
-        hash_out[0] = a;
-        hash_out[1] = b;
-    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// v23: extend the current round's monotone candidate set after a rewrite.
+// v23: extend the current sweep's monotone candidate set after a rewrite.
 // We intentionally DO NOT clear candidate_bits or token_seen.  A candidate that
 // was valid earlier in the round may become stale, but stale bits are harmless:
 // the matcher rechecks the rule before applying it.  The only correctness risk
@@ -3471,220 +3149,6 @@ inline bool gp_match_capture_selected(
     finish = pos;
     return pos > start;
 }
-
-// -----------------------------------------------------------------------
-// v64 hidden phrase memory. Two independent packed phrase lists live beside
-// each trajectory. -2 captures enqueue a left/right pair at the top, -3 at the
-// bottom. Replacement opcodes -128..-151 select top/bottom, first/second,
-// left/right and read/pop/delete. The lists are bounded deques; on pressure an
-// insertion evicts from the opposite end rather than overflowing scratch.
-// -----------------------------------------------------------------------
-inline bool gp_is_hidden_opcode(int op) {
-    int x = -op - GP_HIDDEN_OPCODE_BASE;
-    return x >= 0 && x < GP_HIDDEN_OPCODE_COUNT;
-}
-
-inline int gp_hidden_item_start(
-    const device int* lens, int lens_base, int idx)
-{
-    int s = 0;
-    for (int i = 0; i < idx; ++i) s += max(0, lens[lens_base + i]);
-    return s;
-}
-
-inline void gp_hidden_delete_item_lane0(
-    device gp_token_t* tokens,
-    device int* lens,
-    int token_base,
-    int lens_base,
-    threadgroup int* hidden_state,
-    int count_slot,
-    int total_slot,
-    int idx)
-{
-    int count = hidden_state[count_slot];
-    int total = hidden_state[total_slot];
-    if (idx < 0 || idx >= count) return;
-    int start = gp_hidden_item_start(lens, lens_base, idx);
-    int ln = max(0, lens[lens_base + idx]);
-    if (ln > 0) {
-        for (int q = start + ln; q < total; ++q)
-            tokens[token_base + q - ln] = tokens[token_base + q];
-    }
-    for (int i = idx + 1; i < count; ++i)
-        lens[lens_base + i - 1] = lens[lens_base + i];
-    hidden_state[count_slot] = count - 1;
-    hidden_state[total_slot] = total - ln;
-}
-
-inline void gp_hidden_insert_item_lane0(
-    device gp_token_t* tokens,
-    device int* lens,
-    int token_base,
-    int lens_base,
-    threadgroup int* hidden_state,
-    int count_slot,
-    int total_slot,
-    const device gp_token_t* phrase_src,
-    int phrase_base,
-    int phrase_len,
-    bool front,
-    int capacity)
-{
-    int count = hidden_state[count_slot];
-    int total = hidden_state[total_slot];
-    int ln = max(0, min(capacity, phrase_len));
-
-    // Make both descriptor and token room. Front insert evicts from the bottom;
-    // bottom insert evicts from the top, preserving deque locality.
-    while ((count >= GP_HIDDEN_MAX_ITEMS || total + ln > capacity) && count > 0) {
-        if (front) {
-            int last_len = max(0, lens[lens_base + count - 1]);
-            total -= last_len;
-            count -= 1;
-            hidden_state[count_slot] = count;
-            hidden_state[total_slot] = total;
-        } else {
-            gp_hidden_delete_item_lane0(
-                tokens, lens, token_base, lens_base, hidden_state,
-                count_slot, total_slot, 0);
-            count = hidden_state[count_slot];
-            total = hidden_state[total_slot];
-        }
-    }
-    if (ln > capacity) return;
-    if (front) {
-        if (ln > 0) {
-            for (int q = total - 1; q >= 0; --q)
-                tokens[token_base + q + ln] = tokens[token_base + q];
-        }
-        for (int i = count - 1; i >= 0; --i)
-            lens[lens_base + i + 1] = lens[lens_base + i];
-        for (int q = 0; q < ln; ++q)
-            tokens[token_base + q] = phrase_src[phrase_base + q];
-        lens[lens_base] = ln;
-    } else {
-        for (int q = 0; q < ln; ++q)
-            tokens[token_base + total + q] = phrase_src[phrase_base + q];
-        lens[lens_base + count] = ln;
-    }
-    hidden_state[count_slot] = count + 1;
-    hidden_state[total_slot] = total + ln;
-}
-
-inline void gp_hidden_record_captures_lane0(
-    const device gp_token_t* src,
-    int base,
-    const device gp_token_t* pattern,
-    int pattern_len,
-    threadgroup int* cap_start,
-    threadgroup int* cap_len,
-    device gp_token_t* hidden_left,
-    device gp_token_t* hidden_right,
-    device int* hidden_left_lens,
-    device int* hidden_right_lens,
-    int hidden_token_base,
-    int hidden_lens_base,
-    threadgroup int* hidden_state,
-    int capacity,
-    threadgroup atomic_uint* hidden_changed)
-{
-    int front_s0 = 0, front_l0 = 0, front_s1 = 0, front_l1 = 0, front_n = 0;
-    int back_s0 = 0, back_l0 = 0, back_s1 = 0, back_l1 = 0, back_n = 0;
-    int ci = 0;
-    for (int p = 0; p < pattern_len; ++p) {
-        int t = int(pattern[p]);
-        if (t >= 0) continue;
-        if (t == -2 && front_n < 2) {
-            if (front_n == 0) { front_s0 = cap_start[ci]; front_l0 = cap_len[ci]; }
-            else { front_s1 = cap_start[ci]; front_l1 = cap_len[ci]; }
-            front_n += 1;
-        } else if (t == -3 && back_n < 2) {
-            if (back_n == 0) { back_s0 = cap_start[ci]; back_l0 = cap_len[ci]; }
-            else { back_s1 = cap_start[ci]; back_l1 = cap_len[ci]; }
-            back_n += 1;
-        }
-        ci += 1;
-    }
-    if (front_n > 0) {
-        gp_hidden_insert_item_lane0(
-            hidden_left, hidden_left_lens, hidden_token_base, hidden_lens_base,
-            hidden_state, 0, 2, src, base + front_s0, front_l0, true, capacity);
-        gp_hidden_insert_item_lane0(
-            hidden_right, hidden_right_lens, hidden_token_base, hidden_lens_base,
-            hidden_state, 1, 3, src, base + front_s1,
-            (front_n > 1 ? front_l1 : 0), true, capacity);
-        atomic_store_explicit(hidden_changed, 1u, memory_order_relaxed);
-    }
-    if (back_n > 0) {
-        gp_hidden_insert_item_lane0(
-            hidden_left, hidden_left_lens, hidden_token_base, hidden_lens_base,
-            hidden_state, 0, 2, src, base + back_s0, back_l0, false, capacity);
-        gp_hidden_insert_item_lane0(
-            hidden_right, hidden_right_lens, hidden_token_base, hidden_lens_base,
-            hidden_state, 1, 3, src, base + back_s1,
-            (back_n > 1 ? back_l1 : 0), false, capacity);
-        atomic_store_explicit(hidden_changed, 1u, memory_order_relaxed);
-    }
-}
-
-inline int gp_hidden_execute_lane0(
-    int op,
-    const device gp_token_t* src,
-    device gp_token_t* dst,
-    int base,
-    int n,
-    int out_pos,
-    int out_limit,
-    device gp_token_t* hidden_left,
-    device gp_token_t* hidden_right,
-    device int* hidden_left_lens,
-    device int* hidden_right_lens,
-    int hidden_token_base,
-    int hidden_lens_base,
-    threadgroup int* hidden_state,
-    threadgroup atomic_uint* hidden_changed,
-    threadgroup atomic_uint* diff_flag)
-{
-    int code = -op - GP_HIDDEN_OPCODE_BASE;
-    if (code < 0 || code >= GP_HIDDEN_OPCODE_COUNT) return 0;
-    int action = code % 3;
-    int q = code / 3;
-    bool right = (q & 1) != 0;
-    bool second = ((q >> 1) & 1) != 0;
-    bool from_bottom = ((q >> 2) & 1) != 0;
-
-    device gp_token_t* tokens = right ? hidden_right : hidden_left;
-    device int* lens = right ? hidden_right_lens : hidden_left_lens;
-    int count_slot = right ? 1 : 0;
-    int total_slot = right ? 3 : 2;
-    int count = hidden_state[count_slot];
-    if (count <= 0) return 0;
-    int offset = (second && count >= 2) ? 1 : 0;
-    int idx = from_bottom ? (count - 1 - offset) : offset;
-    int start = gp_hidden_item_start(lens, hidden_lens_base, idx);
-    int ln = max(0, lens[hidden_lens_base + idx]);
-
-    int emitted = 0;
-    if (action != 2 && out_pos + ln <= out_limit) {
-        for (int i = 0; i < ln; ++i) {
-            int v = int(tokens[hidden_token_base + start + i]);
-            int oq = out_pos + i;
-            dst[base + oq] = gp_token_t(v);
-            if (oq >= n || v != int(src[base + oq]))
-                atomic_store_explicit(diff_flag, 1u, memory_order_relaxed);
-        }
-        emitted = ln;
-    }
-    if (action == 1 || action == 2) {
-        gp_hidden_delete_item_lane0(
-            tokens, lens, hidden_token_base, hidden_lens_base, hidden_state,
-            count_slot, total_slot, idx);
-        atomic_store_explicit(hidden_changed, 1u, memory_order_relaxed);
-    }
-    return emitted;
-}
-
 
 // Fast path for wildcard-free pattern + all-literal replacement on short states.
 // All candidate starts are matched in parallel once; lane 0 performs only the
@@ -4442,15 +3906,6 @@ inline void gp_apply_rule_coop(
     threadgroup int* cap_start,
     threadgroup int* cap_len,
     threadgroup atomic_uint* diff_flag,
-    device gp_token_t* hidden_left,
-    device gp_token_t* hidden_right,
-    device int* hidden_left_lens,
-    device int* hidden_right_lens,
-    int hidden_token_base,
-    int hidden_lens_base,
-    threadgroup int* hidden_state,
-    threadgroup atomic_uint* hidden_changed,
-    int hidden_capacity,
     device int* changed_regions)
 {
     if (tid == 0) {
@@ -4527,15 +3982,6 @@ inline void gp_apply_rule_coop(
         if (ctrl[9] < 0) break;
 
         if (tid == 0) {
-            gp_hidden_record_captures_lane0(
-                src, base, pattern, pattern_len, cap_start, cap_len,
-                hidden_left, hidden_right, hidden_left_lens, hidden_right_lens,
-                hidden_token_base, hidden_lens_base, hidden_state, hidden_capacity,
-                hidden_changed);
-        }
-        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-
-        if (tid == 0) {
             ctrl[0] = 1;
             ctrl[1] = 1;
             ctrl[4] += 1;
@@ -4605,19 +4051,6 @@ inline void gp_apply_rule_coop(
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (ctrl[3] != 0) break;
-                continue;
-            }
-
-            if (gp_is_hidden_opcode(t)) {
-                if (tid == 0) {
-                    int emitted = gp_hidden_execute_lane0(
-                        t, src, dst, base, n, ctrl[8], match_out_limit,
-                        hidden_left, hidden_right, hidden_left_lens, hidden_right_lens,
-                        hidden_token_base, hidden_lens_base, hidden_state,
-                        hidden_changed, diff_flag);
-                    ctrl[8] += emitted;
-                }
-                threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
                 continue;
             }
 
@@ -4737,41 +4170,6 @@ inline void gp_apply_rule_coop(
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 }
 
-inline void gp_hash_state_coop(
-    const device gp_token_t* x,
-    int base,
-    int n,
-    uint tid,
-    uint tg_size,
-    threadgroup uint* part1,
-    threadgroup uint* part2,
-    threadgroup uint* out_hash)
-{
-    uint h1 = 0u;
-    uint h2 = 0u;
-    for (int i = int(tid); i < n; i += int(tg_size)) {
-        uint v = uint(x[base + i]);
-        uint m1 = gp_mix32(v ^ (uint(i) * 0x9e3779b9u));
-        uint m2 = gp_mix32(v + (uint(i) * 0x85ebca6bu) + 0x27d4eb2du);
-        h1 ^= m1;
-        h2 += m2;
-    }
-    part1[tid] = h1;
-    part2[tid] = h2;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        uint a = gp_mix32(uint(n) ^ 0x243f6a88u);
-        uint b = gp_mix32(uint(n) ^ 0x9e3779b9u);
-        for (uint q = 0; q < tg_size; ++q) {
-            a ^= part1[q];
-            b += part2[q];
-        }
-        out_hash[0] = a;
-        out_hash[1] = b;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-
 // v23: build the per-genome inverted candidate index on the GPU.  v22 did
 // this with Python nested loops and an open-addressed hash build every generation,
 // which dominated host pack time.  One threadgroup owns one genome; lanes clear
@@ -4875,20 +4273,18 @@ kernel void evaluate_gp_population_v17_i32(
     device uchar* feature_rows [[buffer(14)]],
     device int* stat_rows [[buffer(15)]],
     device int* profile_rows [[buffer(16)]],
-    device int* seen_hashes [[buffer(17)]],
-    constant int& capacity [[buffer(18)]],
-    constant int& logical_max_output [[buffer(19)]],
-    constant int& raw_stride [[buffer(20)]],
-    constant int& sample_count [[buffer(21)]],
-    constant int& rule_count [[buffer(22)]],
-    constant int& genome_count [[buffer(23)]],
-    constant int& global_genome_start [[buffer(24)]],
-    constant int& output_genome_start [[buffer(25)]],
-    constant int& max_rounds_cap [[buffer(26)]],
-    constant int& pair_capacity [[buffer(27)]],
-    device int* literal_positions [[buffer(28)]],
-    device int* wildcard_aux [[buffer(29)]],
-    const device int* anchors [[buffer(30)]],
+    constant int& capacity [[buffer(17)]],
+    constant int& logical_max_output [[buffer(18)]],
+    constant int& raw_stride [[buffer(19)]],
+    constant int& sample_count [[buffer(20)]],
+    constant int& rule_count [[buffer(21)]],
+    constant int& genome_count [[buffer(22)]],
+    constant int& global_genome_start [[buffer(23)]],
+    constant int& output_genome_start [[buffer(24)]],
+    constant int& pair_capacity [[buffer(25)]],
+    device int* literal_positions [[buffer(26)]],
+    device int* wildcard_aux [[buffer(27)]],
+    const device int* anchors [[buffer(28)]],
     uint group_u [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]])
@@ -4898,17 +4294,6 @@ kernel void evaluate_gp_population_v17_i32(
     int total_jobs = sample_count * genome_count;
     if (job >= total_jobs) return;
 
-    // v64.1: Metal compute functions on this path expose buffer slots 0..30
-    // only.  Keep hidden memory inside the already-bound scratch allocations
-    // instead of consuming four extra argument slots.  The first total_jobs
-    // rows remain the visible rewrite/scratch region; the packed hidden arena
-    // starts immediately after that active prefix.  Inactive batch capacity may
-    // be overwritten, which is safe because it is unused by this dispatch.
-    device gp_token_t* hidden_left = buffer_a + total_jobs * capacity;
-    device gp_token_t* hidden_right = buffer_b + total_jobs * capacity;
-    device int* hidden_left_lens = literal_positions + total_jobs * capacity;
-    device int* hidden_right_lens = wildcard_aux + total_jobs * capacity;
-
     int local_genome = job / sample_count;
     int sample = job - local_genome * sample_count;
     int global_genome = global_genome_start + local_genome;
@@ -4916,21 +4301,12 @@ kernel void evaluate_gp_population_v17_i32(
     int base = job * capacity;
     int raw_base = sample * raw_stride;
     int n = raw_lengths[sample];
-    int original_n = max(1, n);
-    // v64.2 packs two small runtime scalars into the existing buffer(26) slot
-    // to stay inside Metal's 0..30 argument-index limit. Low 16 bits are the
-    // cycle-history/round cap; high 16 bits are hidden rewrite checkpoints.
-    int max_rounds = max(1, max_rounds_cap & 0xffff);
-    int hidden_rewrite_phases = max(1, (max_rounds_cap >> 16) & 0xffff);
-    hidden_rewrite_phases = min(hidden_rewrite_phases, max(1, rule_count));
-    int rounds_limit = min(max_rounds,
-        max(1, int(ceil(2.0f * sqrt(float(original_n))))));
+    // A trajectory has one rule sweep, regardless of its input length.
 
     threadgroup atomic_uint candidate_bits[GP_RULE_WORDS];
     threadgroup atomic_uint token_seen[17];
     threadgroup atomic_uint pair_bloom[GP_PAIR_BLOOM_WORDS];
     threadgroup atomic_uint diff_flag;
-    threadgroup atomic_uint hidden_changed;
     threadgroup int best_s_lane[GP_TG_SIZE];
     threadgroup int best_f_lane[GP_TG_SIZE];
     threadgroup int cap_start[16];
@@ -4943,11 +4319,6 @@ kernel void evaluate_gp_population_v17_i32(
     // of issuing hundreds of device-global writes per job.
     threadgroup int prof_local[15];
     threadgroup int stat_local[4];
-    threadgroup uint hash_part1[GP_TG_SIZE];
-    threadgroup uint hash_part2[GP_TG_SIZE];
-    threadgroup uint hash_out[2];
-    // left_count, right_count, left_token_count, right_token_count
-    threadgroup int hidden_state[4];
 
     int emb_base = global_genome * 256;
     for (int i = int(tid); i < n; i += int(tg_size)) {
@@ -4964,32 +4335,18 @@ kernel void evaluate_gp_population_v17_i32(
         for (int i = 0; i < 15; ++i) prof_local[i] = 0;
         shared[0] = 1; // current_is_a
         shared[1] = n;
-        shared[2] = 0; // stop
-        shared[3] = 0; // seen_count
-        for (int i = 0; i < 4; ++i) hidden_state[i] = 0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     int genome_rule_base = global_genome * rule_count;
 
-    for (int round_idx = 0; round_idx < rounds_limit; ++round_idx) {
+    { // exactly one ordered rule sweep
         if (tid == 0) {
-            shared[4] = 0; // rewrote
             shared[5] = 0; // overflowed
-            shared[6] = 0; // round_state_changed
             shared[7] = 0; // next rule index
             shared[8] = 1; // 1=full build, 2=monotone extension
-            atomic_store_explicit(&hidden_changed, 0u, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Split one full 0..rule_count scan into evenly spaced segments.
-        // A hidden-memory phase fires after each segment, so with 1500 rules
-        // phases=2 means after rule 750 and after rule 1500.
-        for (int hidden_phase_idx = 0; hidden_phase_idx < hidden_rewrite_phases; ++hidden_phase_idx) {
-            int hidden_phase_end =
-                ((hidden_phase_idx + 1) * rule_count + hidden_rewrite_phases - 1) /
-                hidden_rewrite_phases;
 
         while (true) {
             int current_n = shared[1];
@@ -4998,85 +4355,18 @@ kernel void evaluate_gp_population_v17_i32(
             const device gp_token_t* src = src_rw;
 
             // No candidate build is needed after the last rule or overflow.
-            if (shared[7] >= hidden_phase_end || shared[5] != 0) break;
+            if (shared[7] >= rule_count || shared[5] != 0) break;
             if (shared[8] == 1) {
                 gp_build_candidates(
                     src, base, current_n, global_genome, rule_count, shared[7],
                     head1, next1, pair_keys, pair_heads, next2, always_bits,
-                    pair_capacity, tid, tg_size, candidate_bits, token_seen, pair_bloom,
-                    hash_part1, hash_part2, hash_out);
+                    pair_capacity, tid, tg_size, candidate_bits, token_seen, pair_bloom);
                 if (tid == 0) {
-                    // Mid-sweep hidden rewrites may request a full candidate
-                    // rebuild.  Only the build at rule index 0 is a full machine
-                    // state boundary for cycle detection; intermediate phase
-                    // states must never cause an early cycle cutoff.
-                    if (shared[7] == 0) {
-                    // Cycle identity is the complete machine state, not just
-                    // the visible token stream.  Without hidden memory here,
-                    // a same-text/different-memory state would be terminated
-                    // spuriously after v64.
-                    // Ordered rolling hash: item index and in-item position are
-                    // part of every mix.  The previous XOR/sum fold made
-                    // [[a],[b]] collide deterministically with [[b],[a]] when
-                    // lengths matched, which could cause false cycle cutoffs.
-                    uint mh1 = gp_mix32(uint(hidden_state[0]) ^ 0x51ed270bu);
-                    uint mh2 = gp_mix32(uint(hidden_state[1]) ^ 0x94d049bbu);
-                    int lp = 0;
-                    for (int i = 0; i < hidden_state[0]; ++i) {
-                        int ln = max(0, hidden_left_lens[job * GP_HIDDEN_MAX_ITEMS + i]);
-                        mh1 = gp_mix32(mh1 ^ gp_mix32(
-                            uint(ln) + uint(i + 1) * 0x9e3779b9u));
-                        for (int q = 0; q < ln; ++q) {
-                            uint v = uint(hidden_left[base + lp + q]);
-                            mh1 = gp_mix32(mh1 ^ gp_mix32(
-                                v + uint(i + 1) * 0x85ebca6bu +
-                                uint(q + 1) * 0xc2b2ae35u));
-                        }
-                        lp += ln;
-                    }
-                    int rp = 0;
-                    for (int i = 0; i < hidden_state[1]; ++i) {
-                        int ln = max(0, hidden_right_lens[job * GP_HIDDEN_MAX_ITEMS + i]);
-                        mh2 = gp_mix32(mh2 + gp_mix32(
-                            uint(ln) + uint(i + 1) * 0x27d4eb2du));
-                        for (int q = 0; q < ln; ++q) {
-                            uint v = uint(hidden_right[base + rp + q]);
-                            mh2 = gp_mix32(mh2 + gp_mix32(
-                                v + uint(i + 1) * 0x165667b1u +
-                                uint(q + 1) * 0xd3a2646cu));
-                        }
-                        rp += ln;
-                    }
-                    hash_out[0] ^= gp_mix32(mh1 ^ uint(hidden_state[2]));
-                    hash_out[1] += gp_mix32(mh2 ^ uint(hidden_state[3]));
-                    // v31: candidate construction already scanned every token.
-                    // Fold cycle hashing into that same pass instead of reading
-                    // the whole state again at the end of the previous round.
-                    bool repeated = false;
-                    int seen_count = shared[3];
-                    for (int i = 0; i < seen_count; ++i) {
-                        int q = (job * max_rounds + i) * 2;
-                        if (uint(seen_hashes[q + 0]) == hash_out[0] &&
-                            uint(seen_hashes[q + 1]) == hash_out[1]) {
-                            repeated = true; break;
-                        }
-                    }
-                    if (repeated) {
-                        stat_local[3] = 1;
-                        shared[2] = 1;
-                    } else if (seen_count < max_rounds) {
-                        int q = (job * max_rounds + seen_count) * 2;
-                        seen_hashes[q + 0] = int(hash_out[0]);
-                        seen_hashes[q + 1] = int(hash_out[1]);
-                        shared[3] = seen_count + 1;
-                    }
-                    } // shared[7] == 0: cycle boundary
                     shared[8] = 0;
                     prof_local[0] += 1;
                     prof_local[1] += current_n;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (shared[2] != 0) break;
             } else if (shared[8] == 2) {
                 gp_extend_candidates(
                     src, base, current_n, global_genome, rule_count, shared[7],
@@ -5097,8 +4387,8 @@ kernel void evaluate_gp_population_v17_i32(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             int r = shared[9];
-            if (r < 0 || r >= hidden_phase_end || shared[5] != 0) {
-                if (tid == 0 && shared[5] == 0) shared[7] = hidden_phase_end;
+            if (r < 0 || r >= rule_count || shared[5] != 0) {
+                if (tid == 0 && shared[5] == 0) shared[7] = rule_count;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 break;
             }
@@ -5114,7 +4404,6 @@ kernel void evaluate_gp_population_v17_i32(
             int wc = metadata[mq + 4];
             int leading = metadata[mq + 5];
             int rep_literal = metadata[mq + 6];
-            int hidden_rule = metadata[mq + 7];
             device gp_token_t* dst = current_is_a ? buffer_b : buffer_a;
             int aq = (global_genome * rule_count + r) * GP_ANCHOR_WIDTH;
             int anchor_kind = anchors[aq + 0];
@@ -5123,7 +4412,7 @@ kernel void evaluate_gp_population_v17_i32(
 
             // v38: literal rules may carry a necessary contiguous 3-gram; wildcard
             // rules retain v33's second-pair condition. The shared state Bloom
-            // is monotone within the round, so a missing bit
+            // is monotone within the sweep, so a missing bit
             // is an exact proof that the rule cannot match. Stale/set bits only
             // cause false positives, never false negatives.
             if (secondary_pair_key >= 0 && !gp_pair_bloom_maybe(pair_bloom, secondary_pair_key)) {
@@ -5135,8 +4424,8 @@ kernel void evaluate_gp_population_v17_i32(
                 continue;
             }
 
-            bool use_literal_fast = (hidden_rule == 0 && wc == 0 && rep_literal != 0);
-            bool use_wc1_fast = (hidden_rule == 0 && wc == 1);
+            bool use_literal_fast = (wc == 0 && rep_literal != 0);
+            bool use_wc1_fast = (wc == 1);
             if (use_literal_fast) {
                 gp_apply_literal_fast(
                     src_rw, dst, base, current_n, capacity, logical_max_output,
@@ -5154,10 +4443,7 @@ kernel void evaluate_gp_population_v17_i32(
                     src, dst, base, current_n, capacity, logical_max_output,
                     pat, pat_len, rep, rep_len, wc, leading, rep_literal,
                     tid, tg_size, ctrl, best_s_lane, best_f_lane,
-                    cap_start, cap_len, &diff_flag,
-                    hidden_left, hidden_right, hidden_left_lens, hidden_right_lens,
-                    base, job * GP_HIDDEN_MAX_ITEMS, hidden_state, &hidden_changed,
-                    original_n, literal_positions + base);
+                    cap_start, cap_len, &diff_flag, literal_positions + base);
             }
 
             // v23 fast path: literal rewrites already expose every changed span.
@@ -5190,8 +4476,7 @@ kernel void evaluate_gp_population_v17_i32(
 
             if (tid == 0) {
                 if (ctrl[1] != 0) {
-                    uchar old = feature_rows[feature_base + r];
-                    if (old < uchar(255)) feature_rows[feature_base + r] = uchar(old + 1);
+                    feature_rows[feature_base + r] = uchar(1);
                     stat_local[1] += 1;
                     prof_local[3] += 1;
                     if (use_literal_fast) {
@@ -5208,7 +4493,6 @@ kernel void evaluate_gp_population_v17_i32(
                     }
                     prof_local[8] += ctrl[4];
                     prof_local[9] += current_n;
-                    shared[4] = 1;
                 }
                 if (ctrl[3] != 0) {
                     stat_local[2] = 1;
@@ -5223,114 +4507,14 @@ kernel void evaluate_gp_population_v17_i32(
                     // ping-pong buffer only to swap immediately back later.
                     if (!((use_literal_fast || use_wc1_fast) && ctrl[14] != 0))
                         shared[0] = current_is_a ? 0 : 1;
-                    shared[6] = 1;
                     shared[8] = 0;
                 }
             }
             threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
         }
 
-        // A repeated state is detected during the full candidate build before
-        // any rule of this round executes. Preserve the old end-of-previous-round
-        // termination semantics and do not count a phantom extra round.
-        if (shared[2] != 0) break;
-
-        // v64.2 hidden-memory checkpoint: apply the current left->right mapping
-        // list exactly once at this scan boundary.  The list is persistent; only
-        // explicit read/pop/delete opcodes mutate it. Pair count no longer causes
-        // repeated end-of-sweep passes.
-        if (tid == 0) shared[10] = 0; // visible state changed in this hidden phase
+        if (tid == 0) stat_local[0] = 1;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (hidden_state[0] > 0 && hidden_state[1] > 0 && shared[5] == 0) {
-            int pair_count = min(hidden_state[0], hidden_state[1]);
-            for (int hi = 0; hi < pair_count; ++hi) {
-                if (tid == 0) {
-                    shared[11] = gp_hidden_item_start(
-                        hidden_left_lens, job * GP_HIDDEN_MAX_ITEMS, hi);
-                    shared[12] = max(0, hidden_left_lens[job * GP_HIDDEN_MAX_ITEMS + hi]);
-                    shared[13] = gp_hidden_item_start(
-                        hidden_right_lens, job * GP_HIDDEN_MAX_ITEMS, hi);
-                    shared[14] = max(0, hidden_right_lens[job * GP_HIDDEN_MAX_ITEMS + hi]);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                int ll = shared[12];
-                int rl = shared[14];
-                // Empty RHS is not a deletion instruction. Keep the hard
-                // non-expanding invariant by skipping mappings that grow.
-                if (ll <= 0 || rl <= 0 || rl > ll) continue;
-                int current_n = shared[1];
-                if (ll > current_n) continue;
-                if (ll == rl) {
-                    if (tid == 0) atomic_store_explicit(&diff_flag, 0u, memory_order_relaxed);
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    for (int q = int(tid); q < ll; q += int(tg_size)) {
-                        if (hidden_left[base + shared[11] + q] !=
-                            hidden_right[base + shared[13] + q])
-                            atomic_store_explicit(&diff_flag, 1u, memory_order_relaxed);
-                    }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (tid == 0) {
-                        shared[15] = (atomic_load_explicit(&diff_flag, memory_order_relaxed) == 0u) ? 1 : 0;
-                        atomic_store_explicit(&diff_flag, 0u, memory_order_relaxed);
-                    }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (shared[15] != 0) continue;
-                }
-
-                bool current_is_a = shared[0] != 0;
-                device gp_token_t* src_rw = current_is_a ? buffer_a : buffer_b;
-                device gp_token_t* dst = current_is_a ? buffer_b : buffer_a;
-                gp_apply_literal_fast(
-                    src_rw, dst, base, current_n, capacity, logical_max_output,
-                    hidden_left + base + shared[11], ll,
-                    hidden_right + base + shared[13], rl,
-                    0, -1, tid, tg_size, ctrl,
-                    (device atomic_uint*)(wildcard_aux + base),
-                    literal_positions + base, best_s_lane);
-                if (tid == 0) {
-                    if (ctrl[3] != 0) {
-                        stat_local[2] = 1;
-                        shared[5] = 1;
-                    } else if (ctrl[1] != 0 && ctrl[2] != 0) {
-                        shared[1] = ctrl[5];
-                        if (ctrl[14] == 0)
-                            shared[0] = current_is_a ? 0 : 1;
-                        shared[4] = 1;
-                        shared[6] = 1;
-                        shared[10] = 1;
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-                if (shared[5] != 0) break;
-            }
-        }
-
-        if (tid == 0) {
-            shared[7] = hidden_phase_end;
-            // A hidden rewrite can remove as well as introduce candidate tokens,
-            // so the next segment needs an exact rebuild. If nothing visible
-            // changed, retain the already-valid incremental candidate state.
-            if (hidden_phase_idx + 1 < hidden_rewrite_phases && shared[10] != 0)
-                shared[8] = 1;
-        }
-        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-        if (shared[5] != 0) break;
-        } // hidden phase segments
-
-        if (shared[2] != 0) break;
-
-        if (tid == 0) {
-            stat_local[0] = round_idx + 1;
-            bool mem_changed = atomic_load_explicit(&hidden_changed, memory_order_relaxed) != 0u;
-            if (shared[5] != 0 || (shared[4] == 0 && !mem_changed)) shared[2] = 1;
-            else if (shared[6] == 0 && !mem_changed) {
-                stat_local[3] = 1;
-                shared[2] = 1;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (shared[2] != 0) break;
-
     }
 
     // One diagnostic flush per trajectory.
@@ -5352,7 +4536,7 @@ def _get_mps_trajectory_lib():
 
 
 class MpsPopulationEvaluator:
-    META_WIDTH = 8
+    META_WIDTH = 7
 
     def __init__(self, sample_count: int, rule_count: int, max_raw_len: int,
                  max_output: int, genome_batch: int = 4,
@@ -5360,8 +4544,7 @@ class MpsPopulationEvaluator:
                  threadgroup_size: int = _GP_TG_SIZE,
                  pool_max_rules: int = 2_000_000,
                  pool_gc_ratio: float = 1.35,
-                 pool_gc_min_dead: int = 150_000,
-                 hidden_rewrite_phases: int = HIDDEN_REWRITE_DEFAULT_PHASES):
+                 pool_gc_min_dead: int = 150_000):
         if rule_count > _GP_MAX_RULES:
             raise ValueError(
                 f"v17 cooperative MPS path supports at most {_GP_MAX_RULES} rules; got {rule_count}"
@@ -5388,32 +4571,16 @@ class MpsPopulationEvaluator:
         self.pool_max_rules = max(self.rule_count, int(pool_max_rules))
         self.pool_gc_ratio = max(1.05, float(pool_gc_ratio))
         self.pool_gc_min_dead = max(0, int(pool_gc_min_dead))
-        self.hidden_rewrite_phases = max(1, min(int(hidden_rewrite_phases), self.rule_count))
-        self.max_rounds = max(1, int(math.ceil(2.0 * math.sqrt(self.raw_stride))))
-        if self.max_rounds > 255:
-            raise ValueError("uint8 firing counters require ceil(2*sqrt(max_chunk)) <= 255")
         jobs = self.sample_count * self.genome_batch
 
         self.raw_inputs = torch.zeros(
             (self.sample_count, self.raw_stride), dtype=torch.int32, device=self.device)
         self.raw_lengths = torch.zeros(self.sample_count, dtype=torch.int32, device=self.device)
-        # v64.1 packs the hidden arenas into the tails of already-bound Metal
-        # scratch buffers.  This is deliberately one flat allocation per binding:
-        # active visible rows occupy [0, active_jobs*capacity), while hidden rows
-        # begin at active_jobs*capacity inside the same buffer.  Doubling A/B gives
-        # one capacity-sized int16 arena per side; the two int32 scratch buffers
-        # each reserve 32 descriptors per maximum job for the corresponding list.
-        # No additional kernel buffer indices are required (Metal limit: 0..30).
-        self.buffer_a = torch.empty((jobs * self.capacity * 2,), dtype=torch.int16, device=self.device)
+        # One visible input and one visible output scratch row per trajectory.
+        self.buffer_a = torch.empty((jobs * self.capacity,), dtype=torch.int16, device=self.device)
         self.buffer_b = torch.empty_like(self.buffer_a)
-        self.literal_positions = torch.empty(
-            (jobs * (self.capacity + HIDDEN_MEMORY_MAX_ITEMS),),
-            dtype=torch.int32, device=self.device)
-        # v27: one extra int scratch row lets the one-wildcard matcher keep a
-        # nearest-suffix table/output-start table without touching the live state.
-        # v64.1 additionally uses its tail for right hidden-list descriptors.
+        self.literal_positions = torch.empty((jobs * self.capacity,), dtype=torch.int32, device=self.device)
         self.wildcard_aux = torch.empty_like(self.literal_positions)
-        self.seen = torch.empty((jobs, self.max_rounds, 2), dtype=torch.int32, device=self.device)
         self._raw_byte_counts = np.ones(INPUT_BYTE_COUNT, dtype=np.float64)
         self._raw_pair_counts = np.zeros((INPUT_BYTE_COUNT, INPUT_BYTE_COUNT), dtype=np.int64)
         self._raw_triple_counts: dict[int, int] = {}
@@ -5471,7 +4638,7 @@ class MpsPopulationEvaluator:
         # rescanning ~675k rule patterns every generation merely to feed the
         # v28 anchor-guided literal matcher.  New structural rules pay once.
         self._anchor_offset_cache: dict[tuple[int, int, int, int], int] = {}
-        self._pool_meta_host: list[tuple[int, int, int, int, int, int, int, int]] = []
+        self._pool_meta_host: list[tuple[int, int, int, int, int, int, int]] = []
         self._pool_tokens_host: list[int] = []
         self._pool_rule_capacity = max(4096, self.rule_count * 2)
         self._pool_token_capacity = max(65536, self.rule_count * 16)
@@ -5497,8 +4664,7 @@ class MpsPopulationEvaluator:
         # Unified-memory visibility is important on M1: a large genome_batch
         # multiplies three max_output-sized scratch buffers.  Report it so batch
         # tuning is based on the actual working set rather than "bigger is faster".
-        scratch_bytes = int(jobs) * int(self.capacity) * 16
-        scratch_bytes += int(jobs) * int(HIDDEN_MEMORY_MAX_ITEMS) * 8
+        scratch_bytes = int(jobs) * int(self.capacity) * 12
         self.scratch_bytes = scratch_bytes
         if self.progress:
             msg = f"  mps scratch={scratch_bytes / (1024**3):.2f} GiB"
@@ -5511,27 +4677,23 @@ class MpsPopulationEvaluator:
             except Exception:
                 pass
             print(msg, flush=True)
-            hidden_scan_ceiling = self.hidden_rewrite_phases * HIDDEN_MEMORY_MAX_ITEMS
-            if hidden_scan_ceiling >= 256:
-                print(
-                    f"  hidden-memory worst-case literal passes/sweep={hidden_scan_ceiling} "
-                    f"({self.hidden_rewrite_phases} phases x {HIDDEN_MEMORY_MAX_ITEMS} pairs) "
-                    "[potential hotspot: reduce --hidden-rewrite-phases if MPS time spikes]",
-                    flush=True,
-                )
-
-    def set_inputs(self, inputs: Sequence[Sequence[int]]) -> None:
+    def set_inputs(self, inputs: Sequence[Sequence[int]], *,
+                   refresh_anchor_statistics: bool = True) -> None:
         # v60 permits a smaller active prefix for the bounded inference GA.  The
         # large training scratch buffers stay allocated, but kernels launch only
         # active_sample_count trajectories, avoiding padded zero-work threadgroups.
         active = len(inputs)
         if active <= 0 or active > self.sample_count:
             raise ValueError(f"expected 1..{self.sample_count} samples, got {active}")
-        host = torch.zeros((self.sample_count, self.raw_stride), dtype=torch.int32)
-        lengths = torch.zeros(self.sample_count, dtype=torch.int32)
-        counts = np.ones(INPUT_BYTE_COUNT, dtype=np.float64)
-        pair_counts = np.zeros((INPUT_BYTE_COUNT, INPUT_BYTE_COUNT), dtype=np.int64)
-        triple_counts: dict[int, int] = {}
+        # Inference candidates often occupy only ~48 of 200 sample slots.
+        # Neither their trailing inactive rows nor their anchor frequencies
+        # are used by a prepacked inference model. Upload only the active prefix.
+        host = torch.zeros((active, self.raw_stride), dtype=torch.int32)
+        lengths = torch.zeros(active, dtype=torch.int32)
+        if refresh_anchor_statistics:
+            counts = np.ones(INPUT_BYTE_COUNT, dtype=np.float64)
+            pair_counts = np.zeros((INPUT_BYTE_COUNT, INPUT_BYTE_COUNT), dtype=np.int64)
+            triple_counts: dict[int, int] = {}
         alias = np.arange(active, dtype=np.int32)
         seen_inputs: dict[tuple[int, ...], int] = {}
         for j, row in enumerate(inputs):
@@ -5541,7 +4703,7 @@ class MpsPopulationEvaluator:
 
             # Preserve anchor-frequency statistics over all observations, even
             # duplicate rows: the regression dataset still contains all of them.
-            if n:
+            if n and refresh_anchor_statistics:
                 arr = np.asarray(row, dtype=np.int64)
                 ok = arr[(arr >= 0) & (arr < INPUT_BYTE_COUNT)]
                 if ok.size:
@@ -5580,11 +4742,12 @@ class MpsPopulationEvaluator:
             if n:
                 host[j, :n] = torch.as_tensor(row, dtype=torch.int32)
 
-        self.raw_inputs.copy_(host)
-        self.raw_lengths.copy_(lengths)
-        self._raw_byte_counts = counts
-        self._raw_pair_counts = pair_counts
-        self._raw_triple_counts = triple_counts
+        self.raw_inputs[:active].copy_(host)
+        self.raw_lengths[:active].copy_(lengths)
+        if refresh_anchor_statistics:
+            self._raw_byte_counts = counts
+            self._raw_pair_counts = pair_counts
+            self._raw_triple_counts = triple_counts
         self._sample_alias = alias
         self.active_sample_count = int(active)
         self.unique_input_count = int(np.sum(alias == np.arange(active, dtype=np.int32)))
@@ -5787,8 +4950,6 @@ class MpsPopulationEvaluator:
                     new_meta.append((
                         po, len(p), ro, len(rep), int(rule.pack_wc),
                         int(rule.pack_leading), int(rule.pack_rep_literal),
-                        1 if (any(int(v) in (-2, -3) for v in p) or
-                              any(is_hidden_opcode(int(v)) for v in rep)) else 0,
                     ))
                     new_key_to_id[key] = pid
                 object_pid[oid] = int(pid)
@@ -5953,8 +5114,6 @@ class MpsPopulationEvaluator:
         self._pool_meta_host.append((
             po, len(p), ro, len(rep), int(rule.pack_wc),
             int(rule.pack_leading), int(rule.pack_rep_literal),
-            1 if (any(int(v) in (-2, -3) for v in p) or
-                  any(is_hidden_opcode(int(v)) for v in rep)) else 0,
         ))
         self._pool_key_to_id[key] = pid
         rule.pool_id = pid
@@ -6209,11 +5368,10 @@ class MpsPopulationEvaluator:
                     pair_keys_d.reshape(-1), pair_heads_d.reshape(-1),
                     next2_d.reshape(-1), always_d.reshape(-1),
                     self.feature_stage.reshape(-1), self.stat_stage.reshape(-1),
-                    self.profile_stage.reshape(-1), self.seen,
+                    self.profile_stage.reshape(-1),
                     int(self.capacity), int(self.max_output), int(self.raw_stride),
                     int(n_samples), int(self.rule_count), int(gcount),
                     int(global_start), int(local_start),
-                    int(self.max_rounds | (self.hidden_rewrite_phases << 16)),
                     int(pair_cap), self.literal_positions, self.wildcard_aux,
                     self._anchors_d[:total].reshape(-1),
                     threads=[jobs * self.threadgroup_size, 1, 1],
@@ -6344,7 +5502,9 @@ def fit_dual_ridge(x: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
         # K is SPD for lam>0.  Cholesky is both cheaper and more stable than
         # a generic LU solve, while preserving the exact legacy objective.
         chol = np.linalg.cholesky(k)
-        alpha = np.linalg.solve(chol.T, np.linalg.solve(chol, y))
+        alpha = (_fast_cho_solve((chol, True), y, check_finite=False)
+                 if _fast_cho_solve is not None
+                 else np.linalg.solve(chol.T, np.linalg.solve(chol, y)))
     except np.linalg.LinAlgError:
         alpha = np.linalg.lstsq(k, y, rcond=None)[0]
     w[active] = scale * (xd.T @ alpha)
@@ -6401,6 +5561,7 @@ def fit_pairwise_rank_ridge_all(
     case_ids: np.ndarray,
     ridge_lambda: float,
     max_features: int = PAIRWISE_RANK_MAX_FEATURES,
+    *, rank_pairs=None,
 ) -> np.ndarray:
     """Fit sparse pairwise Rank Ridge from *all* trajectories.
 
@@ -6410,7 +5571,8 @@ def fit_pairwise_rank_ridge_all(
     strongest ``max_features`` columns.  This is supervised sure-independence
     screening: it changes feature sparsity, not which trajectories participate.
     """
-    hi, lo, margin = case_adjacent_rank_pairs(cleanliness, case_ids)
+    hi, lo, margin = (case_adjacent_rank_pairs(cleanliness, case_ids)
+                      if rank_pairs is None else rank_pairs)
     p = int(x.shape[1])
     if hi.size == 0 or p == 0:
         return np.zeros(p, dtype=np.float64)
@@ -6452,6 +5614,7 @@ def score_genome_features(
     ridge_lambda: float,
     readout_mode: str = "pairwise-all",
     rank_max_features: int = PAIRWISE_RANK_MAX_FEATURES,
+    *, rank_pairs=None,
 ) -> float:
     """Fit the readout and score per-case Spearman.
 
@@ -6470,7 +5633,8 @@ def score_genome_features(
         w = fit_dual_ridge(x[train], residual, ridge_lambda)
     else:
         w = fit_pairwise_rank_ridge_all(
-            x, baseline, cleanliness, case_ids, ridge_lambda, rank_max_features
+            x, baseline, cleanliness, case_ids, ridge_lambda, rank_max_features,
+            rank_pairs=rank_pairs,
         )
 
     genome.readout_weights = w.astype(np.float64, copy=False).tolist()
@@ -6508,23 +5672,24 @@ def evaluate_genome(
     max_output: int,
     readout_mode: str = "pairwise-all",
     rank_max_features: int = PAIRWISE_RANK_MAX_FEATURES,
-    hidden_rewrite_phases: int = HIDDEN_REWRITE_DEFAULT_PHASES,
+    *, rank_pairs=None,
 ) -> float:
     if backend == "mps":
         # Compatibility path. evolve() uses one persistent evaluator for the
         # entire population instead of constructing this per genome.
         ev = MpsPopulationEvaluator(
             len(inputs), len(genome.rules), max(len(x) for x in inputs),
-            max_output, genome_batch=1, hidden_rewrite_phases=hidden_rewrite_phases,
+            max_output, genome_batch=1,
         )
         ev.set_inputs(inputs)
         x, baseline, _ = ev.evaluate_population([genome])[0]
     else:
         x, baseline, _, _ = trajectory_features_cpu(
-            inputs, genome, max_output, hidden_rewrite_phases=hidden_rewrite_phases
+            inputs, genome, max_output
         )
     return score_genome_features(
-        genome, x, baseline, cleanliness, case_ids, sample_ids, ridge_lambda, readout_mode, rank_max_features
+        genome, x, baseline, cleanliness, case_ids, sample_ids, ridge_lambda, readout_mode, rank_max_features,
+        rank_pairs=rank_pairs,
     )
 
 
@@ -6857,7 +6022,7 @@ def evaluate_inference_candidates(genomes: Sequence[Genome], candidates: Sequenc
                                   mps_evaluator: MpsPopulationEvaluator | None = None,
                                   mps_context=None,
                                   pool_live_genomes: Sequence[Genome] | None = None,
-                                  hidden_rewrite_phases: int = HIDDEN_REWRITE_DEFAULT_PHASES) -> np.ndarray:
+) -> np.ndarray:
     """Score the same candidate strings under every genome's fitted cleanliness readout.
 
     ``mps_context`` is a prepacked ``(representatives, row_map, packed)`` tuple.
@@ -6877,7 +6042,9 @@ def evaluate_inference_candidates(genomes: Sequence[Genome], candidates: Sequenc
             reps, row_map, packed = mps_context
             if len(row_map) != len(genomes):
                 raise ValueError("inference MPS context does not match genome count")
-        mps_evaluator.set_inputs(candidates)
+        mps_evaluator.set_inputs(
+            candidates, refresh_anchor_statistics=(packed is None)
+        )
         feats = mps_evaluator.evaluate_population(
             reps,
             pool_live_genomes=(genomes if pool_live_genomes is None else pool_live_genomes),
@@ -6891,7 +6058,7 @@ def evaluate_inference_candidates(genomes: Sequence[Genome], candidates: Sequenc
     scores = np.empty((len(genomes), len(candidates)), dtype=np.float64)
     for gi, g in enumerate(genomes):
         x, baseline, _stats, _states = trajectory_features_cpu(
-            candidates, g, max_output, hidden_rewrite_phases=hidden_rewrite_phases
+            candidates, g, max_output
         )
         scores[gi] = _prediction_scores_from_features(g, x, baseline)
     return scores
@@ -7132,7 +6299,7 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
                             case_count: int | None = None,
                             pool_live_genomes: Sequence[Genome] | None = None,
                             elite_count: int = 3,
-                            hidden_rewrite_phases: int = HIDDEN_REWRITE_DEFAULT_PHASES) -> dict:
+) -> dict:
     """Inner GA over corrupted bytes; final recovery is objective #2.
 
     Search is shared by a mixed ensemble of current Spearman leaders and
@@ -7233,6 +6400,11 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
     roots = genomes if pool_live_genomes is None else pool_live_genomes
 
     search_context = None
+    # Models/readouts are immutable for the whole inner GA. Cached candidate
+    # predictions remain valid even when an elite reappears many generations
+    # later; this also collapses identical independent candidates in a batch.
+    search_score_cache: dict[bytes, np.ndarray] = {}
+    inference_cache_hits = 0
     total_candidate_evaluations = 0
     total_model_jobs = 0
     total_kernel_jobs = 0
@@ -7250,19 +6422,34 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
         # Search phase: only the mixed voting ensemble is required here.
         for step in range(rounds):
             flat = [cand for pop in candidate_pops for cand in pop]
-            search_scores = evaluate_inference_candidates(
-                search_genomes, flat, backend, max_output,
-                hidden_rewrite_phases=hidden_rewrite_phases,
-                mps_evaluator=mps_evaluator, mps_context=search_context,
-                pool_live_genomes=roots,
-            )
+            # Raw inference inputs are byte strings. Use immutable bytes as a
+            # collision-free key and evaluate each unseen candidate exactly once.
+            keys = [bytes(cand) for cand in flat]
+            unseen_keys = []
+            unseen_candidates = []
+            unseen_set = set()
+            for key, cand in zip(keys, flat):
+                if key not in search_score_cache and key not in unseen_set:
+                    unseen_keys.append(key)
+                    unseen_candidates.append(cand)
+                    unseen_set.add(key)
+            if unseen_candidates:
+                new_scores = evaluate_inference_candidates(
+                    search_genomes, unseen_candidates, backend, max_output,
+                    mps_evaluator=mps_evaluator, mps_context=search_context,
+                    pool_live_genomes=roots,
+                )
+                for index, key in enumerate(unseen_keys):
+                    search_score_cache[key] = new_scores[:, index].copy()
+            search_scores = np.column_stack([search_score_cache[key] for key in keys])
+            inference_cache_hits += len(flat) - len(unseen_candidates)
             executed_rounds += 1
-            total_candidate_evaluations += len(flat)
-            total_model_jobs += len(search_genomes) * len(flat)
+            total_candidate_evaluations += len(unseen_candidates)
+            total_model_jobs += len(search_genomes) * len(unseen_candidates)
             if backend == "mps" and search_context is not None:
-                total_kernel_jobs += len(search_context[0]) * len(flat)
+                total_kernel_jobs += len(search_context[0]) * len(unseen_candidates)
             else:
-                total_kernel_jobs += len(search_genomes) * len(flat)
+                total_kernel_jobs += len(search_genomes) * len(unseen_candidates)
 
             next_pops: List[List[List[int]]] = []
             offset = 0
@@ -7343,7 +6530,6 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
             final_context = _prepare_inference_mps_context(genomes, mps_evaluator, roots)
         final_scores = evaluate_inference_candidates(
             genomes, final_flat, backend, max_output,
-            hidden_rewrite_phases=hidden_rewrite_phases,
             mps_evaluator=mps_evaluator, mps_context=final_context,
             pool_live_genomes=roots,
         )
@@ -7447,6 +6633,7 @@ def run_string_inference_ga(genomes: Sequence[Genome], inference_set: RollingInf
         "model_jobs": int(total_model_jobs),
         "kernel_jobs": int(total_kernel_jobs),
         "search_rounds": int(executed_rounds),
+        "inference_cache_hits": int(inference_cache_hits),
         "equivalent_work": float(equiv),
         "active_cases": int(len(cases)),
         "candidate_population": int(psize),
@@ -7618,7 +6805,7 @@ def select_outer_elites(population: Sequence[Genome], elite_count: int) -> List[
 
 def save_genome(path: str, genome: Genome, generation: int) -> None:
     payload = {
-        "program_version": 64,
+        "program_version": 65,
         "generation": generation,
         "fitness": genome.fitness,
         "case_scores": genome.case_scores,
@@ -7760,9 +6947,8 @@ def save_checkpoint(path: str, next_generation: int, population: Sequence[Genome
     if not path:
         return
     arrays: dict = {
-        # v2 distinguishes the new semantic -2/-3 pattern tokens from the old
-        # revisions where every negative pattern spelling meant plain wildcard.
-        "version": np.asarray([2], dtype=np.int32),
+        # v3: network-only semantics; no hidden memory opcodes.
+        "version": np.asarray([3], dtype=np.int32),
         "next_generation": np.asarray([int(next_generation)], dtype=np.int64),
         "history": _bytes_array(list(history)),
         "py_rng": _bytes_array(random.getstate()),
@@ -7779,7 +6965,6 @@ def save_checkpoint(path: str, next_generation: int, population: Sequence[Genome
             "samples": args.samples,
             "max_noise": args.max_noise,
             "max_output": args.max_output,
-            "hidden_rewrite_phases": int(args.hidden_rewrite_phases),
         }),
     }
     _pack_genome_group(population, "pop_", arrays)
@@ -7804,7 +6989,7 @@ def save_checkpoint(path: str, next_generation: int, population: Sequence[Genome
 def load_checkpoint(path: str, sampler: CorpusSampler):
     with np.load(path, allow_pickle=False) as z:
         version = int(z["version"][0])
-        if version not in (1, 2):
+        if version not in (1, 2, 3):
             raise ValueError(f"unsupported checkpoint version {version}")
         next_generation = int(z["next_generation"][0])
         population = _unpack_genome_group(z, "pop_")
@@ -7823,17 +7008,11 @@ def load_checkpoint(path: str, sampler: CorpusSampler):
         sampler._byte_buffer = np.asarray(z["sampler_byte_buffer"], dtype=np.uint16).copy()
         sampler._byte_pos = int(z["sampler_byte_pos"][0])
         config = dict(_array_object(z["config"]))
-    if version == 1:
-        # Pre-v64 pattern values -1..-16 were semantically indistinguishable.
-        # Convert them all to ordinary -1 before enabling -2/-3 side effects so
-        # resuming an old run does not silently reinterpret existing genomes.
-        groups = [population, best_group, hof_group]
-        for group in groups:
-            for g in group:
-                for r in g.rules:
-                    if any(int(v) < 0 for v in r.pattern):
-                        r.pattern[:] = [-1 if int(v) < 0 else int(v) for v in r.pattern]
-                        invalidate_rule_pack_cache(r)
+    # All legacy -2/-3/etc. pattern spellings are ordinary wildcards. Remove
+    # hidden-list opcodes from old v2 checkpoints before any evaluation.
+    for group in (population, best_group, hof_group):
+        for g in group:
+            stabilize_genome_nonexpanding(g, sampler)
     random.setstate(py_rng)
     np.random.set_state(np_rng)
     if torch is not None and torch_rng.size:
@@ -8082,13 +7261,6 @@ def evolve(args) -> Genome:
             raise ValueError("checkpoint contains an empty population")
         args.population = len(population)
         args.rules = len(population[0].rules)
-        saved_hidden_phases = cfg.get("hidden_rewrite_phases")
-        if saved_hidden_phases is not None and int(saved_hidden_phases) != int(args.hidden_rewrite_phases):
-            print(
-                f"init: warning: checkpoint used hidden_rewrite_phases={int(saved_hidden_phases)} "
-                f"but this run requests {int(args.hidden_rewrite_phases)}; trajectory semantics will change",
-                flush=True,
-            )
         migrated = sum(stabilize_genome_nonexpanding(g, sampler) for g in population)
         migrated_best = 0
         if best_ever is not None:
@@ -8191,7 +7363,6 @@ def evolve(args) -> Genome:
             pool_max_rules=args.mps_rule_pool_max,
             pool_gc_ratio=args.mps_rule_pool_gc_ratio,
             pool_gc_min_dead=args.mps_rule_pool_gc_min_dead,
-            hidden_rewrite_phases=args.hidden_rewrite_phases,
         )
         print(f"init: MPS evaluator ready ({time.perf_counter() - t_stage:.2f}s)", flush=True)
 
@@ -8220,6 +7391,10 @@ def evolve(args) -> Genome:
                         f"serial {old_serial}->{new_serial}...", flush=True,
                     )
         inputs, target, case_ids, sample_ids = rolling_dataset.flatten()
+        # The all-sample rank graph depends only on the current dataset; it is
+        # identical for every genome in this generation. Build it just once.
+        rank_pairs = (case_adjacent_rank_pairs(target, case_ids)
+                      if args.readout_mode == "pairwise-all" else None)
         current_case_serials = rolling_dataset.serials
         evaluated_hof = random.sample(hof_archive, min(len(hof_archive), max(0, args.hof_eval)))
         hof_genomes = [e.genome for e in evaluated_hof]
@@ -8305,6 +7480,7 @@ def evolve(args) -> Genome:
                     score_genome_features(
                         genome, x, baseline, target, case_ids, sample_ids, args.ridge_lambda,
                         args.readout_mode, args.rank_max_features,
+                        rank_pairs=rank_pairs,
                     )
                     genome._eval_case_serials = tuple(current_case_serials)
                     if args.progress and ((pos + 1) % max(1, total_eval // 20) == 0 or pos + 1 == total_eval):
@@ -8340,7 +7516,7 @@ def evolve(args) -> Genome:
                 evaluate_genome(
                     genome, inputs, target, case_ids, sample_ids,
                     args.backend, args.ridge_lambda, args.max_output, args.readout_mode,
-                    args.rank_max_features, args.hidden_rewrite_phases,
+                    args.rank_max_features, rank_pairs=rank_pairs,
                 )
                 genome._eval_case_serials = tuple(current_case_serials)
                 if args.progress and ((i + 1) % eval_tick == 0 or i + 1 == total_eval):
@@ -8422,8 +7598,7 @@ def evolve(args) -> Genome:
             inference_stats = run_string_inference_ga(
                 population, inference_set, sampler, inf_pop, inf_gens,
                 args.inference_ensemble, args.backend, args.max_output,
-                hidden_rewrite_phases=args.hidden_rewrite_phases,
-                mps_evaluator=mps_evaluator, restore_inputs=inputs,
+                    mps_evaluator=mps_evaluator, restore_inputs=inputs,
                 case_count=inf_cases, pool_live_genomes=live_pool_roots,
                 elite_count=args.inference_elites,
             )
@@ -8533,6 +7708,7 @@ def evolve(args) -> Genome:
             "inference_selected_change_rate": float(inference_stats.get("selected_change_rate", float("nan"))),
             "inference_seconds": float(inference_stats.get("seconds", 0.0)),
             "inference_evaluations": int(inference_stats.get("evaluations", 0)),
+            "inference_cache_hits": int(inference_stats.get("inference_cache_hits", 0)),
             "inference_model_jobs": int(inference_stats.get("model_jobs", 0)),
             "inference_kernel_jobs": int(inference_stats.get("kernel_jobs", 0)),
             "inference_equivalent_work": float(inference_stats.get("equivalent_work", 0.0)),
@@ -8632,6 +7808,7 @@ def evolve(args) -> Genome:
             f"infPlan={inf_cases}x{inf_pop}x{inf_gens}/"
             f"{int(inference_stats.get('search_rounds', 0))}r "
             f"infVote={int(inference_stats.get('ensemble_members', 0))} "
+            f"infCache={int(inference_stats.get('inference_cache_hits', 0))} "
             f"infEq={float(inference_stats.get('equivalent_work', 0.0)):.1f}/{inf_work} "
             f"active={active}/{len(champion.rules)} expand={expanding_rules} "
             f"stag={stagnation} roll={dataset_epoch} overlap={overlap_cases}/{len(current_case_serials)} "
@@ -8887,7 +8064,7 @@ def self_test() -> None:
     random.seed(1)
     np.random.seed(1)
     sampler = CorpusSampler([b"abc abc xyz\n", b"hello world\n"])
-    # a * b -> capture; repeated sweep should fire once then fixed-point.
+    # a * b -> capture in one ordered sweep.
     g = Genome([Rule([ord("a"), -1, ord("b")], [-1])])
     inputs = [list(b"a12b"), list(b"aXYb")]
     x, baseline, stats, out = trajectory_features_cpu(inputs, g, 128)
@@ -8999,11 +8176,6 @@ def parse_args():
     ap.add_argument("--no-inference", action="store_true", help="disable v60 string inference and reduce Pareto selection to Spearman")
     ap.add_argument("--population", type=int, default=450)
     ap.add_argument("--rules", type=int, default=1500)
-    ap.add_argument(
-        "--hidden-rewrite-phases", type=int, default=HIDDEN_REWRITE_DEFAULT_PHASES,
-        help=("hidden-memory rewrite checkpoints per full rule sweep; 1=end only, "
-              "2=halfway+end, n=ceil(k*rules/n) boundaries"),
-    )
     ap.add_argument("--elites", type=int, default=40, help="outer Pareto elites copied structurally unchanged into the next generation")
     ap.add_argument("--hof-size", type=int, default=16384, help="rolling elite-of-elites archive capacity")
     ap.add_argument("--hof-eval", type=int, default=128, help="random archive evaluation budget per generation; 0 disables archive evaluation")

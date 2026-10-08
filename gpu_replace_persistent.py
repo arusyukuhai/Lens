@@ -112,10 +112,12 @@ def _compile_pattern(pattern: Sequence[int]) -> _CompiledPattern:
     wc = 0
     for raw in pattern:
         x = int(raw)
-        if x <= -1:
+        if x == -1:
             parts.append(tuple(current))
             current.clear()
             wc += 1
+        elif x < -1:
+            raise ValueError(f"invalid pattern token {x}: only -1 is a wildcard")
         else:
             current.append(x)
     parts.append(tuple(current))
@@ -864,7 +866,7 @@ def replace_gpu(
     """GPU-oriented equivalent of replaceSeqCompiled/replaceSeq.
 
     Pattern semantics:
-      * every value <= -1 in `pattern` is a wildcard, numbered by occurrence.
+      * only -1 in `pattern` is a wildcard, numbered by occurrence.
       * interior wildcards use the shortest following literal occurrence.
       * a trailing wildcard captures the entire remaining suffix.
       * all-wildcard / empty / >16-wildcard patterns do not fire.
@@ -954,9 +956,9 @@ if __name__ == "__main__":
 
     chk([97, 120, 120, 98], [97, -1, 98], [-1], [120, 120])
     chk([122, 122, 97, 113], [-1, 97], [-1], [122, 122, 113])
-    chk([97, 49, 98, 50, 99], [97, -1, 98, -2, 99], [-2, -1], [50, 49])
+    chk([97, 49, 98, 50, 99], [97, -1, 98, -1, 99], [-2, -1], [50, 49])
     chk([97, 49, 50], [97, -1], [-1], [49, 50])
-    chk([49, 50, 97], [-1, -2, 97], [-1, 99, -2], [99, 49, 50])
+    chk([49, 50, 97], [-1, -1, 97], [-1, 99, -2], [99, 49, 50])
     chk([97, 49, 98, 97, 50, 98], [97, -1, 98], [-1], [49, 50])
 
     arithmetic_input = [97, 2, 4, 8, 98]
@@ -1009,9 +1011,9 @@ if __name__ == "__main__":
     corpus = [
         ([97, 120, 120, 98], [97, -1, 98], [-1]),
         ([122, 122, 97, 113], [-1, 97], [-1]),
-        ([97, 49, 98, 50, 99], [97, -1, 98, -2, 99], [-2, -1]),
+        ([97, 49, 98, 50, 99], [97, -1, 98, -1, 99], [-2, -1]),
         ([97, 49, 50], [97, -1], [-1]),
-        ([49, 50, 97], [-1, -2, 97], [-1, 99, -2]),
+        ([49, 50, 97], [-1, -1, 97], [-1, 99, -2]),
         (arithmetic_input, arithmetic_pattern, [-16, -32, -48, -64, -80, -96]),
     ]
     bb = replace_batch_gpu(
