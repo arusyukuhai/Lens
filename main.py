@@ -1180,7 +1180,7 @@ def plot_history(history: Sequence[dict], prefix: str, window: int) -> None:
     ax.plot(x,y,alpha=.5,label='Generation best next-byte accuracy')
     ax.plot(x,avg,label='Moving average')
     ax.plot(x,np.maximum.accumulate(y),label='Best observed')
-    ax.set(xlabel='Generation',ylabel='Teacher-forced next-byte accuracy',ylim=(0,1),title='Lens autoregressive training')
+    ax.set(xlabel='Generation',ylabel='Teacher-forced next-byte accuracy',title='Lens autoregressive training')
     ax.legend(); fig.tight_layout()
     out=Path(prefix+'_accuracy.png')
     out.parent.mkdir(parents=True,exist_ok=True)
@@ -1448,10 +1448,10 @@ def parse_args():
     ap.add_argument('--local-corpus',default='github-code.txt')
     ap.add_argument('--corpus-chunks',type=int,default=10000,help='maximum ===SPLIT=== separated chunks to load (not a state memory cap)')
     ap.add_argument('--min-chunk',type=int,default=2)
-    ap.add_argument('--max-chunk',type=int,default=1500,
+    ap.add_argument('--max-chunk',type=int,default=3500,
                     help='exclusive maximum chunk length in bytes: skip entire chunks of 1500 bytes or more (never crop)')
-    ap.add_argument('--cases',type=int,default=8,help='whole-text examples evaluated per generation')
-    ap.add_argument('--case-rotate-every',type=int,default=3,
+    ap.add_argument('--cases',type=int,default=4,help='whole-text examples evaluated per generation')
+    ap.add_argument('--case-rotate-every',type=int,default=1,
                     help='rotate exactly one case per N generations (round-robin; default 3)')
     ap.add_argument('--population',type=int,default=450)
     ap.add_argument('--rules',type=int,default=1500)
@@ -1481,7 +1481,7 @@ def parse_args():
     ap.add_argument('--save',default='best_lens_ar.json')
     ap.add_argument('--history-csv',default='lens_ar_history.csv')
     ap.add_argument('--plot-prefix',default='lens_ar')
-    ap.add_argument('--plot-window',type=int,default=30)
+    ap.add_argument('--plot-window',type=int,default=300)
     ap.add_argument('--plot-every',type=int,default=1)
     ap.add_argument('--no-plot',action='store_true')
     ap.add_argument('--generate',default='',help='saved autoregressive model; generate without teacher forcing')
