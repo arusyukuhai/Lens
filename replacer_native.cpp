@@ -124,6 +124,12 @@ Model compile_model(const int16_t *pat, const int16_t *rep,
         for (int k=0;k<r.qn;++k) {
             int op=r.q[k];
             if (op>=0) { ++literal_output; continue; }
+            if (op<=-112 && op>=-255) {
+                // Binary op length may vary from zero to la+lb-1;
+                // always use the dynamically growing output path.
+                r.can_expand=true;
+                continue;
+            }
             int ci=(op >= -15 ? -op - 1 : ((-op-16)%16));
             if (ci>=0 && ci<16) {
                 if (seen[ci]) r.can_expand=true;
@@ -155,7 +161,98 @@ Model compile_model(const int16_t *pat, const int16_t *rep,
     return model;
 }
 
-int run(const Model &m, const token *txt, int L) {
+// Nine binary operator families, capture pairs from $1..$4. Opcode
+// -(112 + 16*kind + 4*left + right), with zero-based capture indices.
+// Exactly mirrors main.py:_emit_binary; never modifies the source state.
+inline void emit_binary(std::vector<token>& dst, const token* src,
+                        const Capture& ca, const Capture& cb,
+                        const Model& model, int kind) {
+    const token* a=src+ca.start;
+    const token* b=src+cb.start;
+    const int na=ca.length, nb=cb.length;
+    if (kind==0 || kind==1 || kind==8) {
+        std::array<bool,256> members{}, seen{};
+        for (int i=0;i<nb;++i) members[b[i]]=true;
+        for (int i=0;i<na;++i) {
+            token v=a[i];
+            if (kind==8) {
+                if (members[v]) dst.push_back(v);
+            } else if (members[v]==(kind==0) && !seen[v]) {
+                seen[v]=true;
+                dst.push_back(v);
+            }
+        }
+        return;
+    }
+    if (kind==5) {
+        bool equal=(na==nb);
+        if (equal && na) equal=std::memcmp(a,b,static_cast<size_t>(na))==0;
+        dst.push_back(equal?1:0);  // raw boolean byte, not encoded by LUT
+        return;
+    }
+    if (kind==6) {
+        // O(na+nb) KMP suffix/prefix overlap; emit a + b[overlap:].
+        if (nb==0) {dst.insert(dst.end(),a,a+na);return;}
+        std::vector<int> pi(static_cast<size_t>(nb),0);
+        for (int i=1,j=0;i<nb;++i) {
+            while (j && b[i]!=b[j]) j=pi[j-1];
+            if (b[i]==b[j]) ++j;
+            pi[i]=j;
+        }
+        int k=0;
+        for (int i=0;i<na;++i) {
+            while (k && (k==nb || b[k]!=a[i])) k=pi[k-1];
+            if (k<nb && b[k]==a[i]) ++k;
+        }
+        dst.insert(dst.end(),a,a+na);
+        dst.insert(dst.end(),b+k,b+nb);
+        return;
+    }
+    if (kind==3 || kind==4) {
+        for (int i=0;i<std::min(na,nb);++i) {
+            const int x=model.lut[a[i]], y=model.lut[b[i]];
+            dst.push_back(model.inverse[(kind==3 ? x+y : x^y)&255]);
+        }
+        return;
+    }
+    if (na==0 || nb==0) return;
+    if (static_cast<size_t>(na) + static_cast<size_t>(nb) >
+        static_cast<size_t>(std::numeric_limits<int>::max()))
+        throw std::length_error("binary operator output exceeds address range");
+    std::vector<token> result(static_cast<size_t>(na)+nb-1,0);
+    if (kind==2 || kind==7) {
+        for (int i=0;i<na;++i) {
+            const int x=model.lut[a[i]];
+            for (int j=0;j<nb;++j) {
+                int k=(kind==2 ? i+j : i-j+nb-1);
+                result[k]=static_cast<token>((int(result[k])+x*int(model.lut[b[j]]))&255);
+            }
+        }
+    } else {
+        throw std::logic_error("invalid binary operator");
+    }
+    for (token v:result) dst.push_back(model.inverse[v]);
+}
+
+struct TraceSink {
+    int rule_index, max_samples, max_bytes, count = 0;
+    token *before, *after;
+    int32_t *before_lengths, *after_lengths;
+};
+
+inline void capture_snapshot(const std::vector<token> &buffer, int n,
+                             TraceSink &sink, bool before) {
+    if (sink.count >= sink.max_samples) return;
+    const int slot=sink.count;
+    const int copied=std::min(n,sink.max_bytes);
+    // A single contiguous tail window contains the latest recurrent context.
+    const token *src=buffer.data() + (n-copied);
+    token *dst=(before?sink.before:sink.after) + size_t(slot)*sink.max_bytes;
+    if (copied) std::memcpy(dst,src,size_t(copied));
+    (before?sink.before_lengths:sink.after_lengths)[slot]=copied;
+}
+
+int run(const Model &m, const token *txt, int L, TraceSink *trace=nullptr) {
     if (L < 2) return 0;
     // No arbitrary recurrent-state limit. Capacity grows only on demand.
     std::vector<token> buffer_a(static_cast<size_t>(L+1));
@@ -166,8 +263,15 @@ int run(const Model &m, const token *txt, int L) {
     static thread_local ThreadMarks marks;
     uint32_t epoch = marks.epoch;
     bool dirty = true;
+    const int trace_total = trace ? std::min(trace->max_samples, L-1) : 0;
     for (int t = 1; t < L; ++t) {
-        for (const Rule &r : m.rules) {
+        const int next_trace_step = (trace && trace->count < trace_total)
+            ? (1 + (trace_total<=1 ? 0 : trace->count*(L-2)/(trace_total-1))) : -1;
+        const bool trace_here = (trace && t==next_trace_step);
+        for (size_t ri=0; ri<m.rules.size(); ++ri) {
+            const Rule &r=m.rules[ri];
+            if (trace_here && static_cast<int>(ri)==trace->rule_index)
+                capture_snapshot(*a,n,*trace,true);
             if (n == 0 || r.pn == 0 || r.always_identity) continue;
             if (dirty) {
                 epoch=marks.next_epoch();
@@ -263,6 +367,14 @@ int run(const Model &m, const token *txt, int L) {
                         int op = r.q[j];
                         if (op>=0) { b->push_back(static_cast<token>(op)); continue; }
                         if (r.wc==0) continue;
+                        if (op<=-112 && op>=-255) {
+                            const int code=-op-112;
+                            const int kind=code/16;
+                            const int left=(code%16)/4, right=code%4;
+                            if (left<r.wc && right<r.wc)
+                                emit_binary(*b,src,captures[left],captures[right],m,kind);
+                            continue;
+                        }
                         int kind=0,ci=0;
                         if (op>=-15) { kind=0;ci=-op-1; }
                         else if (op>=-31) { kind=2;ci=-op-16; }
@@ -297,6 +409,10 @@ int run(const Model &m, const token *txt, int L) {
                 std::swap(a,b);
                 dirty=changed;
             }
+        }
+        if (trace_here) {
+            capture_snapshot(*a,n,*trace,false);
+            ++trace->count;
         }
         if (n==0) {
             if (a->empty()) a->resize(1);
@@ -388,4 +504,42 @@ extern "C" int lens_eval_cpu_progress(
     int T, int32_t *out, int workers, void (*on_genome_done)(int)) {
     return lens_eval_cpu_impl(patterns, replacements, po, ro, lut, G, R, stride,
                               texts, offsets, T, out, workers, on_genome_done);
+}
+
+// Evaluate one unchanged genome AND collect the real recurrent state immediately
+// before a selected rule and after the whole sweep. Samples are bounded windows,
+// but evaluation itself never truncates any state.
+extern "C" int lens_trace_cpu(
+    const int16_t *patterns, const int16_t *replacements,
+    const int32_t *po, const int32_t *ro, const uint8_t *lut,
+    int R, const uint8_t *texts, const int32_t *offsets, int T,
+    int trace_rule, int sample_count, int sample_bytes,
+    uint8_t *before, uint8_t *after, int32_t *before_lengths,
+    int32_t *after_lengths, int32_t *scores) {
+    if (!patterns || !replacements || !po || !ro || !lut || !texts || !offsets ||
+        !before || !after || !before_lengths || !after_lengths || !scores ||
+        R < 0 || T < 0 || trace_rule < 0 || trace_rule >= R ||
+        sample_count < 1 || sample_bytes < 1) return -1;
+    try {
+        std::array<uint32_t,256> freq_bytes{};
+        std::array<uint32_t,65536> freq_pairs{};
+        for (int t=0;t<T;++t) {
+            for (int i=offsets[t];i<offsets[t+1];++i) {
+                const int z=texts[i]; ++freq_bytes[z];
+                if (i+1<offsets[t+1]) ++freq_pairs[(z<<8)|texts[i+1]];
+            }
+        }
+        Model m=compile_model(patterns,replacements,po,ro,lut,R,freq_bytes,freq_pairs);
+        for (int i=0;i<T;++i) {
+            const size_t byteoff=size_t(i)*sample_count*sample_bytes;
+            const size_t lenoff=size_t(i)*sample_count;
+            TraceSink trace{trace_rule,sample_count,sample_bytes,0,
+                before+byteoff,after+byteoff,
+                before_lengths+lenoff,after_lengths+lenoff};
+            scores[i]=run(m,texts+offsets[i],offsets[i+1]-offsets[i],&trace);
+        }
+        return 0;
+    } catch (const std::bad_alloc &) { return -3; }
+      catch (const std::length_error &) { return -4; }
+      catch (const std::exception &) { return -5; }
 }

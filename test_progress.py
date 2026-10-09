@@ -66,7 +66,10 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(progress.current, len(gs))
 
     def test_mocked_mps_reports_whole_finished_batches(self):
-        gs = [m.new_genome(10, self.rng, self.corpus, self.bigrams) for _ in range(7)]
+        # Exercise the MPS batch path with an explicitly compatible population.
+        # Freshly seeded genomes may contain newly supported CPU-only binary ops.
+        gs = [m.Genome([m.Rule([65, 0], [65, 66 + i]) for _ in range(10)])
+              for i in range(7)]
         progress = RecordingProgress()
         def fake_mps(models, samples, rules, batch_size, on_batch_done=None):
             results = np.array([[m.autoregressive_rollout(g, s)[0] for s in samples]
@@ -88,17 +91,17 @@ class ProgressTests(unittest.TestCase):
                 model = td / f'{label}_best.json'
                 cmd = [sys.executable, str(Path(m.__file__)), '--backend', 'cpu',
                        '--local-corpus', str(Path(m.__file__).with_name('example_corpus.txt')),
-                       '--population', '13', '--rules', '12', '--cases', '3',
+                       '--rules', '12', '--cases', '3',
                        '--generations', '3', '--seed', '73', '--no-plot',
                        '--checkpoint', str(td / f'{label}.pkl'),
                        '--history-csv', str(td / f'{label}.csv'),
                        '--save', str(model)] + extra
                 result = subprocess.run(cmd, cwd=td, capture_output=True, text=True,check=True)
                 if label == 'on':
-                    self.assertIn('評価/cpu', result.stderr)
-                    self.assertIn('次世代作成', result.stderr)
+                    self.assertIn('Lens greedy n-gram', result.stderr)
+                    self.assertNotIn('次世代作成', result.stderr)
                 else:
-                    self.assertNotIn('評価/cpu', result.stderr)
+                    self.assertNotIn('Lens greedy n-gram', result.stderr)
             with (td / 'on_best.json').open() as f:
                 on = json.load(f)
             with (td / 'off_best.json').open() as f:

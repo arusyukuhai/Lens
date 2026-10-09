@@ -23,7 +23,7 @@ class ReplacerAutoregressiveTests(unittest.TestCase):
             self.assertTrue(all(m.is_valid_rule(r) for r in g.rules))
             for r in g.rules:
                 self.assertTrue(all(v==-1 or 0<=v<256 for v in r.pattern))
-                self.assertTrue(all(v>=-111 and v<=255 for v in r.replacement))
+                self.assertTrue(all(v>=m.BINARY_OP_MIN and v<=255 for v in r.replacement))
 
     def test_operator_lut_only(self):
         lut=list(range(256));lut[1],lut[2]=2,1

@@ -1,6 +1,22 @@
+# Training update (single-genome n-gram greedy)
+
+The old GA training loop has been replaced by single-rule greedy updates.
+**Please read [README_GREEDY_NGRAM.md](README_GREEDY_NGRAM.md) first.**
+The original README is retained below for architecture and historical details.
+
+---
+
 # Lens v14 — variable-length Replacer + refined GA / three-parent diff3
 
 This build combines v13's improved mutation / crossover and v12's one-case-at-a-time rotation with a **variable-length rule and recurrent-state implementation**.
+
+## Binary `$1`..`$4` operators (new in this patch)
+
+See **[README_BINARY_OPS.md](README_BINARY_OPS.md)** for opcode layouts,
+semantics, mutation support and runtime costs. Nine operations now occupy
+`-112..-255` without changing the old unary opcodes or saved-model format.
+Python and native C++ evaluate all nine; Metal selects native CPU fallback when
+any binary operator is present.
 
 ## What changed
 
@@ -14,7 +30,7 @@ This build combines v13's improved mutation / crossover and v12's one-case-at-a-
 
 ## Preserved design
 
-- 450 rules per genome by default, 450 population members, byte tokens 0..255 and reversible LUT within `sort/+1/-1/*2//2` only.
+- 450 rules per genome by default, 450 population members, byte tokens 0..255 and reversible LUT within `sort/+1/-1/*2//2` and numeric binary operators.
 - One ordered rule sweep per predicted byte; the resulting state is preserved, teacher-forced at the final prediction slot, then appended with a fresh slot.
 - No fixed recurrent-state/context length, no probability distribution, and no automatic truncation of the internal state.
 - `===SPLIT===` chunk delimiter; complete chunks of **1500 bytes or longer** are skipped (configurable with `--max-chunk`).

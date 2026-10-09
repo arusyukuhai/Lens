@@ -126,7 +126,7 @@ class GeneticInvariantTests(unittest.TestCase):
         for g,original in zip((a,b,c),initial):
             self.assertEqual([m._rule_signature(r) for r in g.rules],original)
 
-    def test_checkpoint_restart_diff3(self):
+    def test_checkpoint_restart_greedy(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td)
             corpus=root/'data.txt'
@@ -134,9 +134,8 @@ class GeneticInvariantTests(unittest.TestCase):
             def run(tag,until,load=None):
                 path=str(root/f'{tag}.pkl')
                 cmd=[sys.executable,str(Path(m.__file__)),'--backend','cpu',
-                     '--local-corpus',str(corpus),'--population','12','--rules','9',
+                     '--local-corpus',str(corpus),'--rules','9',
                      '--cases','2','--case-rotate-every','2','--generations',str(until),
-                     '--diff3-rate','1','--crossover-rate','1',
                      '--cpu-workers','2','--no-tqdm','--no-plot','--seed','123',
                      '--checkpoint',path,'--checkpoint-every','2',
                      '--save',str(root/f'{tag}.json'),
