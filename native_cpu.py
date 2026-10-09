@@ -58,10 +58,6 @@ def _get_library():
     lib.lens_eval_cpu.restype=ctypes.c_int
     lib.lens_eval_cpu_progress.argtypes=lib.lens_eval_cpu.argtypes + [_PROGRESS_CALLBACK]
     lib.lens_eval_cpu_progress.restype=ctypes.c_int
-    lib.lens_trace_cpu.argtypes=[arr16,arr16,arr32,arr32,arr8,
-        ctypes.c_int,arr8,arr32,ctypes.c_int,ctypes.c_int,ctypes.c_int,
-        ctypes.c_int,arr8,arr8,arr32,arr32,arr32]
-    lib.lens_trace_cpu.restype=ctypes.c_int
     _LIBRARY=lib
     return lib
 
@@ -116,46 +112,3 @@ def evaluate_cpu(genomes, texts, rules: int, workers: int = 0,
     if err:
         raise RuntimeError(f'Native CPU evaluator returned {err}')
     return out
-
-
-def trace_cpu(genome, texts, rule_index: int, samples: int = 8,
-              max_bytes: int = 512):
-    """Return (real pre-rule windows, final-sweep windows, per-text hit counts).
-
-    Uses one native evaluation of the unchanged genome; all recurrent states
-    remain unbounded. Only observational snapshots are length-limited.
-    """
-    if not 0 <= rule_index < len(genome.rules):
-        raise ValueError('invalid rule index')
-    if samples < 1 or max_bytes < 1:
-        raise ValueError('samples and max_bytes must be positive')
-    lib=_get_library()
-    R=len(genome.rules); T=len(texts)
-    pp=[v for r in genome.rules for v in r.pattern]
-    qq=[v for r in genome.rules for v in r.replacement]
-    p=np.asarray(pp, dtype=np.int16)
-    q=np.asarray(qq, dtype=np.int16)
-    po=np.zeros(R+1,dtype=np.int32)
-    ro=np.zeros(R+1,dtype=np.int32)
-    for i,r in enumerate(genome.rules):
-        po[i+1]=po[i]+len(r.pattern)
-        ro[i+1]=ro[i]+len(r.replacement)
-    lut=np.asarray(genome.embedding,dtype=np.uint8)
-    packed=np.frombuffer(b''.join(bytes(t) for t in texts),dtype=np.uint8).copy()
-    offsets=np.zeros(T+1,dtype=np.int32)
-    for i,t in enumerate(texts):
-        offsets[i+1]=offsets[i]+len(t)
-    before=np.zeros((T,samples,max_bytes),dtype=np.uint8)
-    after=np.zeros_like(before)
-    bl=np.zeros((T,samples),dtype=np.int32)
-    al=np.zeros_like(bl)
-    scores=np.zeros(T,dtype=np.int32)
-    err=lib.lens_trace_cpu(p,q,po,ro,lut,R,packed,offsets,T,
-                           rule_index,samples,max_bytes,before,after,bl,al,scores)
-    if err:
-        raise RuntimeError(f'native trace failed: {err}')
-    pre=[bytes(before[i,j,:bl[i,j]]) for i in range(T) for j in range(samples)
-         if bl[i,j]>0]
-    post=[bytes(after[i,j,:al[i,j]]) for i in range(T) for j in range(samples)
-          if al[i,j]>0]
-    return pre,post,scores

@@ -1,11 +1,3 @@
-# Training update (single-genome n-gram greedy)
-
-The old GA training loop has been replaced by single-rule greedy updates.
-**Please read [README_GREEDY_NGRAM.md](README_GREEDY_NGRAM.md) first.**
-The original README is retained below for architecture and historical details.
-
----
-
 # Lens v14 — variable-length Replacer + refined GA / three-parent diff3
 
 This build combines v13's improved mutation / crossover and v12's one-case-at-a-time rotation with a **variable-length rule and recurrent-state implementation**.

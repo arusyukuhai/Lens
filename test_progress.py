@@ -91,17 +91,17 @@ class ProgressTests(unittest.TestCase):
                 model = td / f'{label}_best.json'
                 cmd = [sys.executable, str(Path(m.__file__)), '--backend', 'cpu',
                        '--local-corpus', str(Path(m.__file__).with_name('example_corpus.txt')),
-                       '--rules', '12', '--cases', '3',
+                       '--population', '13', '--rules', '12', '--cases', '3',
                        '--generations', '3', '--seed', '73', '--no-plot',
                        '--checkpoint', str(td / f'{label}.pkl'),
                        '--history-csv', str(td / f'{label}.csv'),
                        '--save', str(model)] + extra
                 result = subprocess.run(cmd, cwd=td, capture_output=True, text=True,check=True)
                 if label == 'on':
-                    self.assertIn('Lens greedy n-gram', result.stderr)
-                    self.assertNotIn('次世代作成', result.stderr)
+                    self.assertIn('評価/cpu', result.stderr)
+                    self.assertIn('次世代作成', result.stderr)
                 else:
-                    self.assertNotIn('Lens greedy n-gram', result.stderr)
+                    self.assertNotIn('評価/cpu', result.stderr)
             with (td / 'on_best.json').open() as f:
                 on = json.load(f)
             with (td / 'off_best.json').open() as f:

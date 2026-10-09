@@ -234,25 +234,7 @@ inline void emit_binary(std::vector<token>& dst, const token* src,
     for (token v:result) dst.push_back(model.inverse[v]);
 }
 
-struct TraceSink {
-    int rule_index, max_samples, max_bytes, count = 0;
-    token *before, *after;
-    int32_t *before_lengths, *after_lengths;
-};
-
-inline void capture_snapshot(const std::vector<token> &buffer, int n,
-                             TraceSink &sink, bool before) {
-    if (sink.count >= sink.max_samples) return;
-    const int slot=sink.count;
-    const int copied=std::min(n,sink.max_bytes);
-    // A single contiguous tail window contains the latest recurrent context.
-    const token *src=buffer.data() + (n-copied);
-    token *dst=(before?sink.before:sink.after) + size_t(slot)*sink.max_bytes;
-    if (copied) std::memcpy(dst,src,size_t(copied));
-    (before?sink.before_lengths:sink.after_lengths)[slot]=copied;
-}
-
-int run(const Model &m, const token *txt, int L, TraceSink *trace=nullptr) {
+int run(const Model &m, const token *txt, int L) {
     if (L < 2) return 0;
     // No arbitrary recurrent-state limit. Capacity grows only on demand.
     std::vector<token> buffer_a(static_cast<size_t>(L+1));
@@ -263,15 +245,8 @@ int run(const Model &m, const token *txt, int L, TraceSink *trace=nullptr) {
     static thread_local ThreadMarks marks;
     uint32_t epoch = marks.epoch;
     bool dirty = true;
-    const int trace_total = trace ? std::min(trace->max_samples, L-1) : 0;
     for (int t = 1; t < L; ++t) {
-        const int next_trace_step = (trace && trace->count < trace_total)
-            ? (1 + (trace_total<=1 ? 0 : trace->count*(L-2)/(trace_total-1))) : -1;
-        const bool trace_here = (trace && t==next_trace_step);
-        for (size_t ri=0; ri<m.rules.size(); ++ri) {
-            const Rule &r=m.rules[ri];
-            if (trace_here && static_cast<int>(ri)==trace->rule_index)
-                capture_snapshot(*a,n,*trace,true);
+        for (const Rule &r : m.rules) {
             if (n == 0 || r.pn == 0 || r.always_identity) continue;
             if (dirty) {
                 epoch=marks.next_epoch();
@@ -410,10 +385,6 @@ int run(const Model &m, const token *txt, int L, TraceSink *trace=nullptr) {
                 dirty=changed;
             }
         }
-        if (trace_here) {
-            capture_snapshot(*a,n,*trace,false);
-            ++trace->count;
-        }
         if (n==0) {
             if (a->empty()) a->resize(1);
             (*a)[0]=0;n=1;
@@ -504,42 +475,4 @@ extern "C" int lens_eval_cpu_progress(
     int T, int32_t *out, int workers, void (*on_genome_done)(int)) {
     return lens_eval_cpu_impl(patterns, replacements, po, ro, lut, G, R, stride,
                               texts, offsets, T, out, workers, on_genome_done);
-}
-
-// Evaluate one unchanged genome AND collect the real recurrent state immediately
-// before a selected rule and after the whole sweep. Samples are bounded windows,
-// but evaluation itself never truncates any state.
-extern "C" int lens_trace_cpu(
-    const int16_t *patterns, const int16_t *replacements,
-    const int32_t *po, const int32_t *ro, const uint8_t *lut,
-    int R, const uint8_t *texts, const int32_t *offsets, int T,
-    int trace_rule, int sample_count, int sample_bytes,
-    uint8_t *before, uint8_t *after, int32_t *before_lengths,
-    int32_t *after_lengths, int32_t *scores) {
-    if (!patterns || !replacements || !po || !ro || !lut || !texts || !offsets ||
-        !before || !after || !before_lengths || !after_lengths || !scores ||
-        R < 0 || T < 0 || trace_rule < 0 || trace_rule >= R ||
-        sample_count < 1 || sample_bytes < 1) return -1;
-    try {
-        std::array<uint32_t,256> freq_bytes{};
-        std::array<uint32_t,65536> freq_pairs{};
-        for (int t=0;t<T;++t) {
-            for (int i=offsets[t];i<offsets[t+1];++i) {
-                const int z=texts[i]; ++freq_bytes[z];
-                if (i+1<offsets[t+1]) ++freq_pairs[(z<<8)|texts[i+1]];
-            }
-        }
-        Model m=compile_model(patterns,replacements,po,ro,lut,R,freq_bytes,freq_pairs);
-        for (int i=0;i<T;++i) {
-            const size_t byteoff=size_t(i)*sample_count*sample_bytes;
-            const size_t lenoff=size_t(i)*sample_count;
-            TraceSink trace{trace_rule,sample_count,sample_bytes,0,
-                before+byteoff,after+byteoff,
-                before_lengths+lenoff,after_lengths+lenoff};
-            scores[i]=run(m,texts+offsets[i],offsets[i+1]-offsets[i],&trace);
-        }
-        return 0;
-    } catch (const std::bad_alloc &) { return -3; }
-      catch (const std::length_error &) { return -4; }
-      catch (const std::exception &) { return -5; }
 }
