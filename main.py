@@ -23,7 +23,6 @@ otherwise the native CPU evaluator is selected automatically.
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
 import copy
 import csv
 import hashlib
@@ -569,11 +568,6 @@ def make_rule(rng: random.Random, corpus: Sequence[bytes], bigrams: Sequence[tup
         return Rule([a,-1,PREDICTION_SLOT],[a,-1,b])
     if choice<0.72:
         x=rng.choice(corpus)
-        if len(x) >= 2 and rng.random() < 0.80:
-            pos = rng.randrange(1, len(x))
-            width = rng.randint(1, min(6, pos))
-            context = list(x[pos-width:pos])
-            return Rule(context + [PREDICTION_SLOT], context + [x[pos]])
         size=(log_uniform_count(rng,min(len(x),48)) if rng.random()<0.28
               else rng.randint(1,min(7,len(x))))
         start=rng.randrange(len(x)-size+1)
@@ -974,43 +968,6 @@ def breed(a: Genome,b: Genome,rng: random.Random,corpus,bigrams,
     return mutate_genome(Genome(rows,lut),rng,corpus,bigrams,embedding_enabled)
 
 
-def guided_prediction_children(parent: Genome, examples: Sequence[bytes],
-                               rng: random.Random, offspring: int = 4,
-                               probe_length: int = 48) -> list[Genome]:
-    """Suggest local suffix corrections from *actual* teacher-forced errors.
-
-    This is a low-frequency proposal operator, not gradient learning. New rules
-    are evaluated on the usual full texts with the exact same accuracy metric.
-    A small prefix keeps Python tracing from dominating native CPU evaluation.
-    """
-    if not examples or not parent.rules or offspring <= 0:
-        return []
-    text = rng.choice(examples)[:max(2, probe_length)]
-    if len(text) < 2:
-        return []
-    _, _, preds, states = autoregressive_rollout(parent, text,
-                                                 predictions=True, return_states=True)
-    errors = [(state, expected) for state, pred, expected
-              in zip(states, preds, text[1:]) if pred != expected and len(state) >= 2]
-    if not errors:
-        return []
-    proposals: list[Genome] = []
-    for _ in range(offspring):
-        state, expected = rng.choice(errors)
-        width = rng.randint(2, min(8, len(state)))
-        pattern = list(state[-width:])
-        replacement = pattern[:-1] + [int(expected)]
-        rule = Rule(pattern, replacement)
-        if not is_valid_rule(rule):
-            continue
-        # Place the corrective rule last, after all context/state transforms.
-        # The effect can be generalized or rejected by normal GA selection.
-        child_rows = parent.rules.copy()
-        child_rows[-1] = rule
-        proposals.append(Genome(child_rows, parent.embedding.copy()))
-    return proposals
-
-
 def fingerprint(g: Genome) -> int:
     return hash((tuple(g.embedding),tuple((tuple(r.pattern),tuple(r.replacement)) for r in g.rules)))
 
@@ -1181,114 +1138,6 @@ def score_population(population: Sequence[Genome], examples: Sequence[bytes], ba
         g.case_scores=[float(counts[gi,i]/denominators[i]) for i in range(len(examples))]
 
 
-
-# Keep per-case counts across rotations, not just across identical four-case batches.
-# The backend evaluator above is left unchanged for compatibility.  Small sets of
-# new (genome, case) pairs are dispatched through the same CPU/MPS implementation.
-_score_population_backend = score_population
-_CASE_SCORE_CACHE: OrderedDict[int, list] = OrderedDict()
-_CASE_SCORE_MAX_GENOMES = 1100
-
-
-def clear_case_score_cache() -> None:
-    """Discard in-memory evaluation reuse without changing model/checkpoint state."""
-    _CASE_SCORE_CACHE.clear()
-
-
-def score_population(population: Sequence[Genome], examples: Sequence[bytes], backend: str,
-                     mps_batch: int = 16, cpu_workers: int = 0,
-                     use_cache: bool = True, progress=None) -> None:
-    """Evaluate exact byte accuracy; reuse only verified genome/case pairs.
-
-    Cached values are exact integer correct-byte counts.  Case rotations only
-    invalidate the replaced case, not all other evaluation data.  Duplicated
-    genomes in the current call are evaluated once.  Progress counts genomes,
-    including cached ones, so callers' progress bars stay accurate.
-    """
-    if not population:
-        return
-    global _NATIVE_UNAVAILABLE_WARNED
-    if backend == 'cpu' and native_cpu is None and not _NATIVE_UNAVAILABLE_WARNED:
-        print('Lens warning: native_cpu module not found. CPU mode is using the '
-              'much slower Python reference evaluator; install/build the '
-              'native_cpu backend for performance.', flush=True)
-        _NATIVE_UNAVAILABLE_WARNED = True
-    if not use_cache:
-        return _score_population_backend(population, examples, backend, mps_batch,
-                                         cpu_workers, use_cache=False, progress=progress)
-    denominators = [len(t) - 1 for t in examples]
-    total = sum(denominators)
-    if total <= 0 or any(n <= 0 for n in denominators):
-        raise ValueError('All training cases must have at least two bytes')
-    examples = [bytes(t) for t in examples]
-    fingerprints = [fingerprint(g) for g in population]
-    count_matrix = np.full((len(population), len(examples)), -1, dtype=np.int32)
-    representative_indices: dict[int, list[int]] = {}
-    duplicates: list[tuple[int, int]] = []
-    unique_indices: list[int] = []
-    prior_entries: dict[int, tuple[Genome, dict[bytes, int]]] = {}
-    for i, g in enumerate(population):
-        fp = fingerprints[i]
-        duplicate = next((j for j in representative_indices.get(fp, ())
-                          if _same_structure(g, population[j])), None)
-        if duplicate is not None:
-            duplicates.append((i, duplicate))
-            continue
-        representative_indices.setdefault(fp, []).append(i)
-        unique_indices.append(i)
-        for prev_g, case_map in _CASE_SCORE_CACHE.get(fp, ()):
-            if _same_structure(g, prev_g):
-                prior_entries[i] = (prev_g, case_map)
-                for j, text in enumerate(examples):
-                    if text in case_map:
-                        count_matrix[i, j] = case_map[text]
-                break
-    missing_groups: dict[tuple[int, ...], list[int]] = {}
-    for i in unique_indices:
-        missing = tuple(j for j in range(len(examples)) if count_matrix[i, j] < 0)
-        if missing:
-            missing_groups.setdefault(missing, []).append(i)
-    completed = len(unique_indices) - sum(map(len, missing_groups.values())) + len(duplicates)
-    if progress is not None and completed:
-        progress.update(completed)
-    for missing, indices in missing_groups.items():
-        subsamples = [examples[j] for j in missing]
-        genomes = [population[i] for i in indices]
-        # Core code uses precisely the same backend and the same CPU crosschecks.
-        _score_population_backend(genomes, subsamples, backend, mps_batch,
-                                  cpu_workers, use_cache=False, progress=None)
-        for i, genome in zip(indices, genomes):
-            for k, j in enumerate(missing):
-                count_matrix[i, j] = round(genome.case_scores[k] * denominators[j])
-        if progress is not None:
-            progress.update(len(indices))
-    for i, representative in duplicates:
-        count_matrix[i, :] = count_matrix[representative, :]
-    if np.any(count_matrix < 0):
-        raise AssertionError('Unresolved genome/case evaluation')
-    for i, g in enumerate(population):
-        g.fitness = float(int(count_matrix[i].sum()) / total)
-        g.case_scores = [float(count_matrix[i, j] / denominators[j])
-                         for j in range(len(examples))]
-    # Limit references to whole genomes. Keep recent populations so evaluations
-    # survive a changing rolling training case without memory leaks.
-    for i in unique_indices:
-        g = population[i]
-        fp = fingerprints[i]
-        new_map = dict(prior_entries[i][1]) if i in prior_entries else {}
-        for j, text in enumerate(examples):
-            new_map[text] = int(count_matrix[i, j])
-        # Bound stored cases per genome (most recently used are at the end).
-        if len(new_map) > 48:
-            new_map = dict(list(new_map.items())[-48:])
-        entries = _CASE_SCORE_CACHE.pop(fp, [])
-        entries = [(old, counts) for old, counts in entries
-                   if not _same_structure(old, g)]
-        entries.append((g, new_map))
-        _CASE_SCORE_CACHE[fp] = entries
-    while sum(map(len, _CASE_SCORE_CACHE.values())) > _CASE_SCORE_MAX_GENOMES:
-        _CASE_SCORE_CACHE.popitem(last=False)
-
 def write_history(path: str, history: Sequence[dict]) -> None:
     if not path or not history:
         return
@@ -1326,20 +1175,12 @@ def plot_history(history: Sequence[dict], prefix: str, window: int) -> None:
         return
     x=[row['generation'] for row in history]
     y=np.asarray([row['best_accuracy'] for row in history])
-    cum=np.concatenate(([0.],np.cumsum(y,dtype=np.float64)))
-    avg=np.asarray([(cum[i+1]-cum[max(0,i-window+1)]) /
-                    (i+1-max(0,i-window+1)) for i in range(len(y))])
+    avg=np.asarray([np.mean(y[max(0,i-window+1):i+1]) for i in range(len(y))])
     fig,ax=plt.subplots(figsize=(11,5.5))
-    # Thin only the displayed lines; retain every generation in CSV/history.
-    ix=np.unique(np.r_[np.arange(0,len(x),max(1,len(x)//20000)),len(x)-1])
-    ax.plot(np.asarray(x)[ix],y[ix],alpha=.35,label='Rolling-case best train accuracy')
-    ax.plot(np.asarray(x)[ix],avg[ix],label='Rolling-case moving average')
-    champion = np.asarray([float(r.get('best_ever_accuracy', r['best_accuracy']))
-                           for r in history])
-    ax.plot(np.asarray(x)[ix], champion[ix],
-            label='Champion accuracy (current rolling cases)')
-    ax.set(xlabel='Generation', ylabel='Teacher-forced next-byte accuracy',
-           title='Lens: rolling training accuracy (no extra evaluation)')
+    ax.plot(x,y,alpha=.5,label='Generation best next-byte accuracy')
+    ax.plot(x,avg,label='Moving average')
+    ax.plot(x,np.maximum.accumulate(y),label='Best observed')
+    ax.set(xlabel='Generation',ylabel='Teacher-forced next-byte accuracy',title='Lens autoregressive training')
     ax.legend(); fig.tight_layout()
     out=Path(prefix+'_accuracy.png')
     out.parent.mkdir(parents=True,exist_ok=True)
@@ -1407,10 +1248,6 @@ def evolve(args) -> Genome:
     show_progress = not getattr(args, 'no_tqdm', False)
     if show_progress and tqdm is None:
         raise RuntimeError('tqdm が必要です: python -m pip install tqdm （または --no-tqdm を指定）')
-    if args.plateau_generations < 1 or args.guided_every < 0:
-        raise ValueError('plateau-generations must be >=1 and guided-every must be >=0')
-    if args.guided_offspring < 0 or args.guided_probe_length < 2:
-        raise ValueError('guided-offspring must be >=0, guided-probe-length >=2')
     if not 0 <= args.diff3_rate <= 1:
         raise ValueError('--diff3-rate must be in [0,1]')
     rng=random.Random(args.seed)
@@ -1440,52 +1277,20 @@ def evolve(args) -> Genome:
         finally:
             if init_bar is not None:
                 init_bar.close()
-    # Migrate checkpoints made with the former held-out split.  Map the saved
-    # rolling-case indices to the full corpus instead of reinitializing the GA.
-    # No additional examples are evaluated: every score uses only train cases.
-    legacy_best = None
-    if rotation_state is not None:
-        full_digest = RollingTrainingCases._digest(corpus)
-        if rotation_state['corpus_digest'] != full_digest:
-            old_holdout = rotation_state.get('validation_indices')
-            if old_holdout is None:
-                raise ValueError('Checkpoint uses an unknown corpus split; cannot remap rolling case indices')
-            excluded = set(old_holdout)
-            kept = [i for i in range(len(corpus)) if i not in excluded]
-            old_corpus = [corpus[i] for i in kept]
-            if RollingTrainingCases._digest(old_corpus) != rotation_state['corpus_digest']:
-                raise ValueError('Checkpoint corpus mismatch: cannot safely migrate case indices')
-            rotation_state = dict(rotation_state)
-            rotation_state['indices'] = [kept[i] for i in rotation_state['indices']]
-            rotation_state['corpus_digest'] = full_digest
     rolling = RollingTrainingCases(corpus, args.cases, args.seed * 1000003,
                                    args.case_rotate_every, rotation_state)
+    # Old v10 checkpoints do not contain rolling-case state. Reconstruct a
+    # deterministic rolling schedule from generation 0, without touching GA RNG.
     if rotation_state is None and first:
         rolling.for_generation(first - 1)
-    # Saved fitness from the older validation-based version is incomparable to
-    # training ACC; keep its genome as a candidate and rescore it on train only.
-    if best_ever is not None and any('validation_accuracy' in r for r in history):
-        legacy_best = best_ever
-        best_ever = None
-        archive.append(copy.deepcopy(legacy_best))
-
-    history_keys = ('generation', 'best_accuracy', 'mean_accuracy', 'median_accuracy',
-                    'best_ever_accuracy', 'correct_bytes', 'evaluated_bytes',
-                    'eval_seconds', 'rules', 'tokens', 'backend', 'case_rotation',
-                    'rotated_case', 'train_improved', 'last_train_improve',
-                    'plateau_active', 'unique_fitness', 'breed_seconds',
-                    'compute_seconds')
-    last_train_improve = first
-    if history and best_ever is not None:
-        last_train_improve = int(history[-1].get('last_train_improve', first))
-    # Drop all obsolete validation columns, including for resumed CSV histories;
-    # rows have the exact same schema as newly appended rows.
-    history = [{key: (old_row.get('best_accuracy', '')
-                      if key == 'best_ever_accuracy' and 'validation_accuracy' in old_row
-                      else old_row.get(key, ''))
-                for key in history_keys} for old_row in history]
-    if args.history_csv and history:
-        write_history(args.history_csv, history)
+    if history:
+        for old_row in history:
+            old_row.setdefault('case_rotation', '')
+            old_row.setdefault('rotated_case', '')
+    if args.history_csv:
+        # On a resumed run, restore the completed rows once. Thereafter append
+        # only the new row, including when started from generation zero.
+        write_history(args.history_csv,history)
     generation_bar=(tqdm(total=max(0,args.generations-first),
                          desc='Lens 学習',unit='世代',dynamic_ncols=True,
                          mininterval=0.5,position=0,leave=True)
@@ -1496,55 +1301,31 @@ def evolve(args) -> Genome:
         train=rolling.for_generation(generation)
         if generation_bar is not None:
             generation_bar.set_description_str(f'Lens 学習 gen={generation}')
-        # Historical fitness was measured on different rolling cases; do NOT
-        # allow those stale scores to guide parent selection. Score the sampled
-        # HOF individuals on the *same* current examples as the population.
-        hof_pool = (rng.sample(archive, min(len(archive), max(8, args.hof_inject)))
-                    if args.hof_inject and archive else [])
-        if best_ever is not None and not any(_same_structure(best_ever, g) for g in hof_pool):
-            hof_pool.append(best_ever)
-        if legacy_best is not None and generation == first and not any(
-                _same_structure(legacy_best, g) for g in hof_pool):
-            hof_pool.append(legacy_best)
-        evaluated = population + hof_pool
-        eval_bar=(tqdm(total=len(evaluated),desc=f'gen={generation} 評価/{args.backend}',
+        eval_bar=(tqdm(total=len(population),desc=f'gen={generation} 評価/{args.backend}',
                        unit='個体',position=1,leave=False,dynamic_ncols=True,
                        mininterval=0.5) if show_progress else None)
         try:
-            score_population(evaluated,train,args.backend,args.mps_batch,args.cpu_workers,
+            score_population(population,train,args.backend,args.mps_batch,args.cpu_workers,
                              use_cache=not args.no_eval_cache,progress=eval_bar)
         finally:
             if eval_bar is not None:
                 eval_bar.close()
-        current_hof = sorted(hof_pool, key=lambda g:g.fitness, reverse=True)
         population.sort(key=lambda g:g.fitness,reverse=True)
         current=population[0]
-        # The incumbent is already included in this generation's HOF evaluation.
-        # Compare candidates only on the SAME rotating training cases; no
-        # validation passes or additional full-length rollouts are performed.
-        candidates = [current] + [g for g in current_hof if g is not best_ever]
-        challenger = max(candidates, key=lambda g: g.fitness)
-        train_improved = (best_ever is None or
-                          challenger.fitness > best_ever.fitness + 1e-12)
-        if train_improved:
-            best_ever = copy.deepcopy(challenger)
-            last_train_improve = generation
-            save_model(args.save, best_ever)
-        if args.hof_size > 0:
-            # The HOF is a *diversity reservoir*, not a ranking of incomparable
-            # fitness values from different generations. Keep newest unique states.
+        if best_ever is None or current.fitness>best_ever.fitness:
+            best_ever=copy.deepcopy(current)
+            save_model(args.save,best_ever)
+        if args.hof_size>0:
             archive.append(copy.deepcopy(current))
-            seen = set()
-            unique_reverse = []
-            for g in reversed(archive):
-                sig = fingerprint(g)
+            archive.sort(key=lambda g:g.fitness,reverse=True)
+            unique=[]; seen=set()
+            for g in archive:
+                sig=fingerprint(g)
                 if sig not in seen:
-                    unique_reverse.append(g)
-                    seen.add(sig)
-                if len(unique_reverse) >= args.hof_size:
+                    unique.append(g);seen.add(sig)
+                if len(unique)>=args.hof_size:
                     break
-            archive = list(reversed(unique_reverse))
-        plateau_active = generation - last_train_improve >= args.plateau_generations
+            archive=unique
         mean_fit=statistics.fmean(g.fitness for g in population)
         median_fit=statistics.median(g.fitness for g in population)
         elapsed=time.perf_counter()-t0
@@ -1556,57 +1337,42 @@ def evolve(args) -> Genome:
              'rules':args.rules,'tokens':256,'backend':args.backend,
              'case_rotation':rolling.rotations_done,'rotated_case':(
                  (rolling.rotations_done-1)%args.cases if generation and
-                 generation%args.case_rotate_every == 0 else -1),
-             'train_improved':int(train_improved),
-             'last_train_improve':last_train_improve,
-             'plateau_active':int(plateau_active),
-             'unique_fitness':len({g.fitness for g in population})}
+                 generation%args.case_rotate_every == 0 else -1)}
         history.append(row)
         longest_pattern=max(map(lambda rule: len(rule.pattern), current.rules), default=0)
         longest_replacement=max(map(lambda rule: len(rule.replacement), current.rules), default=0)
-        # Evaluation-only time is recorded above. Breeding/merging and chart
-        # serialization were previously hidden from the printed duration.
-        breed_start = time.perf_counter()
+        summary=(f"gen={generation:6d} acc={current.fitness:.5f} mean={mean_fit:.5f} "
+                 f"ever={best_ever.fitness:.5f} tested={row['evaluated_bytes']} "
+                 f"seconds={elapsed:.2f} backend={args.backend} "
+                 f"rotate={rolling.rotations_done} slot={row['rotated_case']} "
+                 f"ruleLen={longest_pattern}/{longest_replacement}")
+        if generation_bar is not None:
+            generation_bar.set_postfix_str(f'acc={current.fitness:.5f} eval={elapsed:.1f}s',refresh=False)
+            tqdm.write(summary)
+        else:
+            print(summary,flush=True)
+        if args.history_csv:
+            append_history_row(args.history_csv,row)
+        if not args.no_plot and (generation+1)%max(1,args.plot_every)==0:
+            plot_history(history,args.plot_prefix,args.plot_window)
         next_pop=[copy.deepcopy(g) for g in population[:min(args.elites,args.population)]]
-        if current_hof and args.hof_inject:
-            present = {fingerprint(x) for x in next_pop}
-            for g in current_hof[:args.hof_inject]:
-                sig = fingerprint(g)
-                if len(next_pop)<args.population and sig not in present:
+        if archive and args.hof_inject:
+            for g in random.sample(archive, min(len(archive), args.hof_inject)):
+                if len(next_pop)<args.population and not any(fingerprint(x)==fingerprint(g) for x in next_pop):
                     next_pop.append(copy.deepcopy(g))
-                    present.add(sig)
-        if best_ever is not None and len(next_pop) < args.population and not any(
-                _same_structure(best_ever, g) for g in next_pop):
-            next_pop.append(copy.deepcopy(best_ever))
-        if args.guided_every > 0 and generation % args.guided_every == 0:
-            for child in guided_prediction_children(current, train, rng,
-                                                    args.guided_offspring,
-                                                    args.guided_probe_length):
-                if len(next_pop) < args.population:
-                    next_pop.append(child)
         breed_bar=(tqdm(total=args.population,initial=len(next_pop),
                         desc=f'gen={generation} 次世代作成',unit='個体',position=1,
                         dynamic_ncols=True,mininterval=0.5,leave=False)
                    if show_progress else None)
         def pick():
             # Tournament selection on teacher-forced byte accuracy.
-            if current_hof and rng.random() < args.hof_parent_rate:
-                return rng.choice(current_hof[:min(16, len(current_hof))])
-            tournament_size = min((max(2, args.tournament // 2) if plateau_active
-                                   else args.tournament), len(population))
-            return max(rng.choices(population,k=tournament_size),key=lambda g:g.fitness)
+            if archive and rng.random()<args.hof_parent_rate:
+                return rng.choice(archive[:max(1,min(16,len(archive)))])
+            return max(rng.choices(population,k=min(args.tournament,len(population))),key=lambda g:g.fitness)
         try:
             while len(next_pop)<args.population:
-                if rng.random() < (min(0.12, 2 * args.immigrant_rate)
-                                   if plateau_active else args.immigrant_rate):
-                    # Restart near a promising local optimum rather than spending
-                    # almost all evaluations on unfit 1500-row random immigrants.
-                    if plateau_active and rng.random() < 0.85:
-                        child = mutate_genome(pick(),rng,corpus,bigrams,not args.no_embedding)
-                        for _ in range(2):
-                            child = mutate_genome(child,rng,corpus,bigrams,not args.no_embedding)
-                    else:
-                        child=new_genome(args.rules,rng,corpus,bigrams,not args.no_embedding)
+                if rng.random()<args.immigrant_rate:
+                    child=new_genome(args.rules,rng,corpus,bigrams,not args.no_embedding)
                 elif rng.random()<args.crossover_rate:
                     if rng.random()<args.diff3_rate:
                         # Pick a structurally related pseudo-ancestor A;
@@ -1625,24 +1391,6 @@ def evolve(args) -> Genome:
         finally:
             if breed_bar is not None:
                 breed_bar.close()
-        row['breed_seconds'] = time.perf_counter() - breed_start
-        row['compute_seconds'] = time.perf_counter() - t0
-        summary=(f"gen={generation:6d} acc={current.fitness:.5f} mean={mean_fit:.5f} "
-                 f"champion={best_ever.fitness:.5f} tested={row['evaluated_bytes']} "
-                 f"eval={elapsed:.2f}s breed={row['breed_seconds']:.2f}s "
-                 f"compute={row['compute_seconds']:.2f}s backend={args.backend} "
-                 f"rotate={rolling.rotations_done} slot={row['rotated_case']} "
-                 f"ruleLen={longest_pattern}/{longest_replacement} "
-                 f"improved={int(train_improved)} plateau={int(plateau_active)}")
-        if generation_bar is not None:
-            generation_bar.set_postfix_str(f'acc={current.fitness:.5f} compute={row["compute_seconds"]:.1f}s',refresh=False)
-            tqdm.write(summary)
-        else:
-            print(summary,flush=True)
-        if args.history_csv:
-            append_history_row(args.history_csv,row)
-        if not args.no_plot and (generation+1)%max(1,args.plot_every)==0:
-            plot_history(history,args.plot_prefix,args.plot_window)
         if args.checkpoint and args.checkpoint_every>0 and (generation+1)%args.checkpoint_every==0:
             save_checkpoint(args.checkpoint,generation+1,next_pop,best_ever,history,rng,archive,rolling)
         population=next_pop
@@ -1702,22 +1450,17 @@ def parse_args():
     ap.add_argument('--min-chunk',type=int,default=2)
     ap.add_argument('--max-chunk',type=int,default=3500,
                     help='exclusive maximum chunk length in bytes: skip entire chunks of 1500 bytes or more (never crop)')
-    ap.add_argument('--cases',type=int,default=4,help='whole-text examples evaluated per generation (4 by default)')
-    ap.add_argument('--case-rotate-every',type=int,default=4,
-                    help='rotate exactly one case per N generations (round-robin; default 4)')
+    ap.add_argument('--cases',type=int,default=4,help='whole-text examples evaluated per generation')
+    ap.add_argument('--case-rotate-every',type=int,default=2,
+                    help='rotate exactly one case per N generations (round-robin; default 3)')
     ap.add_argument('--population',type=int,default=450)
     ap.add_argument('--rules',type=int,default=1500)
     ap.add_argument('--generations',type=int,default=1000000)
-    ap.add_argument('--plateau-generations',type=int,default=80,
-                    help='boost diversity after N generations without an improvement over the current training champion')
-    ap.add_argument('--guided-every',type=int,default=25,help='create error-informed local rule proposals every N generations; 0 disables')
-    ap.add_argument('--guided-offspring',type=int,default=4,help='number of guided local proposals')
-    ap.add_argument('--guided-probe-length',type=int,default=48,help='prefix byte count for lightweight Python error tracing')
-    ap.add_argument('--elites',type=int,default=12)
-    ap.add_argument('--tournament',type=int,default=5)
+    ap.add_argument('--elites',type=int,default=24)
+    ap.add_argument('--tournament',type=int,default=12)
     ap.add_argument('--hof-size',type=int,default=4096)
     ap.add_argument('--hof-inject',type=int,default=64)
-    ap.add_argument('--hof-parent-rate',type=float,default=0.05)
+    ap.add_argument('--hof-parent-rate',type=float,default=0.10)
     ap.add_argument('--crossover-rate',type=float,default=0.50)
     ap.add_argument('--diff3-rate',type=float,default=0.35,
                     help='share of crossover offspring using 3-parent categorical diff3 (0..1)')
