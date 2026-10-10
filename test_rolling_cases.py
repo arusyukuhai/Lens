@@ -72,7 +72,7 @@ class RollingCaseTests(unittest.TestCase):
             self.assertIsNone(m.load_checkpoint(f,include_rotation_state=True)[-1])
 
     def test_cli_uninterrupted_equals_checkpoint_restart(self):
-        # Full GA test, not just independently stepping case schedules.
+        # Full greedy training test, not just independently stepping case schedules.
         with tempfile.TemporaryDirectory() as td:
             root=Path(td)
             corpus=root/'corpus.txt'
@@ -80,7 +80,7 @@ class RollingCaseTests(unittest.TestCase):
             def run(tag,until,load=''):
                 checkpoint=str(root/f'{tag}.pkl')
                 args=[sys.executable,str(Path(m.__file__)),'--backend','cpu',
-                      '--local-corpus',str(corpus),'--rules','7','--population','10',
+                      '--local-corpus',str(corpus),'--rules','7',
                       '--cases','4','--case-rotate-every','2','--generations',str(until),
                       '--seed','123','--cpu-workers','2','--no-tqdm','--no-plot',
                       '--checkpoint',checkpoint,'--checkpoint-every','2',
