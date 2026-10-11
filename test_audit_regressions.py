@@ -62,3 +62,19 @@ def test_checkpoint_v3_deduplicates_rules_and_roundtrips(tmp_path):
         assert m.same_genome_structure(a, b)
         np.testing.assert_allclose(a.readout_weights, b.readout_weights)
     assert loaded[0].rules[0] is loaded[1].rules[0]
+
+
+def test_inference_direct_budget_honors_requested_shape():
+    auto = m.resolve_inference_budget(
+        200, 3, 16, 128, 0.75,
+        genome_count=450, outer_evaluated_genomes=450, ensemble_size=32,
+        budget_mode="auto",
+    )
+    direct = m.resolve_inference_budget(
+        200, 3, 16, 128, 0.75,
+        genome_count=450, outer_evaluated_genomes=450, ensemble_size=32,
+        budget_mode="direct",
+    )
+    assert auto[:3] == (3, 16, 29)
+    assert direct[:3] == (3, 16, 128)
+    assert direct[3] > auto[3]

@@ -13,9 +13,12 @@ class V59RankReadoutTests(unittest.TestCase):
             for c in range(cases)
         ]).astype(np.float64)
         hi, lo, margin = main.case_adjacent_rank_pairs(clean, case_ids)
-        self.assertEqual(len(hi), cases * (samples - 1))
-        self.assertEqual(len(lo), cases * (samples - 1))
-        self.assertEqual(len(margin), cases * (samples - 1))
+        # Tied targets are now paired against neighboring *distinct* severity
+        # levels instead of consuming the ranking budget with zero-margin ties.
+        self.assertGreater(len(hi), 0)
+        self.assertEqual(len(lo), len(hi))
+        self.assertEqual(len(margin), len(hi))
+        self.assertTrue(np.all(margin > 0))
         touched = set(map(int, hi)) | set(map(int, lo))
         self.assertEqual(touched, set(range(cases * samples)))
         self.assertTrue(np.all(margin >= -1e-15))

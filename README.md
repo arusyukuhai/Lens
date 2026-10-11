@@ -1,61 +1,204 @@
-# Training update (single-genome n-gram greedy)
+> **Current branch (2026-10-11):** Information-Guided BIPS/Relational. See [README_INFORMATION_DRIVEN_2026-10-11.md](README_INFORMATION_DRIVEN_2026-10-11.md).
 
-The old GA training loop has been replaced by single-rule greedy updates.
-**Please read [README_GREEDY_NGRAM.md](README_GREEDY_NGRAM.md) first.**
-The original README is retained below for architecture and historical details.
+**2026-10-11 source-balanced BIPS + edit-sensitive macro verification:** see `README_BIPS_SOURCE_BALANCED_EDIT_2026-10-11.md`. The previous 2-case default could never supply two distinct BIPS training originals; the same ~200 trajectory budget is now redistributed across 3 cases, and confirmed macros can be ranked by correct-vs-wrong same-position edit preference without changing ordinary OLS+Pearson or the inner string GA.
 
----
+> Latest BIPS candidate-screening upgrade: [README_BIPS_CONFIRMATION_2026-10-11.md](README_BIPS_CONFIRMATION_2026-10-11.md).
 
-# Lens v14 — variable-length Replacer + refined GA / three-parent diff3
+> **Current BIPS/CEGAR refinement:** see [`README_BIPS_EFFICIENT_2026-10-11.md`](README_BIPS_EFFICIENT_2026-10-11.md) for source-stage snapshots, counterexample repair, exact Native preflight, settings, and validation.
 
-This build combines v13's improved mutation / crossover and v12's one-case-at-a-time rotation with a **variable-length rule and recurrent-state implementation**.
+# 2026-10-11 multi-strategy guided learning
 
-## Binary `$1`..`$4` operators (new in this patch)
+See `README_MULTISTRATEGY_DIFF3_2026-10-11.md` for six rule-generation modes including 3-way diff3, and mode-selection flags. Outer OLS/Pearson and inner reconstruction GA are preserved.
 
-See **[README_BINARY_OPS.md](README_BINARY_OPS.md)** for opcode layouts,
-semantics, mutation support and runtime costs. Nine operations now occupy
-`-112..-255` without changing the old unary opcodes or saved-model format.
-Python and native C++ evaluate all nine; Metal selects native CPU fallback when
-any binary operator is present.
+IMPORTANT: 2026-10-11 default is DIRECTED RULE LEARNING + LINEAR REGRESSION / PEARSON with GA INFERENCE.
+For current usage see README_DIRECT_RULE_LEARNING_GA_2026-10-11.md.
+The historical revision notes below describe older Spearman versions.
 
-## What changed
+# v64 — Hidden Phrase Memory + v60 String-side Genetic Inference
 
-- **No hard 64-token rule limit for CPU/Python.** Patterns and replacements may exceed 64 tokens; the evolutionary operators can gradually grow them through insertion, context extension, duplication, and diff3 sequence merges. The original `MAX_RULE_TOKENS=64` restriction only remains as a compatibility limit **inside the legacy Metal fast path**.
-- **Output is no longer forced to be nonexpanding.** Literal outputs can exceed the number of input literals, and a capture may be emitted repeatedly. Rule evaluation never silently truncates a replacement to its matched span.
-- **Native C++ evaluator now supports dynamically growing recurrent-state buffers**, without the old `input_length+1` capacity assumption. Rule packing also uses variable row strides instead of the former fixed `rules × 65` layout. The reference Python evaluator uses identical semantics.
-- **Genome validation and saved-model loading** accept longer / expanding rules. Existing v12/v13 autoregressive checkpoints and models remain loadable (checkpoint version unchanged). Evaluation results for unchanged nonexpanding rules are preserved.
-- **Conservative evolution, expressive execution:** unrestricted expansion is valid for hand-written/saved programs, but the *random genetic operators* preferentially make small length increases in prediction-slot-conditioned rules and avoid creating repeated-capture exponential explosions accidentally. The ability to grow repeatedly over future generations is unlimited; this is not a hard rule-length cap.
-- **MPS fallback:** the pre-existing GPU kernel is fixed-stride and nonexpanding. When rules are too long or can expand, `--backend mps` automatically evaluates that generation on native CPU rather than risking a GPU buffer overflow or incorrect score. On Mac, `--backend cpu` is the default, also reflecting measured CPU superiority on this workload.
-- **Training log:** `ruleLen=<max-pattern-length>/<max-replacement-length>` shows the longest current rule in each generation.
+## 2026-10-07 inference/MPS performance repair
 
-## Preserved design
+See `INFERENCE_MPS_FIX_2026-10-07.md`. Inference candidate uploads no longer rebuild anchor statistics every inner generation, unchanged candidate scores are memoized across inner GA rounds, the final ensemble rows are reused, and MPS timing now separates outer/inference work. `--inference-budget-mode direct` makes requested inference shape literal when needed.
 
-- 450 rules per genome by default, 450 population members, byte tokens 0..255 and reversible LUT within `sort/+1/-1/*2//2` and numeric binary operators.
-- One ordered rule sweep per predicted byte; the resulting state is preserved, teacher-forced at the final prediction slot, then appended with a fresh slot.
-- No fixed recurrent-state/context length, no probability distribution, and no automatic truncation of the internal state.
-- `===SPLIT===` chunk delimiter; complete chunks of **1500 bytes or longer** are skipped (configurable with `--max-chunk`).
-- `case_rotate_every` replaces only one evaluation case at each boundary; its RNG state survives checkpoints.
-- tqdm evaluation/generation progress, caching, and refined mutation / two-parent and diff3 three-parent crossover from v13.
 
-## Install and run
+最新の表現力拡張（`-2/-3` hidden capture、24種類の hidden read/pop/delete、走査末尾の persistent hidden rewrite、hidden-aware cycle detection）は **[README_v64.md](README_v64.md)** を参照してください。以下は引き続き有効な v60 系 inference/Pareto の説明です。
 
-```bash
-python -m pip install numpy tqdm
-python main.py --backend cpu --local-corpus github-code.txt \
-    --rules 450 --population 450 --cases 8 --case-rotate-every 3
+v59 の all-sample pairwise rank readout と v58 の linkage/QD/operator search を残したまま、**実際に入力文字列側を探索して復元できるか**を第二目的に追加した版です。
+
+## 何を追加したか
+
+各 outer generation で、通常の Spearman 評価後に独立した短い code snippet を数個用意します。snippet には既知の位置だけ人工ノイズを入れます。
+
+```text
+clean text
+   ↓ corruption (positions are recorded)
+noisy text
+   ↓ inner genetic search: only corrupted positions may change
+candidate strings
+   ↓ current Replace population scores candidates
+best-scoring inferred strings
+   ↓ compare to hidden clean bytes at corrupted positions only
+recovery accuracy
 ```
 
-For an existing Lens directory, replace **`main.py`, `native_cpu.py`, and `replacer_native.cpp` together**. The `gpu_replace_persistent.py` in this archive is the unchanged compatible Metal implementation. Keep all four in the same directory. Native CPU uses a locally available C++17 compiler and caches its compiled binary by a source hash.
+未変更部分を分母へ入れると accuracy が不当に高くなるため、第二目的 `inference_accuracy` は **人工的に壊した byte の復元率だけ**です。
 
-## Verify
+clean byte は mutation proposal や candidate fitness には一切使わず、最終採点にだけ使います。
 
-```bash
-python -m unittest discover -q
-python main.py --self-test
+## Inner GA
+
+既定値は以下です。
+
+```text
+--inference-cases 3
+--inference-population 12
+--inference-generations 4
+--inference-elites 3
+--inference-span 192
+--inference-noise 0.05
+--inference-ensemble 64
+--inference-rotate-every 2
+--inference-budget-ratio 0.75
 ```
 
-The additional `test_dynamic_lengths.py` covers 170+ token patterns, 220+ token replacements, repeated captures, native CPU/Python equality with expanding state, save/load, and MPS fallback.
+候補文字列は corrupted loci だけを gene として扱います。mutation は corpus byte distribution と現在の局所 context から byte を提案し、clean target は見ません。crossover も corrupted loci だけで行います。
 
-## Resource note
+candidate pool は全 genome 共通です。上位 Spearman genome 群だけが search generation 中の candidate を rank 化して投票し、その平均 rank で shared candidate population を進化させます。raw readout scale の大きい genome が投票を独占しないよう、tie-safe な平均順位を使います。
 
-"No artificial memory limit" does **not** imply physically infinite memory. A rule that duplicates a long capture can grow a state exponentially and exhaust RAM / take arbitrarily long; it will not be silently clipped. Such a manual rule is valid but should be used cautiously. When C++ allocations fail, a Python `MemoryError` is reported where possible. By design, the ordinary evolutionary operators discourage explosive rules without imposing a model-level state ceiling.
+探索が終わったら **最終 candidate pool だけ** を全 genome で一度評価します。各 genome の第二目的は、その genome 自身の readout が最終 pool 内で最も高く評価した candidate の復元率を case 平均した値です。したがって `inference_accuracy` は genome ごとに異なりますが、中間世代を全450 genomeで評価する無駄はありません。
+
+### エリート保存
+
+文字列側GAには `--inference-elites`（既定3）を追加し、各 inner generation で上位候補を **byte-for-byte そのまま次世代へコピー**します。elite copy 自体には crossover / mutation を掛けません。候補数が小さくなった場合でも最低1枠は offspring 用に残すため、budget縮小時に elite だけで population が埋まって探索停止することもありません。
+
+## Pareto selection
+
+outer population は
+
+```text
+objective 1: Spearman fitness  (maximize)
+objective 2: inference_accuracy (maximize)
+```
+
+の2目的を NSGA-II 型 non-dominated sorting + crowding distance で選択します。
+
+- elite survivor: **明示的な survivor elitism**。Pareto knee / best Spearman / best inference を優先的に固定し、残りを Pareto rank / crowding 順で `--elites` 枠まで無改変コピー
+- tournament parent selection: Pareto rank / crowding 順
+- QD cell representative: Pareto comparator
+- linkage elite set: Pareto 順
+
+HoF は従来の「rank representation の長期 archive」という役割を保つため、admission 自体は top Spearman candidates を使います。
+
+`best_minimal_gp.json` は従来互換で best-observed Spearman、`latest_minimal_gp.json` は現在の Pareto front の knee（Spearman と inference のバランス点）を保存します。
+
+## 2倍を超えにくくする予算制御
+
+checked revision では inner GA の仕事量を **full-population trajectory equivalent** で見積もります。
+
+```text
+cases * candidate_population * (1 + generations * ensemble_size / population_size)
+```
+
+`1` は最終 candidate pool を全 genome で採点する1回分です。search generation は上位 ensemble だけを評価します。`--inference-budget-ratio` には引き続き 0.85 の hard cap を掛けます。
+
+デフォルト population=450, ensemble=64, cases=3, candidates=12, generations=4 なら、
+
+```text
+3 * 12 * (1 + 4*64/450) = 56.48 equivalent trajectories
+outer = 4 * 50 = 200 trajectories
+nominal extra ~= 28%
+```
+
+となります。inference snippet は既定192 bytesで通常trajectoryより短いため、初版v60よりかなり余裕を持って2倍未満を狙える構成です。
+
+Apple MPS では同じ persistent evaluator / Global Rule Pool を再利用し、active sample prefix に加えて、**同じ search ensemble の rule/index pack を inner generation 間で再利用**します。search ensemble は1回、最後の全population採点でもう1回だけpackします。
+
+## グラフ
+
+`training_saturation.png` は左軸が従来どおり
+
+```text
+-log2(1 - Spearman)
+```
+
+右軸が
+
+```text
+corrupted-byte recovery accuracy [0, 1]
+```
+
+です。右軸には
+
+- `inference raw` — 現在の Pareto-knee genome の実測 recovery（gray）
+- `inference best` — その世代の population 内の最良 recovery
+- `inference MA(200)` — raw recovery の移動平均
+
+を重ねます。
+
+history CSV には `inference_raw`, `inference_best`, `inference_best_ever`, `inference_mean`, `inference_seconds`, `inference_model_jobs`, `inference_equivalent_work`, `inference_search_rounds`, `pareto_front_size` 等も保存します。
+
+## checkpoint compatibility
+
+v64 の新規 checkpoint は `version=2` です。`version=1` checkpoint もそのままロードできますが、旧版では負の pattern token 全てが同じ wildcard 意味だったため、ロード時に旧 `-1..-16` を普通の `-1` wildcard に正規化してから v64 意味論へ移行します。これにより旧個体中の偶然の `-2/-3` が hidden-memory side effect として再解釈されることを防ぎます。
+
+## 推奨実行
+
+```bash
+python3 main.py --backend mps \
+  --load minimal_gp_checkpoint.npz \
+  --checkpoint minimal_gp_checkpoint_v60.npz \
+  --save best_minimal_gp_v60.json \
+  --current-save latest_minimal_gp_v60.json \
+  --history-csv fitness_history_v60.csv \
+  --plot-prefix training_v60
+```
+
+負荷をさらに下げるなら例えば:
+
+```bash
+--inference-budget-ratio 0.50 --inference-generations 3
+```
+
+A/B 用に第二目的を完全に切る場合:
+
+```bash
+--no-inference
+```
+
+## 検証
+
+```bash
+python3 main.py --self-test
+python3 -m unittest -v \
+  test_improvements.py \
+  test_v58_search.py \
+  test_v59_rank_readout.py \
+  test_v60_inference.py
+```
+
+v60 では追加で以下をテストします。
+
+- inference work hard cap
+- mutation が corrupted loci 以外を変更しないこと
+- 2目的 Pareto front/rank
+- checkpoint pack/unpack で inference/Pareto metadata が保存されること
+- CPU smoke training で inner GA + Pareto breeding が通ること
+
+この環境では Apple MPS 実機を持たないため、Metal kernel の実機 benchmark は未実施です。host orchestration と CPU path はテスト済みです。
+
+
+## Checked revision
+
+追加監査で見つかった修正点の詳細は `AUDIT_v60.md` を参照してください。
+
+## v60.1 inference zero fix
+
+If `inferBest=0.000` stayed pinned in the previous v60 package, use this revision.
+A real tie-handling bug was found: final `np.argmax` preferred candidate 0, which is
+always the untouched noisy string, whenever Replacer scores tied. v60.1 removes that
+no-op bias, adds context-guided one-locus proposals, and prints `infOracle` / `infMove`
+diagnostics. See `README_v60.md` and `AUDIT_v60.md`.
+
+## v60.2 inference mutation radius
+
+Normal string-side mutations now choose the number of corrupted loci with `round(exp(uniform(0, log(k))))`, clamped to `1..k`. A scheduled focus locus is included inside that log-uniform mutation set rather than forcing a one-byte mutation. Only known corrupted loci remain mutable.

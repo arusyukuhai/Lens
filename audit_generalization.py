@@ -23,6 +23,7 @@ def run(args):
     sampler = m.CorpusSampler(corpus)
     inputs, target, cases, samples = m.build_dataset(corpus, sampler, args.cases, args.samples, args.max_noise, args.max_chunk)
     result = {'seed': args.seed, 'cases': len(np.unique(cases)), 'samples': args.samples,
+              'metric': getattr(args, 'metric', 'pearson'),
               'method': 'frozen-readout, identical held-out trajectories for every model', 'models': []}
     for path in args.models:
         g = load_model(path)
@@ -33,14 +34,24 @@ def run(args):
             ev.set_inputs(inputs)
             x, baseline, _ = ev.evaluate_population([g])[0]
             del ev
+        elif args.backend == 'cpu-native':
+            from native_cpu_replacer import trajectory_features_native
+            x, baseline, *_ = trajectory_features_native(inputs, g, args.max_output,
+                                                          cpu_threads=getattr(args, 'cpu_threads', 4))
         else:
             x, baseline, _, _ = m.trajectory_features_cpu(inputs, g, args.max_output)
         # Absolutely no label-dependent fit or calibration on this corpus.
         w = np.asarray(g.readout_weights)
         active = np.flatnonzero(w)
         pred = baseline + x[:, active].astype(np.float64) @ w[active]
-        scores = [m.spearman(pred[cases == c], target[cases == c]) for c in np.unique(cases)]
-        result['models'].append({'path': path, 'mean_spearman': float(np.mean(scores)), 'case_scores': scores})
+        metric = getattr(args, 'metric', 'pearson')
+        corr = m.pearson if metric == 'pearson' else m.spearman
+        scores = [corr(pred[cases == c], target[cases == c]) for c in np.unique(cases)]
+        mse = [float(np.mean((pred[cases == c] - target[cases == c]) ** 2))
+               for c in np.unique(cases)]
+        result['models'].append({'path': path, f'mean_{metric}': float(np.mean(scores)),
+                                 'mean_mse': float(np.mean(mse)),
+                                 'case_scores': scores, 'case_mse': mse})
     if len(result['models']) == 2:
         delta = np.subtract(result['models'][1]['case_scores'], result['models'][0]['case_scores'])
         rng = np.random.default_rng(args.seed)
@@ -58,7 +69,9 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--models', nargs='+', required=True)
     p.add_argument('--local-corpus', required=True, help='corpus excluded from training')
-    p.add_argument('--backend', choices=['cpu', 'mps'], default='cpu')
+    p.add_argument('--backend', choices=['cpu-native', 'cpu', 'mps'], default='cpu-native')
+    p.add_argument('--cpu-threads', type=int, default=4)
+    p.add_argument('--metric', choices=['pearson', 'spearman'], default='pearson')
     p.add_argument('--cases', type=int, default=32)
     p.add_argument('--samples', type=int, default=36)
     p.add_argument('--max-noise', type=float, default=.35)
