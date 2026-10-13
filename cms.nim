@@ -23,7 +23,7 @@ proc defaults(): Options =
     plot: true, shuffleCorpus: true, sharedNoiseAlphabet: true, trajectoryLimitMiB: 1024, maxChunkTokens: 4096,
     searchPool: 32, acceptPool: 64, searchChunks: 4, acceptChunks: 6,
     anchorChunks: 8, anchorPool: 32, anchorRefresh: 16,
-    validationSteps: 64, anchorSteps: 48, monitorSteps: 96,
+    validationSteps: 192, anchorSteps: 192, monitorSteps: 192,
     fitReplayChunks: 8, fitReplaySteps: 32,
     readoutRefreshEvery: 4, readoutBlend: 0.5,
     anchorMargin: 0.002, acceptFloor: 0.0, minSourceWin: 0.5,
@@ -54,16 +54,17 @@ Corpus: ===SPLIT=== on a line separates chunks. Empty chunks are skipped.
 --fit-replay-chunks:8  diverse train-pool chunks ONLY for regression (not n-gram mining)
 --fit-replay-steps:32  sampled stages for regression-only replay (0=all)
 --balanced-rank-fit:true  each source path contributes equally to regression
---rank-scales:4       compare distances 1,2,4,8 within corruption trajectory (1=legacy)
+--rank-scales:0       exact all-pairs within-source rank regression (1..16=legacy multiscale)
+--readout-ridge-probes:3  shortlist-only Search-tuned ridge in {0.25x,1x,4x} (1=disabled)
 --mine-start-stride:2  approximate n-gram start sampling (1=all starts)
 --mine-gap-samples:6  stratified wildcard-gap proposal; 0=exhaustive mining
 --screen-candidates:256  rank-residual supervised proposal shortlist; 0=all candidates
 --screen-explore:48  reserve gradient-independent exploratory proposals
 --readout-refresh-every:4  refit frozen readout on new train data if separately validated (0=off)
 --readout-blend:0.5   interpolate frozen/updated readout to avoid abrupt shifts
---validation-steps:64  sampled noise stages for search/rotating acceptance (0=all)
---anchor-steps:48      sampled stages on held-fixed promotion anchors (0=all)
---monitor-steps:96     sampled stages on fixed protected heldout (0=all)
+--validation-steps:192 sampled noise stages for search/rotating acceptance (0=all)
+--anchor-steps:192     sampled stages on held-fixed promotion anchors (0=all)
+--monitor-steps:192    sampled stages on fixed protected heldout (0=all)
 --anchor-margin:0.002  anchor merit improvement required to promote
 --accept-floor:0.0     reject a candidate negatively ranked on either acceptance set
 --min-source-win:0.5  require >=50% source chunks improve on acceptance and anchors (0=disabled)
@@ -192,7 +193,8 @@ proc validate(o: Options) =
       o.anchorChunks < 0 or o.anchorPool < 0 or o.anchorRefresh < 1 or
       o.fitReplayChunks < 0 or o.fitReplaySteps < 0 or
       o.readoutRefreshEvery < 0 or o.readoutBlend <= 0 or o.readoutBlend > 1 or
-      o.search.rankScales < 1 or o.search.rankScales > 16 or
+      o.search.rankScales < 0 or o.search.rankScales > 16 or
+      o.search.readoutRidgeProbes < 1 or o.search.readoutRidgeProbes > 3 or
       o.search.mining.startStride < 1 or o.search.mining.gapSamples < 0 or
       o.search.screenCandidates < 0 or o.search.screenExplore < 0 or o.validationSteps < 0 or
       o.anchorSteps < 0 or o.monitorSteps < 0 or
@@ -463,6 +465,7 @@ proc main() =
     of "readout-blend": o.readoutBlend = parseFloat(value)
     of "balanced-rank-fit": o.search.balanceCases = parseBool(value)
     of "rank-scales": o.search.rankScales = parseInt(value)
+    of "readout-ridge-probes": o.search.readoutRidgeProbes = parseInt(value)
     of "mine-start-stride": o.search.mining.startStride = parseInt(value)
     of "mine-gap-samples": o.search.mining.gapSamples = parseInt(value)
     of "screen-candidates": o.search.screenCandidates = parseInt(value)
@@ -626,6 +629,7 @@ proc main() =
   let fixedAnchorPool = anchorIndices(plan.searchEnd,plan.acceptEnd,o.anchorPool)
   var anchor: DataSet
   var currentAnchorBlock = -1
+  stderr.writeLine("[readout objective] ", (if o.search.rankScales == 0: "exact all-pairs centered rank" else: "legacy sampled multiscale"), " ridge=", o.search.ridge)
   stderr.writeLine("[config] trainPool=", plan.trainEnd, " window=", window,
     " searchChunks=", min(o.searchChunks,plan.searchEnd-plan.trainEnd),
     " acceptanceChunks=", min(o.acceptChunks,plan.acceptEnd-plan.searchEnd-fixedAnchorPool.len),
@@ -747,6 +751,12 @@ proc main() =
     # First evaluate ordinary beam candidates on disjoint acceptance chunks.
     # Rollback is NOT periodic: it is reserved for an acceptance plateau.
     var shortlist = selectBeam(expanded,o.search.beam,iteration)
+    # The expensive ridge sweep runs ONLY on the tiny final shortlist.
+    # It uses Train for fitting and Search for tuning; acceptance and heldout
+    # remain untouched until final promotion gating.
+    for i in 0..<shortlist.len:
+      if shortlist[i].rules != accepted.rules:
+        shortlist[i] = tuneReadout(shortlist[i],train,selection,o.search)
     var nextAccepted = accepted
     var chosenRho = baselineRho
     var chosenAnchor = baselineAnchor

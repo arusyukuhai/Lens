@@ -1,3 +1,5 @@
+> Accuracy-oriented all-pairs rank readout experimental branch. See [DENSE_RANK_V9.md](DENSE_RANK_V9.md). New runs default to `--rank-scales:0` with shortlist readout tuning; historical mode: `--rank-scales:4 --readout-ridge-probes:1`. No measured accuracy/speed uplift is claimed.
+
 # Lens v8 — Residual-Guided Structural Search
 
 **Start here:** [V8_REDESIGN.md](V8_REDESIGN.md) explains the new bounded

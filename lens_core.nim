@@ -1,5 +1,5 @@
 ## Training/evaluation engine. Rules are ordered, applied once each, left to right.
-import std/[math, sequtils, random, algorithm, sets, times]
+import std/[math, sequtils, random, algorithm, sets, times, tables]
 import replace, spearman_rank_ridge
 
 type
@@ -136,6 +136,52 @@ proc predict*(columns: seq[seq[float64]], weights: seq[float64], rows: int): seq
   for c, column in columns:
     for row, x in column: result[row] += weights[c]*x
 
+proc trainingRankGraph*(data: DataSet, rankScales: int): RankPairGraph =
+  ## rankScales=0 is an EXACT O(N) sufficient-statistic representation of
+  ## uniform within-trajectory ALL-PAIRS least squares on normalized ranks.
+  ## rankScales>=1 reproduces the original sampled multiscale comparison graph.
+  if rankScales < 0:
+    raise newException(ValueError, "rankScales must be >= 0")
+  if rankScales > 0:
+    return caseAdjacentRankPairs(data.target, data.cases, rankScales)
+  if data.target.len != data.cases.len:
+    raise newException(ValueError, "trainingRankGraph: target/case mismatch")
+  result.centered = true
+  var grouped = initOrderedTable[int, seq[int]]()
+  for i, cid in data.cases: grouped.mgetOrPut(cid, @[]).add(i)
+  for _, ids in grouped:
+    if ids.len < 2: continue
+    let m = ids.len
+    var y = newSeq[float64](m)
+    for i, row in ids: y[i] = data.target[row]
+    let ranks = averageRanks(y)
+    result.caseGroups.add(ids)
+    inc result.caseCount
+    for i, row in ids:
+      result.hi.add(row)
+      result.lo.add(-1)
+      result.margin.add((ranks[i]-1.0)/float64(m-1)-0.5)
+      result.caseWeight.add(1.0/float64(m))
+
+proc designRankColumn*(graph: RankPairGraph, column: seq[float64]): seq[float64] =
+  ## For all-pairs, replace O(m^2) differences with centered samples:
+  ## sum_(i<j) ((x_i-x_j)-(y_i-y_j))^2 =
+  ##        m * sum_i ((x_i-xmean)-(y_i-ymean))^2.
+  result = newSeq[float64](graph.hi.len)
+  if graph.centered:
+    var pos = 0
+    for ids in graph.caseGroups:
+      var avg = 0.0
+      for row in ids: avg += column[row]
+      avg /= float64(ids.len)
+      for row in ids:
+        result[pos] = column[row] - avg
+        inc pos
+    assert pos == result.len
+  else:
+    for e in 0..<result.len:
+      result[e] = column[graph.hi[e]] - column[graph.lo[e]]
+
 proc fitPrimal*(columns: seq[seq[float64]], data: DataSet, ridge: float64,
                 balanceCases = false, rankScales = 1): seq[float64] =
   ## Primal form of supplied adjacent-pair rank ridge, no feature selection cap.
@@ -144,23 +190,25 @@ proc fitPrimal*(columns: seq[seq[float64]], data: DataSet, ridge: float64,
   let p = columns.len
   result = newSeq[float64](p)
   if p == 0: return
-  let graph = caseAdjacentRankPairs(data.target, data.cases, rankScales)
+  let graph = trainingRankGraph(data, rankScales)
   if graph.hi.len == 0: return
   var gram = newSeq[float64](p*p)
   var rhs = newSeq[float64](p)
   var delta = newSeq[float64](p)
+  var design = newSeq[seq[float64]](p)
+  for c in 0..<p: design[c] = designRankColumn(graph,columns[c])
   for e in 0..<graph.hi.len:
-    let edgeWeight = (if balanceCases: graph.caseWeight[e] else: 1.0)
+    let edgeWeight = (if balanceCases or graph.centered: graph.caseWeight[e] else: 1.0)
     for c in 0..<p:
-      delta[c] = columns[c][graph.hi[e]] - columns[c][graph.lo[e]]
+      delta[c] = design[c][e]
     for c in 0..<p:
       rhs[c] += edgeWeight*delta[c]*graph.margin[e]
       for d in 0..c: gram[c*p+d] += edgeWeight*delta[c]*delta[d]
-  let effectiveEdges = (if balanceCases: graph.caseCount else: graph.hi.len)
+  let effectiveEdges = (if balanceCases or graph.centered: graph.caseCount else: graph.hi.len)
   for c in 0..<p:
     let ss = gram[c*p+c]
     for d in 0..<c: gram[d*p+c] = gram[c*p+d]
-    gram[c*p+c] += (if ss > 0: ridge * ss / float64(effectiveEdges) else: 1.0)
+    gram[c*p+c] += (if ss > 0: (if graph.centered: ridge * ss else: ridge * ss / float64(effectiveEdges)) else: 1.0)
   # In-place Cholesky; lambda > 0 and inactive columns diagonal=1 guarantee SPD.
   for i in 0..<p:
     for j in 0..i:
@@ -303,29 +351,29 @@ proc prepareRankAppend*(columns: seq[seq[float64]], data: DataSet,
   result.p = columns.len
   result.ridge = ridge
   result.balanceCases = balanceCases
-  result.graph = caseAdjacentRankPairs(data.target, data.cases, rankScales)
-  result.effectiveEdges = (if balanceCases: result.graph.caseCount else: result.graph.hi.len)
+  result.graph = trainingRankGraph(data, rankScales)
+  result.effectiveEdges = (if balanceCases or result.graph.centered: result.graph.caseCount else: result.graph.hi.len)
   let p = result.p
   let edges = result.graph.hi.len
   result.edgeScale = newSeq[float64](edges)
   for e in 0..<edges:
-    result.edgeScale[e] = (if balanceCases: sqrt(result.graph.caseWeight[e]) else: 1.0)
+    result.edgeScale[e] = (if balanceCases or result.graph.centered: sqrt(result.graph.caseWeight[e]) else: 1.0)
   result.lower = newSeq[float64](p*p)
   result.differences = newSeq[seq[float64]](p)
   var rhs = newSeq[float64](p)
   for c in 0..<p:
     result.differences[c] = newSeq[float64](edges)
+    let design = designRankColumn(result.graph,columns[c])
     for e in 0..<edges:
       let scale = result.edgeScale[e]
-      result.differences[c][e] =
-        (columns[c][result.graph.hi[e]] - columns[c][result.graph.lo[e]])*scale
+      result.differences[c][e] = design[e]*scale
       rhs[c] += result.differences[c][e]*result.graph.margin[e]*scale
     for d in 0..c:
       var dot = 0.0
       for e in 0..<edges: dot += result.differences[c][e]*result.differences[d][e]
       result.lower[c*p+d] = dot
     let ss = result.lower[c*p+c]
-    result.lower[c*p+c] += (if ss > 0: ridge*ss/float64(result.effectiveEdges) else: 1.0)
+    result.lower[c*p+c] += (if ss > 0: (if result.graph.centered: ridge*ss else: ridge*ss/float64(result.effectiveEdges)) else: 1.0)
   for i in 0..<p:
     for j in 0..i:
       var v = result.lower[i*p+j]
@@ -342,16 +390,17 @@ proc fitAppend*(cache: RankAppendCache, column: seq[float64]): seq[float64] =
   let edges = cache.graph.hi.len
   result = newSeq[float64](p+1)
   if edges == 0: return
+  let design = designRankColumn(cache.graph,column)
   var cross = newSeq[float64](p)
   var ss, rhs: float64
   for e in 0..<edges:
     let scale = cache.edgeScale[e]
-    let d = (column[cache.graph.hi[e]] - column[cache.graph.lo[e]])*scale
+    let d = design[e]*scale
     ss += d*d
     rhs += d*cache.graph.margin[e]*scale
     if d != 0:
       for c in 0..<p: cross[c] += cache.differences[c][e]*d
-  var diagonal = ss + (if ss > 0: cache.ridge*ss/float64(cache.effectiveEdges) else: 1.0)
+  var diagonal = ss + (if ss > 0: (if cache.graph.centered: cache.ridge*ss else: cache.ridge*ss/float64(cache.effectiveEdges)) else: 1.0)
   # y=L^-1 cross, z=A^-1 cross. Use block Cholesky for numerical stability.
   var y = newSeq[float64](p)
   for i in 0..<p:

@@ -6,7 +6,7 @@ type
   SearchConfig* = object
     mining*: MiningConfig
     balanceCases*: bool
-    rankScales*: int
+    rankScales*, readoutRidgeProbes*: int
     beam*, lookahead*, maxCandidates*, screenCandidates*, screenExplore*, repairPasses*: int
     repairCandidates*, repairBeam*: int
     repairFullSweep*: bool
@@ -21,7 +21,7 @@ type
 
 proc defaultSearchConfig*(): SearchConfig =
   SearchConfig(mining: defaultMiningConfig(), balanceCases: true,
-    rankScales: 4, beam: 4, lookahead: 2,
+    rankScales: 0, readoutRidgeProbes: 3, beam: 4, lookahead: 2,
     screenCandidates: 256, screenExplore: 48,
     maxCandidates: 0, repairPasses: 1, repairCandidates: 16,
     repairBeam: 2, repairFullSweep: false, ridge: 0.01,
@@ -315,6 +315,34 @@ proc expandCached(parent: State, clean: seq[seq[int]], train, selection: DataSet
         evaluation: candidate.ev, novelty: candidate.novelty)
       child.rules.add(Rule(lhs: candidate.lhs, rhs: rhs))
       result.add(child)
+
+proc tuneReadout*(state: State, train, selection: DataSet,
+                  cfg: SearchConfig): State =
+  ## Only a handful of selected children reach this code. Try modest ridge
+  ## strengths, score on SEARCH (never acceptance or heldout), and let the
+  ## independent acceptance gate determine whether anything is promoted.
+  result = state
+  if cfg.readoutRidgeProbes <= 1 or state.rules.len == 0: return
+  let tr = traceRules(state.rules,train)
+  let va = traceRules(state.rules,selection)
+  let validation = prepareSpearman(selection)
+  let training = prepareSpearman(train)
+  let scales = (if cfg.readoutRidgeProbes == 2: @[1.0,4.0]
+                else: @[0.25,1.0,4.0])
+  var bestMerit = -Inf
+  for scale in scales:
+    let weights = fitPrimal(tr.columns, train, cfg.ridge*scale,
+                            cfg.balanceCases, cfg.rankScales)
+    let searchPrediction = predict(va.columns, weights, selection.texts.len)
+    let measure = caseSpearmanStability(validation,searchPrediction,cfg.stabilityPenalty)
+    if measure.merit > bestMerit:
+      bestMerit = measure.merit
+      result.evaluation.weights = weights
+      result.evaluation.score = measure.mean
+      result.evaluation.searchMerit = measure.merit
+      result.evaluation.train = scoreSpearman(training,
+        predict(tr.columns,weights,train.texts.len))
+  # Rule firing, phi correlations and novelty do not depend on readout weights.
 
 proc expand*(parent: State, clean: seq[seq[int]], train, selection: DataSet,
              cfg: SearchConfig): seq[State] =

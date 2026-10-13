@@ -34,6 +34,8 @@ type
     # is requested by the readout. Legacy fitters may ignore these weights.
     caseWeight*: seq[float64]
     caseCount*: int
+    centered*: bool   # 0=all-pairs objective uses per-case centered samples
+    caseGroups*: seq[seq[int]]
 
   RankRidgeModel* = object
     weights*: seq[float64]

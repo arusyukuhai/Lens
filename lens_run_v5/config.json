@@ -3,7 +3,7 @@
   "output": "lens_run_v5",
   "resume": "",
   "iterations": 100,
-  "window": 3,
+  "window": 6,
   "paths": 2,
   "noiseSteps": 128,
   "seed": 20261013,
