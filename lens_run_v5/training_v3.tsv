@@ -1,0 +1,2 @@
+#iteration	train_rho	search_rho	rot_accept_rho	anchor_accept_rho	heldout_rho	baseline_rot_rho	baseline_anchor_rho	rules	accepted	seconds	regrow
+1	0.6136588310651295	0.7784629886343302	0.7485372252335902	0.6423536939225014	0.6125972912213061	0.0	0.0	1	1	6.333605051040649	0	0

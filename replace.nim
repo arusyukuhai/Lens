@@ -36,6 +36,7 @@ type
   SeqPattern* = object
     parts: seq[LiteralPart]
     wildcardCount*: int
+    minWildcardLen*: int
     hasLeadingLiteral: bool
     allWildcard: bool
     emptyPattern: bool
@@ -82,7 +83,9 @@ proc makeLiteral(data: openArray[int]): LiteralPart =
   result.data = @data
   result.prefix = buildPrefix(data)
 
-proc compileSeqPattern*(pattern: openArray[int]): SeqPattern =
+proc compileSeqPattern*(pattern: openArray[int], minWildcardLen: int = 0): SeqPattern =
+  if minWildcardLen < 0: raise newException(ValueError, "negative wildcard minimum")
+  result.minWildcardLen = minWildcardLen
   ## Compile a sequence pattern. Every negative token is a wildcard.
   var current: seq[int] = @[]
   for x in pattern:
@@ -223,7 +226,7 @@ proc matchOccurrences(
       else:
         captures[w] = Capture(start: pos, len: 0)
     else:
-      let found = nextOccurrenceLazy(input, literal, cursors[w + 1], pos)
+      let found = nextOccurrenceLazy(input, literal, cursors[w + 1], pos + pattern.minWildcardLen)
       if found < pos or found > input.len or
           literal.data.len > input.len - found:
         return (false, start)
@@ -1223,3 +1226,39 @@ proc diff3ApplyDetailed*(
     base, changed, target, result.data,
     defaultChoice, addr result.conflicts, resolver, maxMyersD
   )
+
+
+proc containsSeqCompiled*(input: openArray[int], pat: SeqPattern): bool =
+  ## Allocation-free first-hit existence, with the same capture semantics as replacement.
+  if pat.emptyPattern or pat.allWildcard or pat.wildcardCount > 16:
+    return false
+  if pat.wildcardCount == 0:
+    return findLiteralFrom(input, pat.parts[0], 0) >= 0
+  var scratch: ReplaceScratch
+  for i in 0..<pat.parts.len:
+    scratch.cursors[i] = LiteralCursor(lastMatch: -1, nextSearch: 0)
+  var pos = 0
+  while pos < input.len:
+    let start = if pat.hasLeadingLiteral:
+      nextOccurrenceLazy(input, pat.parts[0], scratch.cursors[0], pos)
+      else: pos
+    if start < 0: return false
+    let matched = matchOccurrences(input, pat, scratch.cursors, start, scratch.captures)
+    if matched.ok: return true
+    if not pat.hasLeadingLiteral: return false
+    pos = start + 1
+  false
+
+proc replaceSeqStrict*(input: openArray[int], pat: SeqPattern,
+                       replacement: openArray[int]): seq[int] =
+  ## Unlike the legacy public wrapper, never silently turn overflow into identity.
+  var scratch: ReplaceScratch
+  var plan: ReplacementPlan
+  compileReplacementPlan(replacement, plan)
+  if replacement.len > 64:
+    raise newException(SeqReplaceError, "replacement plan exceeds 64 tokens")
+  var overflow = false
+  if not replaceSeqCompiledInto(input, pat, replacement, result, scratch,
+      addr plan, addr overflow):
+    if overflow: raise newException(SeqReplaceError, "replacement output overflow")
+    result = @input

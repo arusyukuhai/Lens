@@ -60,6 +60,22 @@ proc hashArray[T: SomeInteger](s: CountMinSketch,
     h = (h shl 27) or (h shr 37)
   result = mix64(h xor 0x8EBC6AF09C88C6E3'u64)
 
+# Incremental CONTENT hash for exhaustive wildcard mining. The initial
+# length must be the final pattern length, not the length of the prefix.
+# These three helpers reproduce hashArray bit-for-bit for seq[int].
+proc beginArrayHash*(s: CountMinSketch, finalLength: int): uint64 {.inline.} =
+  s.seed xor 0xD6E8FEB86659FD93'u64 xor
+    (uint64(finalLength) * 0x9E3779B185EBCA87'u64)
+
+proc extendArrayHash*(prefix: uint64, value: int): uint64 {.inline.} =
+  let v = cast[uint64](int64(value))
+  let h = (prefix xor (v + 0xA0761D6478BD642F'u64)) *
+    0xE7037ED1A0B428DB'u64
+  (h shl 27) or (h shr 37)
+
+proc finishArrayHash*(prefix: uint64): uint64 {.inline.} =
+  mix64(prefix xor 0x8EBC6AF09C88C6E3'u64)
+
 proc addHashed(s: var CountMinSketch, h: uint64,
                amount: uint32) {.inline.} =
   if amount == 0'u32: return
@@ -81,6 +97,24 @@ proc addHashed(s: var CountMinSketch, h: uint64,
       s.counters[p] = (if old > limit: high(uint32) else: old + amount)
       index = index + step
       offset += s.width
+
+# Fused CMS add + post-add estimate: exactly the same sketch counters and
+# estimate as addHashed(h, 1) followed by estimateHashed(h), but touches each
+# bucket once. Takes a FINALIZED hash (finishArrayHash).
+proc addHashedAndEstimate*(s: var CountMinSketch, h: uint64): uint32 {.inline.} =
+  let step = (h shr 32) or 1'u64
+  var index = h
+  var offset = 0
+  result = high(uint32)
+  for row in 0..<s.depth:
+    let p = offset + int(index and s.mask)
+    var count = s.counters[p]
+    if count != high(uint32):
+      inc count
+      s.counters[p] = count
+    if count < result: result = count
+    index = index + step
+    offset += s.width
 
 proc estimateHashed(s: CountMinSketch, h: uint64): uint32 {.inline.} =
   let step = (h shr 32) or 1'u64
@@ -147,6 +181,11 @@ proc `[]`*[T: SomeInteger](s: CountMinSketch,
                            key: openArray[T]): uint32 {.inline.} =
   s.estimate(key)
 
+# Fused convenience form for callers that do not maintain a rolling hash.
+proc addAndEstimate*[T: SomeInteger](s: var CountMinSketch,
+                                     key: openArray[T]): uint32 {.inline.} =
+  s.addHashedAndEstimate(s.hashArray(key))
+
 # Indexed assignment only raises an estimate. To increment quickly, use add().
 proc `[]=`*(s: var CountMinSketch, key: uint64,
             value: uint32) {.inline.} =
@@ -209,6 +248,22 @@ when isMainModule:
   doAssert cms[b] == 7'u32
   cms.add(@[-1, -2])
   doAssert cms.estimate(@[-1, -2]) == 1'u32
+
+  # Incremental prefix hash must agree with whole-array hashing on literals
+  # and signed wildcard tokens, including empty arrays.
+  let keys: seq[seq[int]] = @[@[], @[1], @[-1], @[1, -1, 3, -1, 5], @[255, 256, 257]]
+  for key in keys:
+    var rolling = cms.beginArrayHash(key.len)
+    for v in key:
+      rolling = extendArrayHash(rolling, v)
+    let h = finishArrayHash(rolling)
+    var reference = initCountMinSketch(width = 4096, depth = 4)
+    var optimized = initCountMinSketch(width = 4096, depth = 4)
+    for i in 0..<20:
+      reference.add(key)
+      let expected = reference.estimate(key)
+      doAssert optimized.addHashedAndEstimate(h) == expected
+      doAssert optimized.estimate(key) == expected
 
   cms.clear()
   doAssert cms.estimate(a) == 0'u32

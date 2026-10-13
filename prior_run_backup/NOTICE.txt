@@ -1,3 +1,0 @@
-Pre-existing sample checkpoint and history from the previous inference-enabled release.
-They are retained only for resuming or historical reference.
-Load with --load prior_run_backup/minimal_gp_checkpoint.npz if desired.

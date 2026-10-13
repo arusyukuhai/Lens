@@ -1,15 +1,0 @@
-corpus: loaded 40 chunks from /mnt/data/lens_cpu_work/smoke/smallcode.txt
-init: building corpus sampler...
-init: corpus sampler ready (0.02s)
-init: creating population (6 genomes x 16 rules = 96 rules)...
-  population 1/6  population 2/6  population 3/6  population 4/6  population 5/6  population 6/6                                                init: population ready (0.04s)
-gen=0: building initial rolling noise trajectories...
-gen=0: evaluating 6 population + 0 hof genomes on 6 trajectories (roll=0, changed=1, len=36..36)...
-  native eval 1/6  native eval 2/6  native eval 3/6  native eval 4/6  native eval 5/6  native eval 6/6                                                        init: inference set cases=1 span<=36 noise=0.030
-gen=     0 best=+0.845154 mean=+0.580275 median=+0.741366 inferBest=1.000 inferBestEver=1.000 infEns=0.250 infOracle=1.000 infMove=0.79 front=3 infGA=0.00s infPlan=1x4x3/3r infReq=1x4x3:direct infVote=3 infEq=5.0/10 active=2/16 expand=0 stag=0 roll=0 overlap=0/1 d=+nan hof=1/8 hofScore=+0.845154 hofNow=+0.845154 link=37 qd=4 search=0.002s embed_moved=5 latent=1 seconds=0.01 infNative=0.00s nativeCalls=4 nativePack=0.00s
-gen=0: breeding next population...
-                                                                        gen=0: breed=0.00s wall=0.01s elite_keep=6 mut(local/bal/explore)=0/0/0 rows_changed=0 mix_rows=0 link=37 qd=4 qd_inject=0 hof_inject=0 hof_parent_uses=0 qd_parent_uses=0 ops[mix_local:0/mix_balanced:0/local:0/balanced:0/explore:0/legacy:0] cross(2pt/merge)=0/0 merge_rows=0 hof_admit=1 hof_replace=0
-gen=1: evaluating 6 population + 1 hof genomes on 6 trajectories (roll=0, changed=0, len=36..36)...
-                                                        gen=     1 best=+0.845154 mean=+0.580275 median=+0.741366 inferBest=1.000 inferBestEver=1.000 infEns=1.000 infOracle=1.000 infMove=0.79 front=3 infGA=0.00s infPlan=1x4x3/3r infReq=1x4x3:direct infVote=3 infEq=5.0/10 active=2/16 expand=0 stag=1 roll=0 overlap=1/1 d=+0.000e+00 hof=1/8 hofScore=+0.845154 hofNow=+0.845154 link=37 qd=4 search=0.000s embed_moved=5 latent=1 seconds=0.00 infNative=0.00s nativeCalls=4 nativePack=0.00s
-gen=1: breeding next population...
-                                                                        gen=1: breed=0.00s wall=0.00s elite_keep=6 mut(local/bal/explore)=0/0/0 rows_changed=0 mix_rows=0 link=37 qd=4 qd_inject=0 hof_inject=0 hof_parent_uses=0 qd_parent_uses=0 ops[mix_local:0/mix_balanced:0/local:0/balanced:0/explore:0/legacy:0] cross(2pt/merge)=0/0 merge_rows=0 hof_admit=0 hof_replace=0

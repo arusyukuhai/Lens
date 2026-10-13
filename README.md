@@ -1,204 +1,176 @@
-> **Current branch (2026-10-11):** Information-Guided BIPS/Relational. See [README_INFORMATION_DRIVEN_2026-10-11.md](README_INFORMATION_DRIVEN_2026-10-11.md).
+# Lens v8 — Residual-Guided Structural Search
 
-**2026-10-11 source-balanced BIPS + edit-sensitive macro verification:** see `README_BIPS_SOURCE_BALANCED_EDIT_2026-10-11.md`. The previous 2-case default could never supply two distinct BIPS training originals; the same ~200 trajectory budget is now redistributed across 3 cases, and confirmed macros can be ranked by correct-vs-wrong same-position edit preference without changing ordinary OLS+Pearson or the inner string GA.
+**Start here:** [V8_REDESIGN.md](V8_REDESIGN.md) explains the new bounded
+wildcard-gap proposal, training-only rank-residual screen, original-source
+consensus acceptance, commands, and important limitations. The existing
+Replacer rule semantics, multiscale regression, JSON checkpoint format and
+-log2 Spearman plot remain intact. Legacy Rollback is opt-in for new runs.
 
-> Latest BIPS candidate-screening upgrade: [README_BIPS_CONFIRMATION_2026-10-11.md](README_BIPS_CONFIRMATION_2026-10-11.md).
+---
 
-> **Current BIPS/CEGAR refinement:** see [`README_BIPS_EFFICIENT_2026-10-11.md`](README_BIPS_EFFICIENT_2026-10-11.md) for source-stage snapshots, counterexample repair, exact Native preflight, settings, and validation.
+# Lens v7 — multiscale rank training / balanced sources / gated readout
 
-# 2026-10-11 multi-strategy guided learning
+**Start here:** [V7_DESIGN_AND_ABLATION.md](V7_DESIGN_AND_ABLATION.md)
 
-See `README_MULTISTRATEGY_DIFF3_2026-10-11.md` for six rule-generation modes including 3-way diff3, and mode-selection flags. Outer OLS/Pearson and inner reconstruction GA are preserved.
+The v7 learner is a structural change, not another search hyperparameter tweak:
+- **Multiscale rank pairs** (1,2,4,8) instead of only adjacent noise stages, fitting a closer surrogate to sequence-wide Spearman.
+- **Equal source-path contribution** to regression regardless of trajectory length.
+- **Gated readout-only improvement** so a validated champion may improve its weights without adding or deleting rules. Rejected updates leave rules and weights untouched.
+- **Bounded two-path noise trajectories** and optional sampled n-gram starting positions to control time/memory. Exact mining remains `--mine-start-stride:1`.
+- More source chunks for validation. Original source-tokenization, RHS rules, dependency-aware rollback, protected holdout and log2 chart remain.
 
-IMPORTANT: 2026-10-11 default is DIRECTED RULE LEARNING + LINEAR REGRESSION / PEARSON with GA INFERENCE.
-For current usage see README_DIRECT_RULE_LEARNING_GA_2026-10-11.md.
-The historical revision notes below describe older Spearman versions.
+## Recommended new run
 
-# v64 — Hidden Phrase Memory + v60 String-side Genetic Inference
-
-## 2026-10-07 inference/MPS performance repair
-
-See `INFERENCE_MPS_FIX_2026-10-07.md`. Inference candidate uploads no longer rebuild anchor statistics every inner generation, unchanged candidate scores are memoized across inner GA rounds, the final ensemble rows are reused, and MPS timing now separates outer/inference work. `--inference-budget-mode direct` makes requested inference shape literal when needed.
-
-
-最新の表現力拡張（`-2/-3` hidden capture、24種類の hidden read/pop/delete、走査末尾の persistent hidden rewrite、hidden-aware cycle detection）は **[README_v64.md](README_v64.md)** を参照してください。以下は引き続き有効な v60 系 inference/Pareto の説明です。
-
-v59 の all-sample pairwise rank readout と v58 の linkage/QD/operator search を残したまま、**実際に入力文字列側を探索して復元できるか**を第二目的に追加した版です。
-
-## 何を追加したか
-
-各 outer generation で、通常の Spearman 評価後に独立した短い code snippet を数個用意します。snippet には既知の位置だけ人工ノイズを入れます。
-
-```text
-clean text
-   ↓ corruption (positions are recorded)
-noisy text
-   ↓ inner genetic search: only corrupted positions may change
-candidate strings
-   ↓ current Replace population scores candidates
-best-scoring inferred strings
-   ↓ compare to hidden clean bytes at corrupted positions only
-recovery accuracy
+```sh
+nim c -d:release --opt:speed cms.nim
+./cms --corpus:github-code.txt --out:lens_run_v7 --iterations:100 \
+  --rank-scales:4 --balanced-rank-fit:true \
+  --mine-start-stride:2 --readout-refresh-every:4
 ```
 
-未変更部分を分母へ入れると accuracy が不当に高くなるため、第二目的 `inference_accuracy` は **人工的に壊した byte の復元率だけ**です。
+Run the new parity test first: `nim c -r -d:release test_v7_multiscale.nim`.
 
-clean byte は mutation proposal や candidate fitness には一切使わず、最終採点にだけ使います。
+**Scientific status:** this release has not been Nim-compiled or benchmarked in the authoring environment. The v6/v7 differences are hypotheses to test; the improved generalization curve is *not* established. Source-level tests and the independent linear algebra check are provided.
 
-## Inner GA
+---
 
-既定値は以下です。
+> **v6 Generalization-first / CacheFast**
+> Start with [OPTIMIZATION_V6.md](OPTIMIZATION_V6.md) for the reproducible shuffled source split, shared training-derived noise alphabet, exact presence/cache optimizations and cross-chunk robustness ranking. Existing v5 checkpoint resumes without changing source order or noise protocol. New `--out` is recommended to evaluate v6 honestly.
 
-```text
---inference-cases 3
---inference-population 12
---inference-generations 4
---inference-elites 3
---inference-span 192
---inference-noise 0.05
---inference-ensemble 64
---inference-rotate-every 2
---inference-budget-ratio 0.75
+# Lens v5 — Frozen Champion & Robust Validation
+
+This release is based on **Lens Rollback Acceptance Gated v4** and preserves
+its nonlocal Dependency-Aware Regrow, beam search, wildcard rules, 4096-token
+cap, and checkpoint compatibility. The important changes are *evaluation*
+and *generalization* corrections, not simply more beam width or a more
+expensive rollback procedure.
+
+## Why this changes the design
+
+Previous v4 code ran `accepted.evaluate(train, selection, ridge)` at the start
+of **every iteration**. Thus even when `promoted=false`, the incumbent's
+regression weights were refitted on a different 3–4-chunk training window.
+The saved model and protected heldout score changed while the rule sequence
+was identical. This is a correctness bug in the meaning of "accepted
+champion", not ordinary training variance.
+
+In v5 the champion's weights are **frozen until a new candidate is promoted**.
+The exploratory beam may be refitted every iteration, but the accepted model
+is not. Its weights are serialized in a **format-3 checkpoint** and restored
+without refitting. Old formats 1 and 2 are supported, but because they did
+not store the champion's weights, the first resumed iteration performs one
+explicit migration refit. Later rejected iterations do not change them.
+
+## Promotion: three safeguards
+
+1. A candidate must outperform the SAME frozen incumbent on a rotating
+   acceptance batch, with the same source chunks and corruption realizations.
+2. A candidate must *also* improve on a separately reserved anchor batch of
+   independent source chunks. The anchor batch refreshes every N iterations
+   to reduce repeated overfitting to one tiny validation set. Reserved anchor
+   pool sources never appear in rotating acceptance, although different
+   anchor batches come from the same designated reservoir.
+3. Both candidate correlations must exceed `--accept-floor` (default 0.0):
+   improving from -0.42 to -0.28 is not a meaningful promotion by default.
+   Additional rules also incur the existing `--rule-penalty`.
+
+Note that *reusing any validation pool for many model-selection steps still
+leaks selection information*. Protected heldout is never used for promotions,
+rollbacks, or hyperparameter selection. Even 8 heldout chunks are only a
+small diagnostic sample. The input format lacks repository identifiers,
+so source-chunk separation alone cannot guarantee repository-disjoint data;
+near duplicates may remain across partitions.
+
+## Data and speed
+
+- Keep `--window:3 --replay-chunks:1` as the **mining** corpus.
+- Add `--fit-replay-chunks:4` training-only, widely spaced corpus chunks;
+  these are *not* mined for n-grams and are used only for regression fitting.
+- The new fit-only trajectories use `--fit-replay-steps:64`, keeping cost
+  bounded even for 4096-token chunks. This reduces training-window fragility.
+- Search and rotating acceptance default to **3 and 4 source chunks** rather
+  than 1 and 2. Their trajectories use `--validation-steps:96` instead of
+  all single-character stages, so verification costs less than before.
+- Anchors use `--anchor-steps:96`; protected heldout uses
+  `--monitor-steps:96`. `--noise-steps:0` still means **all stages in the
+  primary training chunks**; no implicit training-stage subsampling.
+- Rollback is still gated on stalled model promotions, now 5 consecutive
+  failed robust promotions by default. The existing nonadjacent causal-drift
+  heuristic and bounded regrowth stay in place.
+
+## Recommended: clean baseline run
+
+```sh
+nim c -d:release --opt:speed cms.nim
+./cms --corpus:github-code.txt --out:lens_run_v5 --iterations:100 \
+  --max-chunk-tokens:4096 --beam:4 --lookahead:2 \
+  --search-chunks:3 --accept-chunks:4 --anchor-pool:16 \
+  --anchor-chunks:4 --anchor-refresh:8 --holdout:8 \
+  --fit-replay-chunks:4 --fit-replay-steps:64 \
+  --validation-steps:96 --anchor-steps:96 --monitor-steps:96
 ```
 
-候補文字列は corrupted loci だけを gene として扱います。mutation は corpus byte distribution と現在の局所 context から byte を提案し、clean target は見ません。crossover も corrupted loci だけで行います。
+To resume an older checkpoint (while preserving its old partition parameters
+where explicitly stored), overwrite the modules and rebuild, then use:
 
-candidate pool は全 genome 共通です。上位 Spearman genome 群だけが search generation 中の candidate を rank 化して投票し、その平均 rank で shared candidate population を進化させます。raw readout scale の大きい genome が投票を独占しないよう、tie-safe な平均順位を使います。
-
-探索が終わったら **最終 candidate pool だけ** を全 genome で一度評価します。各 genome の第二目的は、その genome 自身の readout が最終 pool 内で最も高く評価した candidate の復元率を case 平均した値です。したがって `inference_accuracy` は genome ごとに異なりますが、中間世代を全450 genomeで評価する無駄はありません。
-
-### エリート保存
-
-文字列側GAには `--inference-elites`（既定3）を追加し、各 inner generation で上位候補を **byte-for-byte そのまま次世代へコピー**します。elite copy 自体には crossover / mutation を掛けません。候補数が小さくなった場合でも最低1枠は offspring 用に残すため、budget縮小時に elite だけで population が埋まって探索停止することもありません。
-
-## Pareto selection
-
-outer population は
-
-```text
-objective 1: Spearman fitness  (maximize)
-objective 2: inference_accuracy (maximize)
+```sh
+./cms --resume:lens_run/checkpoint.json --iterations:100
 ```
 
-の2目的を NSGA-II 型 non-dominated sorting + crowding distance で選択します。
+The first V1/V2-resumed iteration necessarily re-fits the legacy champion
+because its checkpoint did not contain weights. The old output directory's
+`training_v2.tsv` is untouched; v5 logs go to **training_v3.tsv** with
+columns: iteration, frozen champion train rho, frozen champion search rho,
+rotating acceptance rho, anchor acceptance rho, protected heldout rho,
+baseline rotating rho, baseline anchor rho, rule count, promoted, seconds,
+regrow-proposal. `training.png` is regenerated from v5's TSV. The anchor
+series can jump at refresh boundaries; the heldout series uses identical
+fixed source trajectories and *should be exactly flat on rejected updates*.
 
-- elite survivor: **明示的な survivor elitism**。Pareto knee / best Spearman / best inference を優先的に固定し、残りを Pareto rank / crowding 順で `--elites` 枠まで無改変コピー
-- tournament parent selection: Pareto rank / crowding 順
-- QD cell representative: Pareto comparator
-- linkage elite set: Pareto 順
+Use `--anchor-pool:0 --anchor-chunks:0` to disable the secondary anchor gate,
+though doing so weakens model selection. To disable rollback entirely for an
+ablation study, use `--regrow-every:0` or `--regrow-positions:0`.
 
-HoF は従来の「rank representation の長期 archive」という役割を保つため、admission 自体は top Spearman candidates を使います。
+## Validation
 
-`best_minimal_gp.json` は従来互換で best-observed Spearman、`latest_minimal_gp.json` は現在の Pareto front の knee（Spearman と inference のバランス点）を保存します。
-
-## 2倍を超えにくくする予算制御
-
-checked revision では inner GA の仕事量を **full-population trajectory equivalent** で見積もります。
-
-```text
-cases * candidate_population * (1 + generations * ensemble_size / population_size)
+```sh
+nim c -r -d:release test_generalization_v5.nim
+nim c -r -d:release test_validation.nim
+nim c -r -d:release test_rollback_policy.nim
+nim c -r -d:release test_lens.nim
 ```
 
-`1` は最終 candidate pool を全 genome で採点する1回分です。search generation は上位 ensemble だけを評価します。`--inference-budget-ratio` には引き続き 0.85 の hard cap を掛けます。
+Tests include anchor vs. rolling disjointness, two-source-group promotion
+requirements, rejection of negative-only "improvements", and an exploratory
+refit that leaves champion coefficients unchanged. All previous v4 tests
+are included. **The provided environment does not have Nim or gnuplot**;
+compilation and accuracy/speed benchmarking have not been performed here.
+Please run the tests locally and compare v4 and v5 from new runs under
+identical corpus, random seed, and protected heldout group before concluding
+that generalization has improved.
 
-デフォルト population=450, ensemble=64, cases=3, candidates=12, generations=4 なら、
 
-```text
-3 * 12 * (1 + 4*64/450) = 56.48 equivalent trajectories
-outer = 4 * 50 = 200 trajectories
-nominal extra ~= 28%
+## Plot styling update (log2 reference-chart edition)
+
+This variant modifies only `cms.nim`'s `emitPlot` visualization string.
+It replaces the two-panel raw-Spearman plot with one scientific-style 1600x870
+figure (light grid, bottom-left boxed legend, moderate line/marker weights).
+**Each displayed series** is transformed using `-log2(1 - Spearman rho)`;
+negative rho values remain negative and rho=1 is capped only for visualization.
+The source file `training_v3.tsv`, fitting objective, search metric, validation
+acceptance rule, checkpoint format and rule-search behavior are unchanged.
+The series are fixed held-out, rotating anchor, rotating acceptance, and search
+validation. Unlike the fixed held-out series, rotating series are measured on
+changing source chunks and their iteration-to-iteration values are not a
+strictly comparable generalization curve.
+
+After rebuilding `cms.nim`, plots are regenerated as part of each iteration.
+To replot an existing run immediately, enter the run output directory and run:
+
+```sh
+gnuplot training.gnuplot
 ```
 
-となります。inference snippet は既定192 bytesで通常trajectoryより短いため、初版v60よりかなり余裕を持って2倍未満を狙える構成です。
-
-Apple MPS では同じ persistent evaluator / Global Rule Pool を再利用し、active sample prefix に加えて、**同じ search ensemble の rule/index pack を inner generation 間で再利用**します。search ensemble は1回、最後の全population採点でもう1回だけpackします。
-
-## グラフ
-
-`training_saturation.png` は左軸が従来どおり
-
-```text
--log2(1 - Spearman)
-```
-
-右軸が
-
-```text
-corrupted-byte recovery accuracy [0, 1]
-```
-
-です。右軸には
-
-- `inference raw` — 現在の Pareto-knee genome の実測 recovery（gray）
-- `inference best` — その世代の population 内の最良 recovery
-- `inference MA(200)` — raw recovery の移動平均
-
-を重ねます。
-
-history CSV には `inference_raw`, `inference_best`, `inference_best_ever`, `inference_mean`, `inference_seconds`, `inference_model_jobs`, `inference_equivalent_work`, `inference_search_rounds`, `pareto_front_size` 等も保存します。
-
-## checkpoint compatibility
-
-v64 の新規 checkpoint は `version=2` です。`version=1` checkpoint もそのままロードできますが、旧版では負の pattern token 全てが同じ wildcard 意味だったため、ロード時に旧 `-1..-16` を普通の `-1` wildcard に正規化してから v64 意味論へ移行します。これにより旧個体中の偶然の `-2/-3` が hidden-memory side effect として再解釈されることを防ぎます。
-
-## 推奨実行
-
-```bash
-python3 main.py --backend mps \
-  --load minimal_gp_checkpoint.npz \
-  --checkpoint minimal_gp_checkpoint_v60.npz \
-  --save best_minimal_gp_v60.json \
-  --current-save latest_minimal_gp_v60.json \
-  --history-csv fitness_history_v60.csv \
-  --plot-prefix training_v60
-```
-
-負荷をさらに下げるなら例えば:
-
-```bash
---inference-budget-ratio 0.50 --inference-generations 3
-```
-
-A/B 用に第二目的を完全に切る場合:
-
-```bash
---no-inference
-```
-
-## 検証
-
-```bash
-python3 main.py --self-test
-python3 -m unittest -v \
-  test_improvements.py \
-  test_v58_search.py \
-  test_v59_rank_readout.py \
-  test_v60_inference.py
-```
-
-v60 では追加で以下をテストします。
-
-- inference work hard cap
-- mutation が corrupted loci 以外を変更しないこと
-- 2目的 Pareto front/rank
-- checkpoint pack/unpack で inference/Pareto metadata が保存されること
-- CPU smoke training で inner GA + Pareto breeding が通ること
-
-この環境では Apple MPS 実機を持たないため、Metal kernel の実機 benchmark は未実施です。host orchestration と CPU path はテスト済みです。
-
-
-## Checked revision
-
-追加監査で見つかった修正点の詳細は `AUDIT_v60.md` を参照してください。
-
-## v60.1 inference zero fix
-
-If `inferBest=0.000` stayed pinned in the previous v60 package, use this revision.
-A real tie-handling bug was found: final `np.argmax` preferred candidate 0, which is
-always the untouched noisy string, whenever Replacer scores tied. v60.1 removes that
-no-op bias, adds context-guided one-locus proposals, and prints `infOracle` / `infMove`
-diagnostics. See `README_v60.md` and `AUDIT_v60.md`.
-
-## v60.2 inference mutation radius
-
-Normal string-side mutations now choose the number of corrupted loci with `round(exp(uniform(0, log(k))))`, clamped to `1..k`. A scheduled focus locus is included inside that log-uniform mutation set rather than forcing a one-byte mutation. Only known corrupted loci remain mutable.
+For an existing run, first rebuild and run at least one iteration to write the
+new `training.gnuplot`; or copy `examples/training.gnuplot` into the run folder
+that contains `training_v3.tsv`, then execute `gnuplot training.gnuplot`.

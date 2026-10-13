@@ -1,0 +1,11 @@
+abcabc
+===SPLIT===
+abdabd
+===SPLIT===
+abcabd
+===SPLIT===
+abcacd
+===SPLIT===
+abcbbc
+===SPLIT===
+abcbcd

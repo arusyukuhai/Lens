@@ -20,7 +20,7 @@
 import std/[algorithm, math]
 
 const
-  DefaultRankMaxFeatures* = 256
+  DefaultRankMaxFeatures* = 2048
   Tiny* = 1.0e-12
   WeightClip* = 1.0e6
 
@@ -30,6 +30,10 @@ type
     hi*: seq[int]
     lo*: seq[int]
     margin*: seq[float64]
+    # The edges of each source trajectory sum to one when case balancing
+    # is requested by the readout. Legacy fitters may ignore these weights.
+    caseWeight*: seq[float64]
+    caseCount*: int
 
   RankRidgeModel* = object
     weights*: seq[float64]
@@ -367,9 +371,13 @@ proc fitDualRidge*(x: seq[seq[float64]],
 
 
 proc caseAdjacentRankPairs*(cleanliness: seq[float64],
-                            caseIds: seq[int]): RankPairGraph =
-  ## Build the same sparse case-local adjacent rank graph as the Python code.
-  ## For a case with m rows, all m rows participate but only m-1 edges are built.
+                            caseIds: seq[int], scales = 1): RankPairGraph =
+  ## Multi-scale per-trajectory rank graph: distances 1,2,4,... on the
+  ## target-sorted rows, bounded by the requested number of scales.
+  ## scales=1 preserves the legacy adjacent-pair graph exactly.
+  ## caseWeight is 1/(number of edges in that case), so a 4k-stage
+  ## source cannot dominate a 32-stage source solely by row count.
+  if scales < 1: raise newException(ValueError, "rank scales must be >= 1")
   if cleanliness.len != caseIds.len:
     raise newException(ValueError, "caseAdjacentRankPairs: length mismatch")
   let n = cleanliness.len
@@ -404,16 +412,28 @@ proc caseAdjacentRankPairs*(cleanliness: seq[float64],
       let rankOrder = stableSortedIndices(ranks)
       let den = max(1.0, float64(m - 1))
 
-      for j in 0 ..< (m - 1):
-        let loLocal = rankOrder[j]
-        let hiLocal = rankOrder[j + 1]
-        let loId = ids[loLocal]
-        let hiId = ids[hiLocal]
-        let loRank = (ranks[loLocal] - 1.0) / den
-        let hiRank = (ranks[hiLocal] - 1.0) / den
-        result.lo.add(loId)
-        result.hi.add(hiId)
-        result.margin.add(hiRank - loRank)
+      var distances: seq[int]
+      var distance = 1
+      while distance < m and distances.len < scales:
+        distances.add(distance)
+        if distance > m div 2: break
+        distance = distance * 2
+      var caseEdges = 0
+      for d in distances: caseEdges += m - d
+      let edgeWeight = 1.0 / float64(caseEdges)
+      inc result.caseCount
+      for d in distances:
+        for j in 0 ..< (m - d):
+          let loLocal = rankOrder[j]
+          let hiLocal = rankOrder[j + d]
+          let loId = ids[loLocal]
+          let hiId = ids[hiLocal]
+          let loRank = (ranks[loLocal] - 1.0) / den
+          let hiRank = (ranks[hiLocal] - 1.0) / den
+          result.lo.add(loId)
+          result.hi.add(hiId)
+          result.margin.add(hiRank - loRank)
+          result.caseWeight.add(edgeWeight)
 
     groupStart = groupStop
 
