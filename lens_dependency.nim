@@ -106,17 +106,20 @@ proc affectedRuleOrder*(baseline, revised: seq[Rule],
       let onA = containsSeqCompiled(a, altPattern)
       if i > changedIndex and onB != onA:
         drift[i].firingDrift += 1.0
-      if onB:
-        let after = replaceSeqStrict(b, basePattern, baseline[i].rhs)
-        if i > changedIndex and onA:
-          let otherAfter = replaceSeqStrict(a, altPattern, revised[i].rhs)
-          # Do not include absolute match position: an unrelated earlier
-          # insertion can shift an unchanged downstream rule's match.
-          if editSignature(b, after) != editSignature(a, otherAfter):
-            drift[i].editDrift += 1.0
-          altRows[j] = otherAfter
-        baseRows[j] = after
-      if onA and not (i > changedIndex and onB):
+      # IMPORTANT: both pipelines must advance at EVERY rule, even before
+      # the edited root. Otherwise the revised chain silently skips shared
+      # prefix rewrites and reports completely fictitious distant impacts.
+      if onB and onA:
+        let afterB = replaceSeqStrict(b, basePattern, baseline[i].rhs)
+        let afterA = replaceSeqStrict(a, altPattern, revised[i].rhs)
+        if i > changedIndex and
+            editSignature(b, afterB) != editSignature(a, afterA):
+          drift[i].editDrift += 1.0
+        baseRows[j] = afterB
+        altRows[j] = afterA
+      elif onB:
+        baseRows[j] = replaceSeqStrict(b, basePattern, baseline[i].rhs)
+      elif onA:
         altRows[j] = replaceSeqStrict(a, altPattern, revised[i].rhs)
   for i in changedIndex+1..<n:
     var impact = drift[i]

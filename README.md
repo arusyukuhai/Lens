@@ -1,3 +1,16 @@
+## v10 Precision-first Dependency Regrow
+
+See **REGROW_V10.md** for dependency replay fix, pairwise counterfactual ranking, precision-focused command line and tests.
+
+# Counterfactual Dependency-Aware Regrow v9 (experimental)
+
+Read [REGROW_V9.md](REGROW_V9.md) for the source-targeted counterfactual
+rollback, bounded multi-finalist acceptance, and ablation settings.
+This update builds on v8 All-Pairs Rank Readout and does not change
+normal model fitting, held-out evaluation, or visualization.
+
+---
+
 > Accuracy-oriented all-pairs rank readout experimental branch. See [DENSE_RANK_V9.md](DENSE_RANK_V9.md). New runs default to `--rank-scales:0` with shortlist readout tuning; historical mode: `--rank-scales:4 --readout-ridge-probes:1`. No measured accuracy/speed uplift is claimed.
 
 # Lens v8 — Residual-Guided Structural Search

@@ -12,7 +12,8 @@ type
     repairFullSweep*: bool
     regrowDepth*, regrowPositions*, regrowAblate*, regrowBeam*, rhsProbe*: int
     regrowRoots*, regrowTargets*, regrowSamples*, regrowMines*: int
-    ridge*, phiThreshold*, epsilon*, regrowMaxLoss*, stabilityPenalty*: float64
+    regrowProbeTargets*, regrowPairProbes*, regrowMatchPool*, regrowFinalists*: int
+    ridge*, phiThreshold*, epsilon*, regrowMaxLoss*, stabilityPenalty*, regrowFinalistSlack*: float64
   Candidate = object
     lhs: seq[int]
     sourceIndex: int
@@ -29,7 +30,9 @@ proc defaultSearchConfig*(): SearchConfig =
     regrowDepth: 2, regrowPositions: 0, regrowAblate: 4,
     regrowBeam: 2, rhsProbe: 4,
     regrowRoots: 4, regrowTargets: 2, regrowSamples: 64,
-    regrowMines: 8, regrowMaxLoss: 0.04, stabilityPenalty: 0.35)
+    regrowMines: 8, regrowProbeTargets: 4, regrowPairProbes: 3, regrowMatchPool: 64,
+    regrowFinalists: 3, regrowFinalistSlack: 0.02,
+    regrowMaxLoss: 0.04, stabilityPenalty: 0.35)
 
 proc patterns(chunks: seq[seq[int]], cfg: SearchConfig): seq[PatternEntry] =
   var length = 0
@@ -412,9 +415,86 @@ proc repairCandidates*(mined: seq[PatternEntry], oldLhs, rhs: seq[int],
     let offset = ((2*i+1)*(eligible.len-head)) div (2*remaining)
     result.add(eligible[head+offset])
 
+proc restorationShortlist*(pool: seq[PatternEntry],
+                            stageTexts: seq[seq[int]],
+                            referenceFiring: seq[float64],
+                            keep: int): seq[PatternEntry] =
+  ## TRAIN-ONLY mechanistic proposal. If an upstream edit changed the local
+  ## representation, seek replacement LHSs that reproduce the old rule's
+  ## activation signature. Keep half the quota for exploratory alternatives.
+  ## Never query Search / Acceptance / protected Held-out here.
+  if keep <= 0 or pool.len <= keep: return pool
+  if referenceFiring.len != stageTexts.len:
+    return pool[0..<keep]
+  var positives = 0
+  for x in referenceFiring:
+    if x > 0.5: inc positives
+  if positives == 0:
+    return pool[0..<keep]
+  var patterns: seq[seq[int]]
+  for entry in pool: patterns.add(entry.value)
+  let matched = batchPresence(compileBatch(patterns), stageTexts)
+  type RankedPattern = tuple[index: int, score: float64]
+  var ranks: seq[RankedPattern]
+  for i, col in matched.columns:
+    var hits = 0
+    var trueHits = 0
+    for row in 0..<stageTexts.len:
+      if (col[row shr 6] and (1'u64 shl (row and 63))) != 0'u64:
+        inc hits
+        if referenceFiring[row] > 0.5: inc trueHits
+    # F1 avoids the degenerate solution 'never fires' when positives are rare.
+    let f1 = if hits+positives > 0:
+                2.0*float64(trueHits)/float64(hits+positives)
+             else: 0.0
+    ranks.add((index: i, score: f1))
+  ranks.sort(proc(a,b: RankedPattern): int =
+    let diff = cmp(b.score,a.score)
+    if diff != 0: diff else: cmp(a.index,b.index))
+  var seen = initHashSet[int]()
+  let restorative = max(1,keep div 2)
+  for j in 0..<min(restorative,ranks.len):
+    result.add(pool[ranks[j].index])
+    seen.incl(ranks[j].index)
+  # Retain high-frequency and stratified proposals to allow genuinely new
+  # behavior, rather than merely reproducing the previous rule perfectly.
+  for i, entry in pool:
+    if result.len >= keep: break
+    if i notin seen:
+      result.add(entry)
+      seen.incl(i)
+
+proc rankedRegrowTargets*(impacts: seq[RuleImpact],
+                          rescue: seq[float64],
+                          tested: seq[bool], limit: int,
+                          jointBonus: seq[float64] = @[]): seq[RuleImpact] =
+  ## One highest-drift path is always retained, even when temporary masking
+  ## predicts no benefit; remaining slots prefer direct counterfactual rescue.
+  ## A positive rescue means refitting without the affected node IMPROVED the
+  ## SEARCH merit. Do not confuse it with proof that editing will help.
+  if limit <= 0 or impacts.len == 0: return
+  result.add(impacts[0])
+  var order: seq[int]
+  for i in 1..<impacts.len: order.add(i)
+  order.sort(proc(a,b: int): int =
+    var ra = -Inf
+    var rb = -Inf
+    if tested[a]:
+      ra = rescue[a]
+      if jointBonus.len == impacts.len: ra += jointBonus[a]
+    if tested[b]:
+      rb = rescue[b]
+      if jointBonus.len == impacts.len: rb += jointBonus[b]
+    let diff = cmp(rb,ra)
+    if diff != 0: diff else: cmp(impacts[b].priority,impacts[a].priority))
+  for i in order:
+    if result.len >= limit: break
+    result.add(impacts[i])
+
 proc proposeRepair(parent: State, index: int, clean: seq[seq[int]],
                    train, selection: DataSet, cfg: SearchConfig,
-                   ctx: var RepairContext): seq[State] =
+                   ctx: var RepairContext,
+                   referenceFiring: seq[float64] = @[]): seq[State] =
   ## Mining results depend ONLY on earlier rules. No need to re-enumerate
   ## 10+ million occurrences for each parent with the same prefix.
   let prefix = prefixRules(parent.rules, index)
@@ -433,8 +513,12 @@ proc proposeRepair(parent: State, index: int, clean: seq[seq[int]],
     mined = patterns(stageText, cfg)
     ctx.miningCache[key] = mined
     inc ctx.miningMisses
-  let candidates = repairCandidates(mined, parent.rules[index].lhs,
-                                    parent.rules[index].rhs, cfg.repairCandidates)
+  let poolSize = (if referenceFiring.len == train.texts.len and
+                      cfg.regrowMatchPool > 0:
+                    max(cfg.repairCandidates,cfg.regrowMatchPool)
+                  else: cfg.repairCandidates)
+  var candidates = repairCandidates(mined, parent.rules[index].lhs,
+                                    parent.rules[index].rhs, poolSize)
   if candidates.len == 0: return
 
   ## Prefix firing/replacement on the noisy train and selection rows is
@@ -449,6 +533,10 @@ proc proposeRepair(parent: State, index: int, clean: seq[seq[int]],
     prefixTrain = traceRules(prefix, train)
     prefixSelect = traceRules(prefix, selection)
     ctx.prefixCache[key] = (trainTrace: prefixTrain, selectionTrace: prefixSelect)
+  if referenceFiring.len == train.texts.len and cfg.regrowMatchPool > 0 and
+      cfg.repairCandidates > 0 and candidates.len > cfg.repairCandidates:
+    candidates = restorationShortlist(candidates,prefixTrain.texts,
+                                      referenceFiring,cfg.repairCandidates)
   for candidate in candidates:
     var child = State(rules: copyRules(parent.rules), nextToken: parent.nextToken)
     child.rules[index].lhs = candidate.value
@@ -519,42 +607,38 @@ proc repair*(original: State, clean: seq[seq[int]], train, selection: DataSet,
 
 
 proc chooseRegrowFrontier(paths: seq[RegrowPath], width: int): seq[RegrowPath] =
-  ## Don't kill every temporarily-worse intermediate repair. Keep one route
-  ## that actually edited an affected rule until the next wave can assess it.
+  ## Enforce distinct rule chains; merely marking a different node 'visited'
+  ## does not justify burning a full beam slot on an unchanged model.
+  ## Always preserve one actually repaired trajectory if available.
   if paths.len == 0 or width <= 0: return
   var sorted = paths
   sorted.sort(proc(a,b: RegrowPath): int =
-    let c = cmp(b.state.evaluation.score,a.state.evaluation.score)
+    let c = cmp(b.state.evaluation.searchMerit,a.state.evaluation.searchMerit)
     if c != 0: c else: cmp(b.repaired,a.repaired))
   var seen = initHashSet[string]()
-  for path in sorted:
-    let k = ruleKey(path.state.rules) & "|" & $path.visited
-    if k notin seen:
-      seen.incl(k)
-      result.add(path)
-      break
-  if result.len < width and result[0].repaired == 0:
+  result.add(sorted[0])
+  seen.incl(ruleKey(sorted[0].state.rules))
+  if width > 1 and result[0].repaired == 0:
     for path in sorted:
-      if path.repaired == 0: continue
-      let k = ruleKey(path.state.rules) & "|" & $path.visited
-      if k notin seen:
-        seen.incl(k)
+      if path.repaired <= 0: continue
+      let key = ruleKey(path.state.rules)
+      if key notin seen:
         result.add(path)
+        seen.incl(key)
         break
   for path in sorted:
     if result.len >= width: break
-    let k = ruleKey(path.state.rules) & "|" & $path.visited
-    if k notin seen:
-      seen.incl(k)
+    let key = ruleKey(path.state.rules)
+    if key notin seen:
       result.add(path)
+      seen.incl(key)
 
-proc rollbackRegrow*(original: State, clean: seq[seq[int]],
+proc rollbackRegrowCandidates*(original: State, clean: seq[seq[int]],
                      train, selection: DataSet, cfg: SearchConfig,
-                     iteration = 0, allowHardRoots = false): State =
+                     iteration = 0, allowHardRoots = false): seq[State] =
   ## Change a root and selectively revisit the empirically affected rules,
   ## including NONADJACENT targets. Multiple downstream targets are branched,
   ## and the beam retains a real repair path if greedy sorting would drop it.
-  result = original
   if cfg.regrowPositions <= 0 or cfg.regrowDepth <= 0 or
      original.rules.len < 2: return
   let started = epochTime()
@@ -587,7 +671,7 @@ proc rollbackRegrow*(original: State, clean: seq[seq[int]],
     minus.rules.delete(idx)
     minus.evaluate(train, selection, cfg.ridge, cfg.stabilityPenalty,
                    cfg.balanceCases, cfg.rankScales)
-    trials.add((index: idx, score: minus.evaluation.score))
+    trials.add((index: idx, score: minus.evaluation.searchMerit))
   trials.sort(proc(a,b: Ablation): int =
     let diff = cmp(b.score,a.score)
     if diff != 0: diff else: cmp(a.index,b.index))
@@ -596,7 +680,7 @@ proc rollbackRegrow*(original: State, clean: seq[seq[int]],
   # Persistent plateaus allow an explicit fallback to stronger roots.
   var eligible: seq[Ablation]
   for trial in trials:
-    let loss = original.evaluation.score - trial.score
+    let loss = original.evaluation.searchMerit - trial.score
     if loss <= cfg.regrowMaxLoss or allowHardRoots:
       eligible.add(trial)
   if eligible.len == 0:
@@ -609,18 +693,25 @@ proc rollbackRegrow*(original: State, clean: seq[seq[int]],
     prefixCache: initTable[string,tuple[trainTrace,selectionTrace: Trace]]())
   var impactCache = initTable[string,seq[RuleImpact]]()
   var impactHits = 0
+  var maskProbes = 0
+  var pairProbes = 0
+  var maskCacheHits = 0
+  var maskGainCache = initTable[string,float64]()
+  let referenceTrain = traceRules(original.rules,train)
+  var finalists: seq[State]
+  let cutoff = original.evaluation.searchMerit - cfg.regrowFinalistSlack
   for j in 0..<positions:
     let idx = eligible[j].index
     stderr.writeLine("[regrow] root=",idx," ablatedScore=",eligible[j].score,
-      " ablationLoss=",original.evaluation.score-eligible[j].score,
+      " ablationLoss=",original.evaluation.searchMerit-eligible[j].score,
       " depth=",cfg.regrowDepth," rootBudget=",cfg.regrowRoots,
       " targetsPerWave=",cfg.regrowTargets)
     # Keep a broader root frontier until downstream interactions are known.
     # Otherwise a root with a temporary score loss would be eliminated before
     # any affected downstream rule has a chance to adapt.
     var rootCfg = cfg
-    rootCfg.beam = max(cfg.beam, cfg.regrowRoots)
-    rootCfg.repairBeam = max(cfg.repairBeam, cfg.regrowRoots)
+    rootCfg.beam = max(cfg.beam, cfg.regrowRoots * 2)
+    rootCfg.repairBeam = max(cfg.repairBeam, cfg.regrowRoots * 2)
     let rootVariants = proposeRepair(original,idx,clean,train,selection,
                                      rootCfg,ctx)
     var localBest = original
@@ -641,39 +732,136 @@ proc rollbackRegrow*(original: State, clean: seq[seq[int]],
             impacted = affectedRuleOrder(original.rules,path.state.rules,
                         train.texts,idx,cfg.regrowSamples,train.cases)
             impactCache[key] = impacted
-          var inspected = 0
+          var available: seq[RuleImpact]
           for impact in impacted:
-            if inspected >= cfg.regrowTargets: break
-            if impact.index in path.visited: continue
-            inc inspected
+            if impact.index notin path.visited:
+              available.add(impact)
+          # Probe only the strongest empirical dependencies. A counterfactual
+          # disables ONE downstream rule temporarily, reruns the WHOLE chain,
+          # and refits readout on Train. It is used for ordering only.
+          var rescue = newSeq[float64](available.len)
+          var tested = newSeq[bool](available.len)
+          for i in 0..<min(available.len,cfg.regrowProbeTargets):
+            let pos = available[i].index
+            let maskKey = ruleKey(path.state.rules) & "|mask:" & $pos
+            if maskGainCache.hasKey(maskKey):
+              rescue[i] = maskGainCache[maskKey]
+              inc maskCacheHits
+            else:
+              var masked = State(rules:copyRules(path.state.rules),
+                                 nextToken:path.state.nextToken)
+              # Fresh literal exceeds every marker in this legal chain and the
+              # Unicode input space. Mask is NEVER persisted as a learned rule.
+              masked.rules[pos].lhs = @[max(0x200000,path.state.nextToken+1024)]
+              masked.evaluate(train,selection,cfg.ridge,cfg.stabilityPenalty,
+                              cfg.balanceCases,cfg.rankScales)
+              rescue[i] = masked.evaluation.searchMerit -
+                          path.state.evaluation.searchMerit
+              maskGainCache[maskKey] = rescue[i]
+              inc maskProbes
+            tested[i] = true
+          # Pairwise counterfactuals find compensating/nonlocal interactions:
+          # disabling A or B alone may hurt, while disabling BOTH improves
+          # the revised chain. This is a TRAIN-fit / SEARCH-score *proposal*
+          # only. Acceptance and held-out are never touched here.
+          var jointBonus = newSeq[float64](available.len)
+          let pairPool = min(available.len,
+            min(cfg.regrowProbeTargets,cfg.regrowPairProbes))
+          if cfg.regrowTargets > 1 and pairPool >= 2:
+            for a in 0..<pairPool:
+              for b in a+1..<pairPool:
+                let posA = available[a].index
+                let posB = available[b].index
+                let maskKey = ruleKey(path.state.rules) &
+                  "|double-mask:" & $min(posA,posB) & ":" & $max(posA,posB)
+                var jointRescue: float64
+                if maskGainCache.hasKey(maskKey):
+                  jointRescue = maskGainCache[maskKey]
+                  inc maskCacheHits
+                else:
+                  var masked = State(rules:copyRules(path.state.rules),
+                                     nextToken:path.state.nextToken)
+                  let noOp = @[max(0x200000,path.state.nextToken+1024)]
+                  masked.rules[posA].lhs = noOp
+                  masked.rules[posB].lhs = noOp
+                  masked.evaluate(train,selection,cfg.ridge,
+                                  cfg.stabilityPenalty,cfg.balanceCases,
+                                  cfg.rankScales)
+                  jointRescue = masked.evaluation.searchMerit -
+                                path.state.evaluation.searchMerit
+                  maskGainCache[maskKey] = jointRescue
+                  inc pairProbes
+                # This bonus only rewards *extra* benefit over the best
+                # single removal, not a correlated pair with no interaction.
+                let synergy = (if jointRescue > 0.0:
+                  max(0.0,jointRescue - max(rescue[a],rescue[b])) else: 0.0)
+                if synergy > jointBonus[a]: jointBonus[a] = synergy
+                if synergy > jointBonus[b]: jointBonus[b] = synergy
+          let selected = rankedRegrowTargets(available,rescue,tested,
+                                              cfg.regrowTargets,jointBonus)
+          if selected.len == 0: proposals.add(path)
+          for impact in selected:
             foundAffected = true
+            var maskGain = NaN
+            var synergyBonus = 0.0
+            for k, x in available:
+              if x.index == impact.index:
+                if tested[k]: maskGain = rescue[k]
+                synergyBonus = jointBonus[k]
+                break
             stderr.writeLine("[regrow affected] root=",idx," wave=",wave+1,
               " rule=",impact.index," drift=",impact.priority,
+              " maskGain=",maskGain,
+              " synergyBonus=",synergyBonus,
               " nonadjacent=",impact.index-idx>1)
             let touched = path.visited & @[impact.index]
-            # Skipping a disturbed node is permitted; unlike the earlier
-            # version, it does not consume ALL options for this wave.
             proposals.add(RegrowPath(state:path.state,visited:touched,
                                       repaired:path.repaired))
             for proposed in proposeRepair(path.state,impact.index,clean,
-                                           train,selection,cfg,ctx):
+                                           train,selection,cfg,ctx,
+                                           referenceTrain.columns[impact.index]):
               if proposed.rules[impact.index].lhs != path.state.rules[impact.index].lhs:
                 proposals.add(RegrowPath(state:proposed,visited:touched,
                                           repaired:path.repaired+1))
-          if inspected == 0: proposals.add(path)
         if not foundAffected or proposals.len == 0: break
         frontier = chooseRegrowFrontier(proposals,cfg.regrowBeam)
       for path in frontier:
-        if path.state.evaluation.score > localBest.evaluation.score + cfg.epsilon:
+        if path.state.rules != original.rules and
+            path.state.evaluation.searchMerit >= cutoff:
+          finalists.add(path.state)
+        if path.state.evaluation.searchMerit > localBest.evaluation.searchMerit + cfg.epsilon:
           localBest = path.state
-      if root.evaluation.score > localBest.evaluation.score + cfg.epsilon:
+      if root.rules != original.rules and
+          root.evaluation.searchMerit >= cutoff:
+        finalists.add(root)
+      if root.evaluation.searchMerit > localBest.evaluation.searchMerit + cfg.epsilon:
         localBest = root
-    if localBest.evaluation.score > result.evaluation.score + cfg.epsilon:
-      result = localBest
-  stderr.writeLine("[regrow done] original=",original.evaluation.score,
-    " candidate=",result.evaluation.score,
+    if localBest.rules != original.rules and
+        localBest.evaluation.searchMerit >= cutoff:
+      finalists.add(localBest)
+  # Bound the number of independently tested finalists: many trials against
+  # a small acceptance set would overfit the gate itself. Search never sees
+  # acceptance/anchors/heldout; finalists are only proposals.
+  result = selectBeam(finalists,cfg.regrowFinalists,iteration)
+  stderr.writeLine("[regrow done] originalSearchMerit=",original.evaluation.searchMerit,
+    " finalists=",result.len,
     " mining=",ctx.miningMisses," cacheHits=",ctx.miningHits,
     " fullEvaluations=",ctx.evaluations,
     " miningLimit=",cfg.regrowMines,
+    " maskProbes=",maskProbes," pairProbes=",pairProbes,
+    " maskCacheHits=",maskCacheHits,
     " impactCacheHits=",impactHits,
     " seconds=",epochTime()-started)
+
+proc rollbackRegrow*(original: State, clean: seq[seq[int]],
+                     train, selection: DataSet, cfg: SearchConfig,
+                     iteration = 0, allowHardRoots = false): State =
+  ## Compatibility wrapper for older direct callers, preserving the old
+  ## nondecreasing raw Search Spearman contract. The main learner instead
+  ## passes multiple finalists to the independent acceptance gate.
+  result = original
+  let proposals = rollbackRegrowCandidates(original,clean,train,selection,
+                                            cfg,iteration,allowHardRoots)
+  for proposal in proposals:
+    if proposal.evaluation.score > result.evaluation.score + cfg.epsilon:
+      result = proposal

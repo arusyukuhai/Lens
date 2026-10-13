@@ -23,7 +23,7 @@ proc defaults(): Options =
     plot: true, shuffleCorpus: true, sharedNoiseAlphabet: true, trajectoryLimitMiB: 1024, maxChunkTokens: 4096,
     searchPool: 32, acceptPool: 64, searchChunks: 4, acceptChunks: 6,
     anchorChunks: 8, anchorPool: 32, anchorRefresh: 16,
-    validationSteps: 192, anchorSteps: 192, monitorSteps: 192,
+    validationSteps: 128, anchorSteps: 128, monitorSteps: 96,
     fitReplayChunks: 8, fitReplaySteps: 32,
     readoutRefreshEvery: 4, readoutBlend: 0.5,
     anchorMargin: 0.002, acceptFloor: 0.0, minSourceWin: 0.5,
@@ -62,9 +62,9 @@ Corpus: ===SPLIT=== on a line separates chunks. Empty chunks are skipped.
 --screen-explore:48  reserve gradient-independent exploratory proposals
 --readout-refresh-every:4  refit frozen readout on new train data if separately validated (0=off)
 --readout-blend:0.5   interpolate frozen/updated readout to avoid abrupt shifts
---validation-steps:192 sampled noise stages for search/rotating acceptance (0=all)
---anchor-steps:192     sampled stages on held-fixed promotion anchors (0=all)
---monitor-steps:192    sampled stages on fixed protected heldout (0=all)
+--validation-steps:128  sampled noise stages for search/rotating acceptance (0=all)
+--anchor-steps:128      sampled stages on held-fixed promotion anchors (0=all)
+--monitor-steps:96     sampled stages on fixed protected heldout (0=all)
 --anchor-margin:0.002  anchor merit improvement required to promote
 --accept-floor:0.0     reject a candidate negatively ranked on either acceptance set
 --min-source-win:0.5  require >=50% source chunks improve on acceptance and anchors (0=disabled)
@@ -84,6 +84,11 @@ Corpus: ===SPLIT=== on a line separates chunks. Empty chunks are skipped.
 --regrow-depth:2      regenerate this many downstream rules after rollback
 --regrow-positions:0  rollback targets per iteration (0 disables; opt-in for new runs)
 --regrow-ablate:4     candidate indices for full-replay ablation (small = fast)
+--regrow-probe-targets:4  single-target Search rescue probes (0=drift-only)
+--regrow-pair-probes:3  investigate pairwise downstream interactions (0=disabled)
+--regrow-match-pool:64  TRAIN-only firing signature matches for adapted LHS (0=frequency-only)
+--regrow-finalists:3  distinct Search-ranked rollback finalists reaching Acceptance
+--regrow-finalist-slack:0.02  tolerate slight Search loss to rescue coupled rules
 --regrow-max-loss:0.04  maximum search-rho loss on root ablation (late fallback allowed)
 --regrow-beam:2       hard cap on local regrow paths
 --regrow-roots:4      root variants retained before their affected rules are repaired
@@ -205,6 +210,8 @@ proc validate(o: Options) =
       o.search.regrowAblate < 0 or o.search.regrowBeam < 1 or
       o.search.regrowRoots < 1 or o.search.regrowTargets < 1 or
       o.search.regrowSamples < 1 or o.search.regrowMines < 0 or
+      o.search.regrowProbeTargets < 0 or o.search.regrowMatchPool < 0 or
+      o.search.regrowFinalists < 1 or o.search.regrowFinalistSlack < 0 or
       o.search.regrowMaxLoss < 0 or o.search.stabilityPenalty < 0 or
       o.search.rhsProbe < 1 or
       o.search.beam < 1 or o.search.lookahead < 1 or
@@ -221,6 +228,7 @@ proc validate(o: Options) =
       classify(o.acceptFloor) in {fcNan, fcInf, fcNegInf} or
       classify(o.minSourceWin) in {fcNan, fcInf, fcNegInf} or
       classify(o.search.regrowMaxLoss) in {fcNan, fcInf, fcNegInf} or
+      classify(o.search.regrowFinalistSlack) in {fcNan, fcInf, fcNegInf} or
       classify(o.search.stabilityPenalty) in {fcNan, fcInf, fcNegInf} or
       classify(o.readoutBlend) in {fcNan, fcInf, fcNegInf}:
     raise newException(ValueError, "Nonfinite configuration")
@@ -491,6 +499,11 @@ proc main() =
     of "regrow-targets": o.search.regrowTargets = parseInt(value)
     of "regrow-samples": o.search.regrowSamples = parseInt(value)
     of "regrow-mines": o.search.regrowMines = parseInt(value)
+    of "regrow-probe-targets": o.search.regrowProbeTargets = parseInt(value)
+    of "regrow-pair-probes": o.search.regrowPairProbes = parseInt(value)
+    of "regrow-match-pool": o.search.regrowMatchPool = parseInt(value)
+    of "regrow-finalists": o.search.regrowFinalists = parseInt(value)
+    of "regrow-finalist-slack": o.search.regrowFinalistSlack = parseFloat(value)
     of "rhs-probe": o.search.rhsProbe = parseInt(value)
     of "repair-candidates": o.search.repairCandidates = parseInt(value)
     of "repair-beam": o.search.repairBeam = parseInt(value)
@@ -814,16 +827,16 @@ proc main() =
       stderr.writeLine("[rollback] triggered iteration=",iteration+1,
         " stagnation=",rollback.noPromotionStreak,
         " root=accepted-champion hardRoots=",allowHardRoots)
-      let rebuilt = rollbackRegrow(parentChampion,clean,train,selection,
-                                   o.search,iteration,allowHardRoots)
-      regrew = rebuilt.rules != accepted.rules
-      if regrew:
+      let rebuiltCandidates = rollbackRegrowCandidates(parentChampion,clean,
+                                   train,selection,o.search,iteration,allowHardRoots)
+      for rebuilt in rebuiltCandidates:
+        if rebuilt.rules == accepted.rules: continue
+        regrew = true
         let rho = outOfSampleRho(rebuilt,acceptance)
         let anchorRho = (if anchor.texts.len > 0:
                            outOfSampleRho(rebuilt,anchor) else: rho)
-        if rebuilt.rules != accepted.rules and
-            canPromoteV8(rebuilt,nextAccepted,acceptance,anchor,
-                         rho,chosenRho,anchorRho,chosenAnchor,o.paths,o):
+        if canPromoteV8(rebuilt,nextAccepted,acceptance,anchor,
+                        rho,chosenRho,anchorRho,chosenAnchor,o.paths,o):
           nextAccepted = rebuilt
           chosenRho = rho
           chosenAnchor = anchorRho
