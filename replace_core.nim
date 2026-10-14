@@ -7,12 +7,7 @@
 ## Replacement syntax:
 ##    >= 0       literal token
 ##    -1..-15    capture 0..14
-##   -16..-31    sorted capture 0..15
-##   -32..-47    reversed capture 0..15
-##   -48..-63    capture +1 mod 512
-##   -64..-79    capture -1 mod 512
-##   -80..-95    capture *2 mod 512
-##   -96..-111   capture floor-div 2
+##   <= -16    unsupported (no sort/reverse/arithmetic operations)
 ##
 ## The implementation preserves the original hot-path optimizations:
 ## - 1/2-token direct literal scan
@@ -51,7 +46,7 @@ type
     exhausted: bool
 
   ReplacementOp = object
-    kind: uint8       # 0 literal, 1 capture, 2 sort, 3 reverse, 4..7 arithmetic
+    kind: uint8       # 0 literal, 1 capture
     arg: uint8        # capture index 0..15
     value: int        # literal token when kind == 0
 
@@ -63,10 +58,8 @@ type
   ReplaceScratch = object
     cursors: array[17, LiteralCursor]
     captures: array[16, Capture]
-    sortBuf: seq[int]
 
 const
-  EMBEDDING_CODE_COUNT = 512
   MAX_REPLACE_OUTPUT* = 1_048_576
 
 proc buildPrefix(p: openArray[int]): seq[int] =
@@ -267,7 +260,9 @@ proc compileReplacementPlan(
   b: openArray[int],
   plan: var ReplacementPlan
 ) {.inline.} =
-  plan.len = uint8(min(64, b.len))
+  if b.len > 64:
+    raise newException(SeqReplaceError, "replacement exceeds 64 tokens")
+  plan.len = uint8(b.len)
   plan.allLiteral = true
 
   for i in 0 ..< int(plan.len):
@@ -277,25 +272,9 @@ proc compileReplacementPlan(
     elif t >= -15:
       plan.allLiteral = false
       plan.ops[i] = ReplacementOp(kind: 1'u8, arg: uint8(-t - 1), value: 0)
-    elif t >= -31:
-      plan.allLiteral = false
-      plan.ops[i] = ReplacementOp(kind: 2'u8, arg: uint8(-t - 16), value: 0)
-    elif t >= -47:
-      plan.allLiteral = false
-      plan.ops[i] = ReplacementOp(kind: 3'u8, arg: uint8(-t - 32), value: 0)
-    elif t >= -111:
-      plan.allLiteral = false
-      let offset = -t - 48
-      plan.ops[i] = ReplacementOp(
-        kind: uint8(4 + offset div 16),
-        arg: uint8(offset mod 16),
-        value: 0
-      )
     else:
-      raise newException(
-        SeqReplaceError,
-        "Invalid replacement opcode: " & $t
-      )
+      raise newException(SeqReplaceError,
+        "Replacement supports only literals and captures -1..-15; got " & $t)
 
 proc appendReplacementPlan(
   outp: var seq[int],
@@ -346,106 +325,6 @@ proc appendReplacementPlan(
           return
         appendIntsBulk(outp, input, c.start, c.len)
 
-    of 2'u8:
-      var n = int(op.arg)
-      if wildcardCount == 0 or captures.len == 0:
-        continue
-      if n >= wildcardCount or n >= captures.len:
-        n = 0
-      let c = captures[n]
-      if c.start < 0 or c.len < 0 or c.start > input.len or
-          c.len > input.len - c.start:
-        raise newException(SeqReplaceError,
-          "invalid capture: start=" & $c.start & " len=" & $c.len &
-          " input.len=" & $input.len & " op=" & $op.kind)
-      if c.len > 0:
-        if c.len > maxOutput - outp.len:
-          overflow = true
-          return
-        scratch.sortBuf.setLen(c.len)
-        copyMem(addr scratch.sortBuf[0], unsafeAddr input[c.start], c.len * sizeof(int))
-        sort(scratch.sortBuf)
-        appendIntValuesBulk(outp, scratch.sortBuf)
-
-    of 3'u8:
-      var n = int(op.arg)
-      if wildcardCount == 0 or captures.len == 0:
-        continue
-      if n >= wildcardCount or n >= captures.len:
-        n = 0
-      let c = captures[n]
-      if c.start < 0 or c.len < 0 or c.start > input.len or
-          c.len > input.len - c.start:
-        raise newException(SeqReplaceError,
-          "invalid capture: start=" & $c.start & " len=" & $c.len &
-          " input.len=" & $input.len & " op=" & $op.kind)
-      if c.len > maxOutput - outp.len:
-        overflow = true
-        return
-      var ri = c.start + c.len
-      while ri > c.start:
-        dec ri
-        outp.add(input[ri])
-
-    of 4'u8 .. 7'u8:
-      var n = int(op.arg)
-      if wildcardCount == 0 or captures.len == 0:
-        continue
-      if n >= wildcardCount or n >= captures.len:
-        n = 0
-      let c = captures[n]
-      if c.start < 0 or c.len < 0 or c.start > input.len or
-          c.len > input.len - c.start:
-        raise newException(SeqReplaceError,
-          "invalid capture: start=" & $c.start & " len=" & $c.len &
-          " input.len=" & $input.len & " op=" & $op.kind)
-      if c.len > maxOutput - outp.len:
-        overflow = true
-        return
-
-      let dst = outp.len
-      outp.setLen(dst + c.len)
-      case op.kind
-      of 4'u8: # +1 modulo 512
-        for j in 0 ..< c.len:
-          let v = input[c.start + j]
-          outp[dst + j] =
-            (if v >= 0 and v < EMBEDDING_CODE_COUNT:
-               (v + 1) mod EMBEDDING_CODE_COUNT
-             else:
-               v)
-
-      of 5'u8: # -1 modulo 512
-        for j in 0 ..< c.len:
-          let v = input[c.start + j]
-          outp[dst + j] =
-            (if v >= 0 and v < EMBEDDING_CODE_COUNT:
-               (v + EMBEDDING_CODE_COUNT - 1) mod EMBEDDING_CODE_COUNT
-             else:
-               v)
-
-      of 6'u8: # *2 modulo 512
-        for j in 0 ..< c.len:
-          let v = input[c.start + j]
-          outp[dst + j] =
-            (if v >= 0 and v < EMBEDDING_CODE_COUNT:
-               (v * 2) mod EMBEDDING_CODE_COUNT
-             else:
-               v)
-
-      of 7'u8: # floor division; high OOV/out-of-domain tokens stay untouched
-        for j in 0 ..< c.len:
-          let v = input[c.start + j]
-          if v >= EMBEDDING_CODE_COUNT:
-            outp[dst + j] = v
-          else:
-            let q = v div 2
-            outp[dst + j] =
-              (if v < 0 and v mod 2 != 0: q - 1 else: q)
-
-      else:
-        discard
-
     else:
       raise newException(SeqReplaceError, "Unknown replacement opcode")
 
@@ -457,13 +336,16 @@ proc replaceSeqCompiledInto(
   scratch: var ReplaceScratch,
   replacementPlan: ptr ReplacementPlan,
   overflowed: ptr bool = nil,
-  maxOutput: int = MAX_REPLACE_OUTPUT
+  maxOutput: int = MAX_REPLACE_OUTPUT,
+  matchCounter: ptr int = nil
 ): bool {.gcsafe.} =
   ## Core replacement routine. Returns whether a replacement actually occurred.
   if isAllWildcard(pat) or isEmptyPattern(pat) or pat.wildcardCount > 16:
     return false
 
   var overflow = false
+  var matches = 0
+  if matchCounter != nil: matchCounter[] = 0
   if overflowed != nil:
     overflowed[] = false
 
@@ -509,6 +391,7 @@ proc replaceSeqCompiledInto(
           outp.setLen(0)
           return false
 
+      inc matches
       copyPos = i + plen
       i = findLiteralFrom(input, literal, copyPos)
 
@@ -520,6 +403,7 @@ proc replaceSeqCompiledInto(
         return false
       appendIntsBulk(outp, input, copyPos, input.len - copyPos)
 
+    if matchCounter != nil: matchCounter[] = matches
     return true
 
   let hasLeadingLiteral = pat.hasLeadingLiteral
@@ -598,6 +482,7 @@ proc replaceSeqCompiledInto(
           outp.setLen(0)
           return false
 
+        inc matches
         changed = true
         pos = m2.finish
         hasCached = false
@@ -628,6 +513,7 @@ proc replaceSeqCompiledInto(
       outp.setLen(0)
       return false
 
+    inc matches
     changed = true
     pos = m.finish
     hasCached = false
@@ -643,6 +529,7 @@ proc replaceSeqCompiledInto(
       return false
     appendIntsBulk(outp, input, pos, input.len - pos)
 
+  if matchCounter != nil: matchCounter[] = matches
   true
 
 proc replaceSeqCompiled*(
@@ -651,7 +538,7 @@ proc replaceSeqCompiled*(
   replacement: openArray[int]
 ): tuple[changed: bool, data: seq[int]] {.gcsafe.} =
   var outp = newSeqOfCap[int](max(16, input.len))
-  var scratch = ReplaceScratch(sortBuf: @[])
+  var scratch = ReplaceScratch()
   var plan: ReplacementPlan
   compileReplacementPlan(replacement, plan)
 
@@ -675,7 +562,7 @@ proc replaceSeqCompiledInPlace*(
   ## A pattern miss leaves input intact without materializing an identity copy.
   ## The bool reports a REAL byte-sequence change, not merely a matched pattern.
   var output: seq[int] = @[]
-  var scratch = ReplaceScratch(sortBuf: @[])
+  var scratch = ReplaceScratch()
   var plan: ReplacementPlan
   compileReplacementPlan(replacement, plan)
   if replaceSeqCompiledInto(input, pat, replacement, output, scratch, addr plan):
@@ -703,7 +590,7 @@ proc replaceSeqInPlace*(
   ## avoids allocating/copying the unchanged input.
   let pat = compileSeqPattern(pattern)
   var outp = newSeqOfCap[int](max(16, input.len))
-  var scratch = ReplaceScratch(sortBuf: @[])
+  var scratch = ReplaceScratch()
   var plan: ReplacementPlan
   compileReplacementPlan(replacement, plan)
   if replaceSeqCompiledInto(input, pat, replacement, outp, scratch, addr plan):
@@ -1262,3 +1149,45 @@ proc replaceSeqStrict*(input: openArray[int], pat: SeqPattern,
       addr plan, addr overflow):
     if overflow: raise newException(SeqReplaceError, "replacement output overflow")
     result = @input
+
+# Fast public compiled-rule/count API for Lens neurons.
+type
+  CountRule* = object
+    pattern*: seq[int]
+    replacement*: seq[int]
+    compiled: SeqPattern
+    plan: ReplacementPlan
+
+proc compileCountRule*(pattern, replacement: openArray[int],
+                       minWildcardLen: int = 0): CountRule =
+  result.pattern = @pattern
+  result.replacement = @replacement
+  result.compiled = compileSeqPattern(pattern, minWildcardLen)
+  if result.compiled.wildcardCount > 15:
+    raise newException(SeqReplaceError, "at most 15 captures supported")
+  if result.compiled.allWildcard or result.compiled.emptyPattern:
+    raise newException(SeqReplaceError, "pattern needs at least one literal")
+  for op in replacement:
+    if op < -15:
+      raise newException(SeqReplaceError, "-16 and lower opcodes are disabled")
+    if op < 0 and -op > result.compiled.wildcardCount:
+      raise newException(SeqReplaceError, "invalid capture index " & $op)
+  compileReplacementPlan(replacement, result.plan)
+
+proc applyCountRule*(input: openArray[int], rule: CountRule,
+                     outp: var seq[int], maxOutput: int = MAX_REPLACE_OUTPUT
+                    ): tuple[count: int, overflow: bool] =
+  ## Output is populated only if there was a match, otherwise caller retains input.
+  ## Counts non-overlapping rule applications, including identity rewrites.
+  var scratch: ReplaceScratch
+  var plan = rule.plan
+  var overflow = false
+  var count = 0
+  outp.setLen(0)
+  discard replaceSeqCompiledInto(input, rule.compiled, rule.replacement,
+                                 outp, scratch, addr plan, addr overflow,
+                                 maxOutput, addr count)
+  if overflow:
+    outp.setLen(0)
+    return (0, true)
+  (count, false)
