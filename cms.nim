@@ -91,12 +91,12 @@ proc readFloat(s: string, fallback: float64): float64 =
 
 proc parseConfig(): Config =
   result = Config(corpus: "github-code-dataset.txt", outDir: "lens_run",
-    chunks: 65536*4, trainChunks: 4, validChunks: 2, chunkLen: 1500,
+    chunks: 65536*4, trainChunks: 8, validChunks: 2, chunkLen: 1500,
     noiseSteps: 0, steps: 100, maxRules: 24, minNgram: 1,
     maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
     candidates: 384, beamWidth: 4, swapDepth: 3, minGain: 1e-9,
-    ridgeLambda: 0.1, screenRows: 32, screenCandidates: 96,
+    ridgeLambda: 0.01, screenRows: 32, screenCandidates: 96,
     useFingerprint: true, usePrefixCache: true, usePrefixStateCache: true,
     useDeltaSuffix: false, plotEvery: 1,
     cmsWidth: 65536, cmsDepth: 4,
