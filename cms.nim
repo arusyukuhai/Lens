@@ -10,6 +10,8 @@ type
     steps, maxRules, minNgram, maxGram, maxTotalGram, maxWildcards: int
     maxGap, mineStarts, mineBudget, mineTracked, candidates, beamWidth, swapDepth: int
     minGain, ridgeLambda: float64
+    coarsePower, finePower, evalPower: float64 # union: floor(k^power) + floor(k*L^(1-1/power)) schedules
+    fineTop, evalEvery: int # evaluate/validate and Fine-select each evalEvery generations
     screenRows, screenCandidates, plotEvery: int # 0 disables respective work
     cmsWidth, cmsDepth: int
     useFingerprint: bool # exact no-false-negative match rejection
@@ -49,6 +51,12 @@ type
     standardizedGram, inversePenalizedGram: seq[float64]
     standardizedXty, standardizedBeta: seq[float64]
     targetMean: float64
+    predictionCov, predictionNorm: float64 # cached centered prediction moments
+
+  RidgePrefixMoments = ref object
+    ## Shared fixed prefix across exchange siblings; same rows, same order.
+    n, count: int
+    means, scales, gram: seq[float64]
 
   PatternScore = object
     pat: seq[int]
@@ -93,23 +101,30 @@ proc readFloat(s: string, fallback: float64): float64 =
 
 proc parseConfig(): Config =
   result = Config(corpus: "github-code-dataset.txt", outDir: "lens_run",
-    chunks: 65536*4, trainChunks: 4, validChunks: 2, chunkLen: 1500,
+    chunks: 65536*4, trainChunks: 8, validChunks: 2, chunkLen: 1500,
     noiseSteps: 0, steps: 100, maxRules: 24, minNgram: 1,
     maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
     candidates: 384, beamWidth: 4, swapDepth: 3, minGain: 1e-9,
-    ridgeLambda: 0.1, screenRows: 32, screenCandidates: 96,
+    ridgeLambda: 0.01, coarsePower: 2.0, finePower: 1.0, evalPower: 0.0,
+    fineTop: 12, evalEvery: 5,
+    screenRows: 32, screenCandidates: 96,
     useFingerprint: true, usePrefixCache: true, usePrefixStateCache: true,
-    useDeltaSuffix: false, plotEvery: 1,
+    useDeltaSuffix: true, plotEvery: 1,
     cmsWidth: 65536, cmsDepth: 4,
     tokenSeed: 1729, tokenMapFile: "")
+  var evalPowerProvided = false
   if not fileExists(result.corpus) and fileExists("github-code.txt"):
     result.corpus = "github-code.txt"
   for arg in commandLineParams():
     if arg == "--help" or arg == "-h":
       echo "Lens Ridge/OLS count-rule training"
       echo "--self-test | --corpus=FILE --out=DIR --resume=FILE --chunks=N --train=N --valid=N"
-      echo "--chunk-len=N --noise-steps=N (0=one step per character) --steps=N"
+      echo "--chunk-len=N --noise-steps=N (legacy, 0=all; requires both powers 1) --steps=N"
+      echo "--coarse-power=2.0 --fine-power=1.0 (union floor(k^p) and floor(k*L^(1-1/p)); p>=1)"
+      echo "--fine-top=12 (per-move Coarse finalists scored on Fine when evaluation is due)"
+      echo "--eval-power=1.0 (same dual-grid schedule for diagnostics; defaults to fine-power)"
+      echo "--eval-every=1 (Fine reassessment + train/held-out evaluation every N generations)"
       echo "--max-rules=N --min-ngram=N --max-gram=N --max-total-gram=N"
       echo "--max-wildcards=N --max-gap=N --mine-starts=N --mine-budget=N"
       echo "--mine-tracked=N --candidates=N --beam=N --swap-depth=N"
@@ -137,6 +152,13 @@ proc parseConfig(): Config =
     of "valid": result.validChunks = readInt(val, result.validChunks)
     of "chunk-len": result.chunkLen = readInt(val, result.chunkLen)
     of "noise-steps": result.noiseSteps = readInt(val, result.noiseSteps)
+    of "coarse-power": result.coarsePower = readFloat(val, result.coarsePower)
+    of "fine-power": result.finePower = readFloat(val, result.finePower)
+    of "eval-power":
+      evalPowerProvided = true
+      result.evalPower = readFloat(val, -1.0)
+    of "eval-every": result.evalEvery = readInt(val, result.evalEvery)
+    of "fine-top": result.fineTop = readInt(val, result.fineTop)
     of "steps": result.steps = readInt(val, result.steps)
     of "max-rules": result.maxRules = readInt(val, result.maxRules)
     of "min-ngram": result.minNgram = readInt(val, result.minNgram)
@@ -166,6 +188,22 @@ proc parseConfig(): Config =
     of "token-seed": result.tokenSeed = readInt(val, result.tokenSeed)
     of "token-map": result.tokenMapFile = val
     else: stderr.writeLine("Unknown option: ", arg)
+  # Unspecified evaluation density follows --fine-power irrespective of
+  # the order of arguments; an explicitly provided zero is an error.
+  if not evalPowerProvided: result.evalPower = result.finePower
+  if classify(result.coarsePower) in {fcNan, fcInf, fcNegInf} or
+      classify(result.finePower) in {fcNan, fcInf, fcNegInf} or
+      classify(result.evalPower) in {fcNan, fcInf, fcNegInf} or
+      result.finePower < 1.0 or result.coarsePower < result.finePower or
+      result.evalPower < 1.0:
+    quit("Require finite 1 <= fine-power <= coarse-power and eval-power >= 1", 1)
+  if result.noiseSteps > 0 and
+      (result.coarsePower != 1.0 or result.finePower != 1.0 or
+       result.evalPower != 1.0):
+    quit("--noise-steps is legacy; use 0 with power schedules, or set all powers to 1", 1)
+  if result.evalEvery < 1:
+    quit("--eval-every must be >= 1", 1)
+  result.fineTop = max(1, result.fineTop)
   result.chunkLen = max(8, result.chunkLen)
   result.trainChunks = max(1, result.trainChunks)
   result.validChunks = max(0, result.validChunks)
@@ -219,8 +257,62 @@ proc randomNext(seed: var uint64): uint64 {.inline.} =
   seed = seed xor (seed shl 17)
   result = seed
 
+proc diffusionLevels(n: int, exponent: float64): seq[int] =
+  ## The UNION of two noise-count sequences, both inclusive of 0 and n:
+  ##   power:   floor(k ^ exponent)
+  ##   spaced:  floor(k * n ^ (1 - 1/exponent))
+  ## where k = 1,2,... until each progression reaches n.
+  ## The power progression resolves low-noise differences; the spaced
+  ## progression keeps coverage across the entire corruption range.
+  ## Deduplicate and sort; the matching/noise order is otherwise unchanged.
+  result = @[0]
+  if n < 1: return
+  doAssert exponent >= 1.0 and classify(exponent) notin {fcNan, fcInf, fcNegInf}
+  if exponent == 1.0:
+    # Both progressions are exactly 1..n: do not generate/sort twice.
+    for changed in 1..n: result.add(changed)
+    return
+  let nf = float64(n)
+  let logN = ln(nf)
+  # Protect pow against overflow when exponent is very large.
+  var k = 1
+  while true:
+    var changed: int
+    if exponent * ln(float64(k)) >= logN:
+      changed = n
+    else:
+      changed = min(n, max(1, int(floor(pow(float64(k), exponent)))))
+    if changed > result[^1]: result.add(changed)
+    if changed == n: break
+    inc k
+  # k * L^(1-1/a), an almost-uniform companion grid. Floored on purpose.
+  let stride = pow(nf, 1.0 - 1.0/exponent)
+  k = 1
+  while true:
+    let scaled = float64(k) * stride
+    var changed: int
+    if scaled >= nf:
+      changed = n
+    else:
+      changed = max(1, int(floor(scaled)))
+    result.add(changed)
+    if changed == n: break
+    inc k
+  result.sort()
+  # Sorted in-place unique: avoid an O(n) bitmap for long sequences.
+  var uniqueLen = 1
+  for i in 1..<result.len:
+    if result[i] != result[uniqueLen - 1]:
+      result[uniqueLen] = result[i]
+      inc uniqueLen
+  result.setLen(uniqueLen)
+
+proc evaluationDue(step, totalSteps, every: int): bool {.inline.} =
+  ## Always provide an initial baseline and a final verified checkpoint.
+  step == 0 or step == totalSteps - 1 or (step + 1) mod every == 0
+
 proc appendDiffusion(rows: var seq[Row], original: seq[int], chunkId: int,
-                     cfg: Config, codec: TokenCodec) =
+                     cfg: Config, codec: TokenCodec, exponent = 1.0) =
   if original.len < 2: return
   var rng = (uint64(chunkId + 1) * 0x9E3779B97F4A7C15'u64) xor 0xD1B54A32D192ED03'u64
   var indices = newSeq[int](original.len)
@@ -230,10 +322,16 @@ proc appendDiffusion(rows: var seq[Row], original: seq[int], chunkId: int,
     swap(indices[i], indices[j])
   var data = newSeq[int](original.len)
   for i, v in original: data[i] = v
-  let stages = (if cfg.noiseSteps <= 0: original.len else: min(original.len, cfg.noiseSteps))
+  var levels: seq[int]
+  if cfg.noiseSteps > 0:
+    let steps = min(original.len, cfg.noiseSteps)
+    for stage in 0..steps:
+      let changed = stage * original.len div steps
+      if levels.len == 0 or changed != levels[^1]: levels.add(changed)
+  else:
+    levels = diffusionLevels(original.len, exponent)
   var previous = 0
-  for stage in 0..stages:
-    let changed = stage * original.len div stages
+  for changed in levels:
     while previous < changed:
       let pos = indices[previous]
       # Diffuse the frequency-encoded text BEFORE applying ANY rules.
@@ -248,7 +346,7 @@ proc appendDiffusion(rows: var seq[Row], original: seq[int], chunkId: int,
       originalLength: original.len))
 
 proc rowsForChunk(corpus: seq[seq[int]], cfg: Config, codec: TokenCodec,
-                  chunkId: int, cache: var DiffusionCache): seq[Row] =
+                  chunkId: int, cache: var DiffusionCache, exponent: float64): seq[Row] =
   if cache.byChunk.hasKey(chunkId):
     # LRU cache: neighboring rotations reuse all but one chunk.
     for i in 0..<cache.recentlyUsed.len:
@@ -257,7 +355,7 @@ proc rowsForChunk(corpus: seq[seq[int]], cfg: Config, codec: TokenCodec,
         break
     cache.recentlyUsed.add(chunkId)
     return cache.byChunk[chunkId]
-  appendDiffusion(result, corpus[chunkId], chunkId, cfg, codec)
+  appendDiffusion(result, corpus[chunkId], chunkId, cfg, codec, exponent)
   if cache.recentlyUsed.len >= cache.capacity:
     let evicted = cache.recentlyUsed[0]
     cache.recentlyUsed.delete(0)
@@ -266,17 +364,18 @@ proc rowsForChunk(corpus: seq[seq[int]], cfg: Config, codec: TokenCodec,
   cache.byChunk[chunkId] = result
 
 proc makeRows(corpus: seq[seq[int]], cfg: Config, codec: TokenCodec,
-              step: int, validation: bool, cache: var DiffusionCache): seq[Row] =
+              step: int, validation: bool, cache: var DiffusionCache,
+              exponent = 1.0): seq[Row] =
   let validCount = min(cfg.validChunks, max(0, corpus.len - 1))
   let trainPool = max(1, corpus.len - validCount)
   if validation:
     for i in trainPool..<corpus.len:
-      let chunkRows = rowsForChunk(corpus, cfg, codec, i, cache)
+      let chunkRows = rowsForChunk(corpus, cfg, codec, i, cache, exponent)
       result.add(chunkRows)
   else:
     for offset in 0..<cfg.trainChunks:
       let idx = (step + offset) mod trainPool
-      let chunkRows = rowsForChunk(corpus, cfg, codec, idx, cache)
+      let chunkRows = rowsForChunk(corpus, cfg, codec, idx, cache, exponent)
       result.add(chunkRows)
 
 when defined(lensProfile):
@@ -439,14 +538,51 @@ proc standardizedPearson(theta: seq[float64],
   if normSq <= 1e-24: return 0.0
   result = max(-1.0, min(1.0, cov / sqrt(sst * normSq)))
 
+proc prepareRidgePrefix(cols: seq[seq[float64]]): RidgePrefixMoments =
+  ## Prepare first q columns of a design matrix ONCE for a group of sibling
+  ## exchanges. Does not alter numeric semantics of normal Ridge regression.
+  let q = cols.len
+  if q == 0: return nil
+  let n = cols[0].len
+  result = RidgePrefixMoments(n: n, count: q,
+    means: newSeq[float64](q), scales: newSeq[float64](q),
+    gram: newSeq[float64](q*q))
+  let nf = float64(n)
+  for j in 0..<q:
+    var mean = 0.0
+    for v in cols[j]: mean += v
+    mean /= nf
+    result.means[j] = mean
+    var variance = 0.0
+    for v in cols[j]:
+      variance += (v-mean)*(v-mean)
+    let std = sqrt(max(0.0, variance/nf))
+    if std > 1e-12 * max(1.0, abs(mean)):
+      result.scales[j] = std
+    else:
+      result.scales[j] = 1.0
+  for j in 0..<q:
+    for k in 0..j:
+      var cross = 0.0
+      for i in 0..<n:
+        cross += (cols[j][i]-result.means[j]) *
+          (cols[k][i]-result.means[k])
+      cross /= result.scales[j]*result.scales[k]
+      result.gram[j*q+k] = cross
+      result.gram[k*q+j] = cross
+
 proc ridge(cols: seq[seq[float64]], y: seq[float64],
-           ridgeLambda: float64, computeDeletion = true): Fit =
+           ridgeLambda: float64, computeDeletion = true,
+           prefixMoments: RidgePrefixMoments = nil): Fit =
   ## lambda is relative to N because each column has variance one.
   ## lambda = 0 retains exactly the previous OLS behavior.
   if ridgeLambda == 0.0:
     return ols(cols, y, computeDeletion)
   let n = y.len
   let m = cols.len
+  let q = (if prefixMoments == nil: 0 else: prefixMoments.count)
+  if prefixMoments != nil:
+    doAssert q <= m and prefixMoments.n == n
   result.beta = newSeq[float64](m+1)
   result.residual = newSeq[float64](n)
   result.removalLoss = newSeq[float64](m)
@@ -467,30 +603,38 @@ proc ridge(cols: seq[seq[float64]], y: seq[float64],
   for v in y:
     result.sst += (v-result.targetMean)*(v-result.targetMean)
   for j in 0..<m:
-    var mean = 0.0
-    for v in cols[j]: mean += v
-    mean /= nf
-    result.featureMeans[j] = mean
-    var variance = 0.0
-    for v in cols[j]:
-      variance += (v-mean)*(v-mean)
-    let std = sqrt(max(0.0, variance/nf))
-    # A constant column contains no new information; Ridge handles it safely.
-    if std > 1e-12 * max(1.0, abs(mean)):
-      result.featureScales[j] = std
+    if j < q:
+      result.featureMeans[j] = prefixMoments.means[j]
+      result.featureScales[j] = prefixMoments.scales[j]
     else:
-      result.featureScales[j] = 1.0
+      var mean = 0.0
+      for v in cols[j]: mean += v
+      mean /= nf
+      result.featureMeans[j] = mean
+      var variance = 0.0
+      for v in cols[j]:
+        variance += (v-mean)*(v-mean)
+      let std = sqrt(max(0.0, variance/nf))
+      # A constant column contains no new information; Ridge handles it safely.
+      if std > 1e-12 * max(1.0, abs(mean)):
+        result.featureScales[j] = std
+      else:
+        result.featureScales[j] = 1.0
     var xy = 0.0
     for i in 0..<n:
-      xy += (cols[j][i]-mean)*(y[i]-result.targetMean)
+      xy += (cols[j][i]-result.featureMeans[j])*(y[i]-result.targetMean)
     result.standardizedXty[j] = xy/result.featureScales[j]
   for j in 0..<m:
     for k in 0..j:
-      var cross = 0.0
-      for i in 0..<n:
-        cross += (cols[j][i]-result.featureMeans[j]) *
-          (cols[k][i]-result.featureMeans[k])
-      cross /= result.featureScales[j]*result.featureScales[k]
+      var cross: float64
+      if j < q: # Both columns are in the shared unchanged prefix.
+        cross = prefixMoments.gram[j*q+k]
+      else:
+        cross = 0.0
+        for i in 0..<n:
+          cross += (cols[j][i]-result.featureMeans[j]) *
+            (cols[k][i]-result.featureMeans[k])
+        cross /= result.featureScales[j]*result.featureScales[k]
       result.standardizedGram[j*m+k] = cross
       result.standardizedGram[k*m+j] = cross
   if m > 0:
@@ -526,6 +670,9 @@ proc ridge(cols: seq[seq[float64]], y: seq[float64],
     var pred = result.beta[0]
     for j in 0..<m:
       pred += result.beta[j+1] * cols[j][i]
+    let centeredPred = pred - result.targetMean
+    result.predictionCov += centeredPred*(y[i]-result.targetMean)
+    result.predictionNorm += centeredPred*centeredPred
     result.residual[i] = y[i] - pred
     result.sse += result.residual[i]*result.residual[i]
   result.pearson = standardizedPearson(result.standardizedBeta,
@@ -584,18 +731,21 @@ proc ridgeAppendedPearson(z: seq[float64], fit: Fit): float64 =
   for j in 0..<m: denom -= cross[j]*projection[j]
   if denom <= 1e-15: return fit.pearson
   let alpha = g/denom
-  var newTheta = newSeq[float64](m)
+  # Exact identity using C = (G+n*lambda*I)^(-1), h=C*cross:
+  # Cov(y,p_new) = Cov(y,p_old) + alpha*g
+  # ||p_new||² = ||p_old||² + 2*alpha*n*lambda*(theta.h)
+  #             + alpha²*(zz - cross.h - n*lambda*h.h).
+  # Avoid the old O(p²) Gram multiplication and the temporary beta vector
+  # PER CANDIDATE. Coefficients/selection semantics are unchanged.
+  var crossH, hNorm, betaH = 0.0
   for j in 0..<m:
-    newTheta[j] = fit.standardizedBeta[j] - projection[j]*alpha
-  var cov = alpha*(g + dot(cross, fit.standardizedBeta))
-  for j in 0..<m: cov += newTheta[j]*fit.standardizedXty[j]
-  var predictionNorm = alpha*alpha*zz
-  for j in 0..<m:
-    predictionNorm += 2.0*alpha*newTheta[j]*cross[j]
-    var row = 0.0
-    for k in 0..<m:
-      row += fit.standardizedGram[j*m+k]*newTheta[k]
-    predictionNorm += newTheta[j]*row
+    crossH += cross[j]*projection[j]
+    hNorm += projection[j]*projection[j]
+    betaH += fit.standardizedBeta[j]*projection[j]
+  let cov = fit.predictionCov + alpha*g
+  let predictionNorm = fit.predictionNorm +
+    2.0*alpha*nf*fit.ridgeLambda*betaH +
+    alpha*alpha*(zz-crossH-nf*fit.ridgeLambda*hNorm)
   if predictionNorm <= 1e-24: return 0.0
   result = max(-1.0, min(1.0, cov/sqrt(fit.sst*predictionNorm)))
 
@@ -891,15 +1041,24 @@ proc mine(text: seq[int], cfg: Config,
   if result.len > cfg.candidates:
     result.setLen(cfg.candidates)
 
-# 512-bit per-row token-presence filter. Unlike the approximate candidate
-# screen, this ONLY skips rows which definitely cannot contain the pattern.
-# A false-positive bloom hit costs a normal matcher call; false negatives
-# are impossible for any pattern with at least one literal token.
-type TokenFingerprint = array[8, uint64]
+# 8192-bit per-row token-presence filter. No false negatives: each token sets
+# one bit, and a row is skipped only when a mandatory literal bit is absent.
+# The old 512-bit filter can saturate on ~2000-token rows, forcing avoidable
+# exact wildcard scans despite a missing literal. This enlarges the bitmap
+# without changing any scoring, matching, mining or rule-selection semantics.
+when defined(lensFingerprint512):
+  # Exact same candidate semantics as the 8192-bit version. Use for A/B tests.
+  const TokenFingerprintWords = 8
+  const TokenFingerprintShift = 55
+else:
+  const TokenFingerprintWords = 128 # 8192 bits = 1024 bytes per row
+  const TokenFingerprintShift = 51 # top 13 bits of 64-bit mixed token
+
+type TokenFingerprint = array[TokenFingerprintWords, uint64]
 
 proc tokenFingerprintBit(token: int): int {.inline.} =
   # Nonnegative tokens only; deterministic multiplicative mixing.
-  int((uint64(token) * 0x9E3779B97F4A7C15'u64) shr 55)
+  int((uint64(token) * 0x9E3779B97F4A7C15'u64) shr TokenFingerprintShift)
 
 proc fingerprintText(text: openArray[int]): TokenFingerprint =
   for value in text:
@@ -922,7 +1081,8 @@ proc mayContainPattern(fp: TokenFingerprint, pat: openArray[int]): bool {.inline
 
 proc countFeatures(texts: seq[seq[int]], pat: seq[int],
                    fingerprints: seq[TokenFingerprint] = @[],
-                   originalLengths: seq[int] = @[]): seq[float64] =
+                   originalLengths: seq[int] = @[],
+                   profileSkipped: ptr[int] = nil): seq[float64] =
   ## Every candidate feature uses the same denominator as encoded rules.
   ## Production callers pass pre-noise originalLengths, NEVER rewritten size.
   doAssert originalLengths.len == 0 or originalLengths.len == texts.len
@@ -931,6 +1091,8 @@ proc countFeatures(texts: seq[seq[int]], pat: seq[int],
   for i in 0..<texts.len:
     if fingerprints.len == texts.len and
         not mayContainPattern(fingerprints[i], pat):
+      when defined(lensProfile):
+        if profileSkipped != nil: inc profileSkipped[]
       continue
     let denominator = (if originalLengths.len == texts.len:
                          originalLengths[i] else: texts[i].len)
@@ -1052,6 +1214,7 @@ type
   PrefixState = ref object
     encoded: Encoded
     tokenElements: int
+    ridgeMoments: RidgePrefixMoments # lazy per-step Gram cache
   StageEntry = ref object
     mined: seq[PatternScore]
     fingerprints: seq[TokenFingerprint]
@@ -1114,6 +1277,10 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
   when defined(lensProfile):
     let screenTime = epochTime()
   var scored: seq[PatternScore] = @[]
+  when defined(lensProfile):
+    var skippedExactRows = 0
+    var countedExactRows = 0
+    var exactCountSeconds, exactGainSeconds: float64
   # Appended-rule Pearson is exact among surviving candidates;
   # mid-chain scores remain heuristic.
   # At mid-chain insertion the candidate also changes downstream count
@@ -1125,8 +1292,15 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
       counts = entry.vectors[candidate.pat]
       inc cache.reusedCounts
     else:
-      counts = countFeatures(texts, candidate.pat, fingerprints,
-        originalLengths)
+      when defined(lensProfile):
+        countedExactRows += texts.len
+        let countStart = epochTime()
+        counts = countFeatures(texts, candidate.pat, fingerprints,
+          originalLengths, addr skippedExactRows)
+        exactCountSeconds += epochTime() - countStart
+      else:
+        counts = countFeatures(texts, candidate.pat, fingerprints,
+          originalLengths)
       if entry != nil and entry.vectors.len < MaxCachedFeatureVectorsPerPrefix:
         entry.vectors[candidate.pat] = counts
     var actualOccurrences = 0
@@ -1138,7 +1312,11 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
       actualOccurrences += int(round(density * float64(denominator)))
     if actualOccurrences <= 0: continue
     candidate.frequency = actualOccurrences
+    when defined(lensProfile):
+      let gainStart = epochTime()
     candidate.gain = candidateGain(counts, fit)
+    when defined(lensProfile):
+      exactGainSeconds += epochTime() - gainStart
     if insertionMode or candidate.gain > cfg.minGain:
       scored.add(candidate)
   when defined(lensProfile):
@@ -1155,7 +1333,12 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
       " tokens=", totalTokens, " max_row=", maxTokens,
       " prefix_cache=", (if entry != nil: "on" else: "off"),
       " reused_mine=", (if cache != nil: cache.reusedMining else: 0),
-      " reused_vectors=", (if cache != nil: cache.reusedCounts else: 0))
+      " reused_vectors=", (if cache != nil: cache.reusedCounts else: 0),
+      " fingerprint_bits=", TokenFingerprintWords*64,
+      " exact_skipped_rows=", skippedExactRows,
+      " exact_total_rows=", countedExactRows,
+      " exact_match_seconds=", exactCountSeconds,
+      " exact_gain_seconds=", exactGainSeconds)
   scored.sort(proc(a,b: PatternScore): int =
     let order = cmp(b.gain, a.gain)
     if order != 0: order else: cmp(b.frequency, a.frequency))
@@ -1403,7 +1586,8 @@ proc runDeltaTail(state: var seq[int], cols: var seq[seq[float64]],
       applyAndCount(state, work.lastProgram), originalLength)
 
 proc rankDeltaExchange(prefix: Encoded, branches: seq[Branch],
-                       at: int, ridgeLambda: float64): seq[Branch] =
+                       at: int, ridgeLambda: float64,
+                       commonMoments: RidgePrefixMoments = nil): seq[Branch] =
   ## Count each distinct candidate LHS once, even when RHS differs through
   ## plain/sort/reverse/inverse_sort. A cache miss in downstream counts is
   ## computed lazily from the pre-rule text, with the candidate OMITTED.
@@ -1464,7 +1648,8 @@ proc rankDeltaExchange(prefix: Encoded, branches: seq[Branch],
     var scored = b
     when defined(lensProfile):
       let startRidge = epochTime()
-    scored.score = ridge(encoded.cols, encoded.y, ridgeLambda, false).pearson
+    scored.score = ridge(encoded.cols, encoded.y, ridgeLambda,
+                         false, commonMoments).pearson
     when defined(lensProfile):
       let ridgeElapsed = epochTime() - startRidge
       profileEval.deltaRidgeSeconds += ridgeElapsed
@@ -1488,12 +1673,25 @@ proc rankBranches(rows: seq[Row], branches: seq[Branch], keep: int,
       inc profileEval.rankCacheCalls
     let prefixLength = sharedPrefixLength(branches)
     let prefix = cachedRankingPrefix(rows, branches, prefixLength, stateCache)
+    # Share the O(n * prefix²) Ridge Gram submatrix among sibling branches.
+    # The original prefix rules (and all of their count columns) are equal.
+    var commonMoments: RidgePrefixMoments = nil
+    if ridgeLambda > 0.0 and prefixLength > 0:
+      let prefixKey = stageSignature(branches[0].rules, prefixLength)
+      if stateCache != nil and stateCache.prefixStates.hasKey(prefixKey):
+        let entry = stateCache.prefixStates[prefixKey]
+        if entry.ridgeMoments == nil:
+          entry.ridgeMoments = prepareRidgePrefix(prefix.cols)
+        commonMoments = entry.ridgeMoments
+      else:
+        commonMoments = prepareRidgePrefix(prefix.cols)
     if enableDeltaSuffix and identicalExchangeSuffix(branches, prefixLength):
       when defined(lensProfile):
         let deltaStart = epochTime()
         let oldDeltaRidge = profileEval.deltaRidgeSeconds
         inc profileEval.deltaCalls
-      ranking = rankDeltaExchange(prefix, branches, prefixLength, ridgeLambda)
+      ranking = rankDeltaExchange(prefix, branches, prefixLength,
+                                  ridgeLambda, commonMoments)
       when defined(lensProfile):
         let deltaElapsed = epochTime() - deltaStart
         profileEval.deltaSeconds += deltaElapsed
@@ -1513,7 +1711,8 @@ proc rankBranches(rows: seq[Row], branches: seq[Branch], keep: int,
           profileEval.rankSuffixSeconds += afterEncoding-start
           if b.rules.len > prefixLength:
             inc profileEval.rankLastCountOnly
-        scored.score = ridge(enc.cols, enc.y, ridgeLambda, false).pearson
+        scored.score = ridge(enc.cols, enc.y, ridgeLambda,
+                             false, commonMoments).pearson
         when defined(lensProfile):
           profileEval.rankRidgeSeconds += epochTime()-afterEncoding
         ranking.add(scored)
@@ -1548,6 +1747,31 @@ proc bestCurrentBranches(branches: seq[Branch], keep: int): seq[Branch] =
   ordered.sort(proc(a, b: Branch): int = cmp(b.score, a.score))
   for i in 0..<min(keep, ordered.len):
     result.add(ordered[i])
+
+proc coarseFinalists(branches: seq[Branch], limit: int): seq[Branch] =
+  ## First ensure coverage of different *rule patterns*, since all RHS
+  ## variants of one last-rule addition have identical immediate Coarse score.
+  ## The remainder of the budget can hold RHS variations as usual.
+  var ordered = branches
+  ordered.sort(proc(a, b: Branch): int = cmp(b.score, a.score))
+  var used = newSeq[bool](ordered.len)
+  var seen: seq[seq[int]] = @[]
+  for i, b in ordered:
+    if result.len >= limit: break
+    if b.editedAt < 0 or b.editedAt >= b.rules.len: continue
+    let pat = b.rules[b.editedAt].pat
+    var duplicate = false
+    for prior in seen:
+      if pat == prior:
+        duplicate = true
+        break
+    if not duplicate:
+      seen.add(pat)
+      used[i] = true
+      result.add(b)
+  for i, b in ordered:
+    if result.len >= limit: break
+    if not used[i]: result.add(b)
 
 proc chooseMove(basePearson, addPearson, replacePearson,
                 minGain: float64): MoveKind =
@@ -1634,7 +1858,7 @@ proc attemptAddition(rows: seq[Row], base: Branch, cfg: Config,
       result.add(Branch(rules: rules, score: newPearson,
         description: "add " & patternString(c.pat) & " => " & patternString(r.rhs),
         editedAt: base.rules.len))
-  result = bestCurrentBranches(result, cfg.beamWidth)
+  result = coarseFinalists(result, cfg.beamWidth)
 
 proc predictPearson(rows: seq[Row], rules: seq[Rule], beta: seq[float64]): float64 =
   if rows.len == 0 or beta.len != rules.len+1: return 0.0
@@ -1759,6 +1983,18 @@ proc selfTest() =
       countFeatures(fingerprintTexts, pat, fingerprints)
   doAssert not mayContainPattern(fingerprints[0], @[99999])
   doAssert mayContainPattern(fingerprints[0], @[12, -1, 13])
+  # A long and diverse row must not produce false negatives after changing
+  # the filter size. All skipped matches are provably impossible.
+  var diverseRow: seq[int] = @[]
+  for i in 0..<2000: diverseRow.add(100000 + i*7919)
+  let diverseTexts = @[diverseRow, diverseRow[100..<1900], @[17, 23, 31]]
+  let largeFingerprints = fingerprintRows(diverseTexts)
+  for value in diverseRow:
+    doAssert mayContainPattern(largeFingerprints[0], @[value])
+  for pat in [@[100000], @[100000, -1, 100000 + 7919*33],
+              @[17, 23], @[9999999], @[100000, -1, 23]]:
+    doAssert countFeatures(diverseTexts, pat) ==
+      countFeatures(diverseTexts, pat, largeFingerprints)
   # Screening is identity when disabled or when the shortlist is small.
   let screenCfg = Config(screenRows: 3, screenCandidates: 2)
   let screenTexts = @[@[11], @[22], @[22], @[33]]
@@ -1866,6 +2102,17 @@ proc selfTest() =
     doAssert abs(cur.beta[0] - (cur.targetMean -
       cur.beta[1]*cur.featureMeans[0] -
       cur.beta[2]*cur.featureMeans[1])) < 1e-9
+  # Cached common-prefix Gram must match a full Ridge rebuild: same
+  # coefficients, Pearson and residuals, including standardized columns.
+  let preparedPrefix = prepareRidgePrefix(@[a, b])
+  for lambda in [0.001, 0.01, 0.1, 1.0]:
+    let plainRidge = ridge(@[a, b, z], y, lambda, false)
+    let fastRidge = ridge(@[a, b, z], y, lambda, false, preparedPrefix)
+    doAssert abs(plainRidge.pearson-fastRidge.pearson) < 1e-9
+    for j in 0..<plainRidge.beta.len:
+      doAssert abs(plainRidge.beta[j]-fastRidge.beta[j]) < 1e-9
+    for j in 0..<plainRidge.residual.len:
+      doAssert abs(plainRidge.residual[j]-fastRidge.residual[j]) < 1e-9
   let ridgeConstant = ridge(@[newSeqWith(y.len, 1.0)], y, 0.1)
   doAssert abs(ridgeConstant.beta[0] - (0.0+1.0+3.0+5.0+8.0+13.0)/float64(y.len)) < 1e-9
   doAssert abs(ridgeConstant.beta[1]) < 1e-10
@@ -2074,6 +2321,29 @@ proc selfTest() =
   # The final diffusion snapshot contains only corpus-observed alphabet
   # tokens; each corrupted position differs from its original value.
   # The initial snapshot is unchanged frequency-encoded input.
+  # Dual-grid: floor(k^p) UNION floor(k * L^(1-1/p)). Both have 0 and L.
+  doAssert diffusionLevels(25, 1.0) == toSeq(0..25)
+  doAssert diffusionLevels(25, 2.0) == @[0, 1, 4, 5, 9, 10, 15, 16, 20, 25]
+  doAssert diffusionLevels(30, 2.0) == @[0, 1, 4, 5, 9, 10, 16, 21, 25, 27, 30]
+  doAssert diffusionLevels(25, 3.0) == @[0, 1, 8, 17, 25]
+  doAssert diffusionLevels(25, 1000.0) == @[0, 1, 24, 25]
+  doAssert diffusionLevels(1, 2.0) == @[0, 1]
+  let levelsDecimal = diffusionLevels(100, 1.5)
+  doAssert levelsDecimal.len > diffusionLevels(100, 2.0).len
+  doAssert levelsDecimal.len < diffusionLevels(100, 1.0).len
+  for power in [1.0, 1.2, 1.5, 2.0, 2.25, 3.0, 1000.0]:
+    for size in [1, 2, 10, 25, 100, 2000]:
+      let levels = diffusionLevels(size, power)
+      doAssert levels[0] == 0 and levels[^1] == size
+      for i in 1..<levels.len:
+        doAssert levels[i] > levels[i-1]
+      # Explicitly verify the additional complementary linear progression.
+      let stride = pow(float64(size), 1.0 - 1.0/power)
+      var index = 1
+      while float64(index) * stride < float64(size):
+        let count = int(floor(float64(index)*stride))
+        doAssert count in levels
+        inc index
   var tinyCfg = Config(noiseSteps: 0)
   var diffused: seq[Row] = @[]
   appendDiffusion(diffused, hashed[0], 0, tinyCfg, codec)
@@ -2099,6 +2369,23 @@ proc selfTest() =
   var repeatedDiffusion: seq[Row] = @[]
   appendDiffusion(repeatedDiffusion, hashed[0], 0, tinyCfg, codec)
   doAssert repeatedDiffusion[^1].text == diffused[^1].text
+  # Coarse, Fine and Evaluation schedules must observe identical snapshots
+  # at a shared noise count, independent of their individual density.
+  for power in [1.25, 1.5, 2.0, 2.25, 3.0]:
+    var sampledDiffusion: seq[Row] = @[]
+    appendDiffusion(sampledDiffusion, hashed[0], 0, tinyCfg, codec, power)
+    doAssert sampledDiffusion.len == diffusionLevels(hashed[0].len, power).len
+    for sampledRow in sampledDiffusion:
+      let altered = int(round((1.0-sampledRow.target) * float64(hashed[0].len)))
+      doAssert sampledRow.text == diffused[altered].text
+      doAssert sampledRow.originalLength == hashed[0].len
+  # Verify exact evaluation scheduling (step indices are zero-based).
+  for t in 0..<12:
+    doAssert evaluationDue(t, 12, 1)
+    let shouldEvaluate = t == 0 or t == 4 or t == 9 or t == 11
+    doAssert evaluationDue(t, 12, 5) == shouldEvaluate
+  doAssert evaluationDue(0, 1, 99)
+  doAssert evaluationDue(4, 5, 100)
   # Even if one character dominates, sampling excludes it in bounded time.
   let skewed = makeTokenCodec(@[newSeqWith(200, 65) & @[66]], 11'u64)
   for position in 0..<200:
@@ -2182,21 +2469,37 @@ proc main() =
     " intercept_penalty=false")
   stderr.writeLine("[corpus] chunks=", source.len, " chunkLen<=", cfg.chunkLen,
     " train=", cfg.trainChunks, " valid=", cfg.validChunks,
-    " noiseSteps=", cfg.noiseSteps, " (0=all)")
+    " noiseSteps=", cfg.noiseSteps, " diffusionGrid=power_plus_scaled_linear coarsePower=", cfg.coarsePower,
+    " finePower=", cfg.finePower, " fineTop=", cfg.fineTop,
+    " evalPower=", cfg.evalPower, " evalEvery=", cfg.evalEvery)
   var baseRules: seq[Rule] = @[]
   if cfg.resumeFile.len > 0:
     baseRules = loadRules(cfg.resumeFile, codec)
     if baseRules.len > cfg.maxRules: quit("Resume exceeds max-rules", 1)
   var beams = @[Branch(rules: baseRules, description: "initial", editedAt: -1)]
-  var cache = DiffusionCache(byChunk: initTable[int, seq[Row]](),
+  # NEVER share caches across schedules: their rows have different diffusion
+  # densities despite identical chunk ids. The noise itself is deterministic.
+  var coarseCache = DiffusionCache(byChunk: initTable[int, seq[Row]](),
+                            capacity: max(2, cfg.trainChunks + 1))
+  var fineCache = DiffusionCache(byChunk: initTable[int, seq[Row]](),
                             capacity: max(2, cfg.trainChunks + cfg.validChunks + 1))
-  let validation = makeRows(source, cfg, codec, 0, true, cache)
+  # Do not pre-generate dense validation rows: evaluation may be infrequent.
+  # Schedules with different exponents MUST NOT share a cache by chunk ID.
+  var evalCache = DiffusionCache(byChunk: initTable[int, seq[Row]](),
+                            capacity: max(2, cfg.trainChunks + cfg.validChunks + 1))
+  var searchCfg = cfg
+  searchCfg.beamWidth = max(cfg.beamWidth, cfg.fineTop)
+  stderr.writeLine("[coarse-fine] power=", cfg.coarsePower,
+    " finePower=", cfg.finePower, " fineTop=", cfg.fineTop,
+    " evalPower=", cfg.evalPower, " evalEvery=", cfg.evalEvery,
+    " endpoints=0,N")
   let plotPath = cfg.outDir / "training.dat"
   writeFile(plotPath, "# step train_nlog1mpearson heldout_nlog1mpearson rules train_pearson heldout_pearson seconds train_ma15_nlog1mpearson heldout_ma15_nlog1mpearson\n")
   var trainMA, heldoutMA: PearsonMovingAverage
   for step in 0..<cfg.steps:
     let tick = epochTime()
-    let rows = makeRows(source, cfg, codec, step, false, cache)
+    let rows = makeRows(source, cfg, codec, step, false, coarseCache,
+                        cfg.coarsePower)
     when defined(lensProfile):
       let rowsReadyTime = epochTime()
     if rows.len < 3: quit("Training rows insufficient", 1)
@@ -2223,11 +2526,11 @@ proc main() =
       let parent = parents[parentIndex]
       let state = evaluate(rows, parent.rules, cfg.ridgeLambda, true)
       if parent.rules.len < cfg.maxRules:
-        for b in attemptAddition(rows, parent, cfg, codec,
+        for b in attemptAddition(rows, parent, searchCfg, codec,
                                  state.enc, state.fit, stageCache):
           additions.add(b)
       if parent.rules.len > 0:
-        for b in attemptExchange(rows, parent, cfg, codec,
+        for b in attemptExchange(rows, parent, searchCfg, codec,
                                  state.enc, state.fit, stageCache):
           exchanges.add(b)
     when defined(lensProfile):
@@ -2260,55 +2563,137 @@ proc main() =
         " baseline_built_rows=", profileEval.deltaBaselineBuilds,
         " total=", profileEval.deltaSeconds, "s",
         " ridge=", profileEval.deltaRidgeSeconds, "s")
+    # Fine re-ranking is deliberately optional: on the other generations,
+    # comparisons use the SAME Coarse rows and their Pearson, never mix
+    # scores from different schedules in the same chooseMove() call.
+    let doEvaluate = evaluationDue(step, cfg.steps, cfg.evalEvery)
+    let shortlistAdd = coarseFinalists(additions, cfg.fineTop)
+    let shortlistReplace = coarseFinalists(exchanges, cfg.fineTop)
+    var selectedParents, selectedAdd, selectedReplace: seq[Branch]
+    var selectedBaseline: float64
+    var fineRows: seq[Row] = @[]
+    if doEvaluate:
+      when defined(lensProfile):
+        let startFine = epochTime()
+      fineRows = makeRows(source, cfg, codec, step, false, fineCache,
+                          cfg.finePower)
+      if fineRows.len < 3: quit("Fine training rows insufficient", 1)
+      # Ranking caches are row-dependent: Fine must NOT reuse Coarse states.
+      let fineStageCache = (if cfg.usePrefixCache or cfg.usePrefixStateCache:
+                             StageCache(stages: initTable[string, StageEntry](),
+                               prefixStates: initTable[string, PrefixState]())
+                           else: nil)
+      selectedParents = rankBranches(fineRows, parents, cfg.beamWidth,
+        cfg.ridgeLambda, fineStageCache, cfg.usePrefixStateCache,
+        cfg.useDeltaSuffix)
+      selectedAdd = rankBranches(fineRows, shortlistAdd, cfg.beamWidth,
+        cfg.ridgeLambda, fineStageCache, cfg.usePrefixStateCache,
+        cfg.useDeltaSuffix)
+      selectedReplace = rankBranches(fineRows, shortlistReplace, cfg.beamWidth,
+        cfg.ridgeLambda, fineStageCache, cfg.usePrefixStateCache,
+        cfg.useDeltaSuffix)
+      when defined(lensProfile):
+        stderr.writeLine("[profile-fine] step=", step,
+          " rows=", fineRows.len, " shortlisted=",
+          shortlistAdd.len + shortlistReplace.len,
+          " elapsed=", epochTime() - startFine, "s")
+      selectedBaseline = selectedParents[0].score
+    else:
+      # Use the already evaluated Coarse scores. Sorting still preserves
+      # the best beam variants without re-encoding any Fine rows.
+      selectedParents = parents
+      selectedAdd = bestCurrentBranches(shortlistAdd, cfg.beamWidth)
+      selectedReplace = bestCurrentBranches(shortlistReplace, cfg.beamWidth)
+      selectedBaseline = incumbent.score
+      when defined(lensProfile):
+        stderr.writeLine("[profile-fine] step=", step,
+          " skipped=true evalEvery=", cfg.evalEvery)
+    let addScore = (if selectedAdd.len > 0: selectedAdd[0].score else: -Inf)
+    let replaceScore = (if selectedReplace.len > 0:
+                          selectedReplace[0].score else: -Inf)
+    let move = chooseMove(selectedBaseline, addScore, replaceScore, cfg.minGain)
+    echo "[coarse-fine] step=", step, " coarseRows=", rows.len,
+      " fineRows=", fineRows.len, " evalDue=", doEvaluate,
+      " shortlistAdd=", shortlistAdd.len,
+      " shortlistReplace=", shortlistReplace.len,
+      " coarseBaseline=", incumbent.score,
+      " selectedBaseline=", selectedBaseline
+    echo "[compare] step=", step, " scoring=",
+      (if doEvaluate: "fine" else: "coarse"),
+      " baseline=", selectedBaseline,
+      " add=", (if selectedAdd.len > 0: $addScore else: "n/a"),
+      " replace=", (if selectedReplace.len > 0: $replaceScore else: "n/a"),
+      " chosen=", move, " beamParents=", selectedParents.len
+    case move
+    of moveAdd: beams = selectedAdd
+    of moveReplace: beams = selectedReplace
+    of moveNone: beams = selectedParents
+    let current = beams[0]
+    # Saving rules is cheap and still occurs EVERY generation; if stopped
+    # between evaluation checkpoints, the latest model can be resumed.
+    saveRules(cfg.outDir / "rules.tsv", current.rules)
+    if doEvaluate:
+      # The evaluation schedule is independent from Coarse and Fine. A
+      # different exponent gets its own cache; do not use coefficients from
+      # a different sampling density to calculate evaluation train Pearson.
+      var evalTrainRows, validation: seq[Row]
+      if cfg.evalPower == cfg.finePower:
+        evalTrainRows = fineRows
+        validation = makeRows(source, cfg, codec, 0, true, fineCache,
+                              cfg.evalPower)
+      else:
+        evalTrainRows = makeRows(source, cfg, codec, step, false, evalCache,
+                                 cfg.evalPower)
+        validation = makeRows(source, cfg, codec, 0, true, evalCache,
+                              cfg.evalPower)
+      if evalTrainRows.len < 3: quit("Evaluation training rows insufficient", 1)
+      let evaluated = evaluate(evalTrainRows, current.rules, cfg.ridgeLambda)
+      let valPearson = predictPearson(validation, current.rules,
+                                      evaluated.fit.beta)
+      let elapsed = epochTime() - tick
+      let trainMetric = plotMeasure(evaluated.fit.pearson)
+      let valMetric = plotMeasure(valPearson)
+      # MA15 is over the last 15 *evaluation checkpoints*, NOT 15 steps.
+      let trainSmoothed = plotMeasure(trainMA.addPearson(evaluated.fit.pearson))
+      let valSmoothed = plotMeasure(heldoutMA.addPearson(valPearson))
+      let logLine = $step & " " & $trainMetric & " " & $valMetric & " " &
+        $current.rules.len & " " & $evaluated.fit.pearson & " " &
+        $valPearson & " " & $elapsed & " " &
+        $trainSmoothed & " " & $valSmoothed & "\n"
+      let stream = open(plotPath, fmAppend)
+      stream.write(logLine)
+      stream.close()
+      if cfg.plotEvery > 0 and
+          ((step + 1) mod cfg.plotEvery == 0 or step == cfg.steps - 1):
+        writePlot(cfg.outDir, cfg.ridgeLambda)
+      when defined(lensProfile):
+        stderr.writeLine("[profile-eval-checkpoint] step=", step,
+          " evalPower=", cfg.evalPower,
+          " trainRows=", evalTrainRows.len,
+          " validationRows=", validation.len)
+      echo "[step] ", step, " trainPearson=", evaluated.fit.pearson,
+        " validPearson=", valPearson, " -ln(1-rho)=", trainMetric,
+        " rules=", current.rules.len, " branch=", current.description,
+        " operator=", operatorName(current),
+        " evaluation=", cfg.evalPower, " time=", elapsed, "s"
+    else:
+      # Coarse-only steps have no held-out evaluation. Never reuse stale
+      # held-out Pearson or append fabricated/mixed-density graph points.
+      echo "[step] ", step, " coarsePearson=", current.score,
+        " validPearson=skipped rules=", current.rules.len,
+        " branch=", current.description, " operator=", operatorName(current),
+        " evaluation=skipped time=", epochTime() - tick, "s"
+    when defined(lensProfile):
+      # This counter now includes both mandatory coarse search evaluations
+      # and infrequent diagnostic evaluation on the chosen eval-power rows.
       stderr.writeLine("[profile-evaluate] calls=", profileEval.evaluateCalls,
         " encode=", profileEval.evaluateEncodeSeconds,
-        "s ridge=", profileEval.evaluateRidgeSeconds, "s")
-    additions = bestCurrentBranches(additions, cfg.beamWidth)
-    exchanges = bestCurrentBranches(exchanges, cfg.beamWidth)
-    let addScore = (if additions.len > 0: additions[0].score else: -Inf)
-    let replaceScore = (if exchanges.len > 0: exchanges[0].score else: -Inf)
-    let move = chooseMove(incumbent.score, addScore, replaceScore, cfg.minGain)
-    echo "[compare] step=", step, " baseline=", incumbent.score,
-      " add=", (if additions.len > 0: $addScore else: "n/a"),
-      " replace=", (if exchanges.len > 0: $replaceScore else: "n/a"),
-      " chosen=", move, " beamParents=", parents.len
-    case move
-    of moveAdd:
-      beams = additions
-    of moveReplace:
-      beams = exchanges
-    of moveNone:
-      beams = parents
-    # Record the best actual current-window fitted model, NOT the forecast.
-    let current = beams[0]
-    let initial = evaluate(rows, current.rules, cfg.ridgeLambda, true)
-    let valPearson = predictPearson(validation, current.rules, initial.fit.beta)
-    let elapsed = epochTime() - tick
-    let trainMetric = plotMeasure(initial.fit.pearson)
-    let valMetric = plotMeasure(valPearson)
-    let trainSmoothed = plotMeasure(trainMA.addPearson(initial.fit.pearson))
-    let valSmoothed = plotMeasure(heldoutMA.addPearson(valPearson))
-    let logLine = $step & " " & $trainMetric & " " & $valMetric & " " &
-      $current.rules.len & " " & $initial.fit.pearson & " " &
-      $valPearson & " " & $elapsed & " " &
-      $trainSmoothed & " " & $valSmoothed & "\n"
-    let stream = open(plotPath, fmAppend)
-    stream.write(logLine)
-    stream.close()
-    saveRules(cfg.outDir / "rules.tsv", current.rules)
-    if cfg.plotEvery > 0 and
-        ((step + 1) mod cfg.plotEvery == 0 or step == cfg.steps - 1):
-      writePlot(cfg.outDir, cfg.ridgeLambda)
-    when defined(lensProfile):
+        "s ridge=", profileEval.evaluateRidgeSeconds,
+        "s checkpoint=", doEvaluate)
       stderr.writeLine("[profile-step] rows=", rowsReadyTime-tick,
         "s rank=", parentsReadyTime-rowsReadyTime,
         "s expand=", expansionReadyTime-parentsReadyTime,
         "s selection/evaluation/plot=", epochTime()-expansionReadyTime, "s")
-    echo "[step] ", step, " trainPearson=", initial.fit.pearson,
-      " validPearson=", valPearson, " -ln(1-rho)=", trainMetric,
-      " rules=", current.rules.len, " branch=", current.description,
-      " operator=", operatorName(current),
-      " time=", elapsed, "s"
 
 when isMainModule:
   main()
