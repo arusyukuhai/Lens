@@ -275,3 +275,184 @@ out-of-sample improvements.
 **Build verification:** No Nim compiler or gnuplot was available in the
 execution environment. The Nim build and end-to-end self-tests have not been
 run here; use `./cms --self-test` after compiling locally.
+
+## CPU optimization build: two-stage screening, exact fingerprint rejection, CMS fast path
+
+This variant adds three complementary optimizations (all enabled by default):
+
+1. **512-bit row-token fingerprints (exact rejection).** For each rewritten
+   diffusion row, build an eight-`uint64` presence fingerprint. If even one
+   literal token in a candidate rule is absent, the matcher *cannot* succeed
+   on that row. Such calls are skipped. Hash collisions only produce false
+   positives (extra matching work), never false negatives. Disable with
+   `--fingerprint=0` for comparison. Wildcards are intentionally ignored by
+   the necessary-condition test.
+2. **Approximate two-stage candidate screening.** Of the candidates returned
+   by the CMS miner, run a cheap univariate residual-correlation proxy on
+   `--screen-rows=32` snapshots evenly spread across the whole training
+   diffusion window. Retain up to `--screen-candidates=96` candidates, reserving
+   one eighth of these for CMS-frequency leaders. Then compute **exact
+   occurrence counts and full Ridge add/replace scores** on every row for
+   survivors. This can miss a rule that would have won an exhaustive search;
+   set **`--screen-rows=0 --screen-candidates=0`** to recover the earlier
+   all-candidate evaluation, or increase `--screen-candidates` to be safer.
+   This filtering is *not* a claim of exact top-K selection; mid-chain
+   replacements were already heuristic.
+3. **CMS/min-heap hot-path shortcut.** Once the tracked heap is full, the
+   pattern's combined update+estimate is compared to the cached minimum
+   before looking up its `seq[int]` key in the hash table. Keys that cannot
+   improve the heap are bypassed without extra table hashing. The CMS itself
+   still counts **all** offers. Lookups of surviving keys now use one
+   `getOrDefault` instead of `hasKey` plus `[]`.
+
+4. **Reusable miner shape catalog.** Up to eight sampled diffusion rows
+   now share a single generated pattern-shape list per window. CMS sketch
+   dimensions are tunable with `--cms-width=65536 --cms-depth=4`. Reducing
+   depth to `3` or `2` performs fewer counter probes but increases
+   count overestimation risk; increasing width can offset collisions at
+   the cost of memory. Benchmark both settings before choosing.
+
+There is also `--plot-every=N` (default `1`, `0` for no gnuplot rendering).
+`training.dat` still records **every** step, and the chart's Pearson-first
+15-step moving average is unchanged. To inspect the timing breakdown compile
+with `-d:lensProfile`:
+
+```bash
+nim c -d:release --opt:speed -d:lensProfile -o:lens_profile cms.nim
+./lens_profile --corpus=github-code-dataset.txt --steps=20 \
+  --screen-rows=32 --screen-candidates=96 --fingerprint=1 --plot-every=5 --cms-depth=3 \
+  --out=fast_run
+```
+
+The `[profile]` lines distinguish CMS mining, screening, and exact candidate
+counting/Ridge scoring. The `[profile-step]` lines distinguish diffusion row
+construction, initial beam ranking, Add/Replace expansion, and final reporting.
+
+### Compare quality and speed
+
+Try equal corpus, seed, chunks, and steps with *different* output directories:
+
+```bash
+./lens_profile --steps=20 --out=baseline --screen-rows=0 --fingerprint=0 --plot-every=0
+./lens_profile --steps=20 --out=fingerprint --screen-rows=0 --fingerprint=1 --plot-every=0
+./lens_profile --steps=20 --out=screened --screen-rows=32 --screen-candidates=96 --fingerprint=1 --plot-every=0
+```
+
+The second run preserves candidate evaluation order/semantics; only matcher
+calls provably incapable of firing are skipped. The third run can find a
+*different* rule sequence. Compare held-out performance as well as elapsed
+seconds; do not compare just the final training Pearson.
+
+**Build status:** these changes have not been verified with a Nim compiler in
+this environment. Run `./lens_profile --self-test` locally before trusting a
+long training run. No performance speedup ratio is asserted without a runtime
+benchmark on your machine.
+
+
+## Hot-path optimizations based on observed Lens profiling (2026-10-15)
+
+The measured steps were dominated by `expand` (96–98% of total wall time),
+not CMS. The following exact/semantics-preserving optimizations were added:
+
+1. **Per-rotation prefix cache:** If independent beams or swap chains reach
+   the same already-applied rule prefix, use the same CMS-mined candidates,
+   fingerprint rows, and full *exact* match-count vectors. A unique key
+   encodes the complete ordered `(pattern, replacement)` prefix. The cache
+   is reset on every training-window rotation, so changing noise windows
+   cannot reuse stale features. At most 192 exact candidate vectors are
+   kept per prefix; this is a memory/time trade-off, not an approximation.
+2. **Ridge/OLS tail-exchange short-circuit:** Replacing the last rule cannot
+   change previous count columns. Compute Pearson for every RHS variant
+   directly using the marginal Ridge/OLS formula already used for Add,
+   instead of encoding and refitting once per variant. Mid-chain swaps
+   still perform full sequential rewriting and fitting.
+3. **Verification:** `--self-test` compares uncached and cached candidate
+   sets / frequencies / gains, and checks tail-exchange Pearson against
+   a full Ridge fit on a nonconstant synthetic dataset.
+
+Profile build:
+
+```bash
+nim c -d:release --opt:speed -d:lensProfile -o:lens_profile cms.nim
+./lens_profile --steps=20 --beam=4 --screen-rows=32 --screen-candidates=96 \
+  --fingerprint=1 --plot-every=0 --out=lens_profiled
+```
+
+New log fields: `[profile] ... prefix_cache=on reused_mine=N
+reused_vectors=N` (running counters) and `[profile-cache] prefixes=N
+reused_mining=N reused_exact_vectors=N` (totals for that step). A positive
+reuse counter confirms a stage was reused. The objective, row set, and
+candidate screening settings remain unchanged. Actual speedup depends on how
+many beams share prefixes and on the distribution of swap locations.
+
+**Compiler/build still unverified in this environment** (Nim unavailable).
+Run `./lens_profile --self-test` locally before launching a long experiment.
+
+
+For a controlled speed/quality comparison with the same screening policy,
+use `--prefix-cache=0` to disable prefix caching. Cached and uncached runs
+should produce identical `rules.tsv` and Pearson histories (subject to the
+same deterministic input/seed/build). The `[profile]` report also includes
+`tokens` and `max_row` to reveal whether later rules are expanding the
+rewritten diffusion rows, which can make matching disproportionately slower.
+
+## Prefix State Cache: swap candidate ranking (new)
+
+A rule swap at position `j` preserves all rewritten text and exact count
+features from rules `0 ..< j`. The old `rankBranches` re-encoded these earlier
+rules **once for each replacement candidate**, then refitted Ridge. With
+`--prefix-state-cache=1` (default), ranking candidates instead:
+
+1. Finds the **longest identical prefix**, checking *both* pattern and RHS.
+2. Builds (or reuses) the rewritten rows and count columns **once** for that
+   prefix, within the same rotated training window.
+3. Replays only the divergent rule suffix for each sibling candidate.
+4. For ranking only, **counts the final rule without rewriting its output**.
+   This is exactly equivalent because its RHS has no influence on earlier
+   count features and there is no next rule in that candidate pipeline.
+   A conservative fallback still runs the rewrite when necessary to retain
+   normal output-overflow behavior.
+5. Computes the unchanged Ridge/OLS Pearson on the assembled exact counts.
+
+This is **not approximate**: the count columns and regression are the same as
+full encoding. In practice its speedup depends on how late a swap happens,
+how often multiple candidates share a prefix, and how much time `ridge` takes.
+Zero-prefix changes still benefit from avoiding the unneeded final rewrite.
+The state cache is reset every rotation, stores at most **2 prefixes** and at
+most **6 million materialized token elements** (approximately 48MB of int64
+payload, excluding container/object overhead). A larger one-off prefix may be
+shared within one ranking call but is not retained across calls.
+
+Control and profile:
+
+```bash
+nim c -d:release --opt:speed -d:lensProfile -o:lens_profile cms.nim
+./lens_profile --self-test
+./lens_profile --steps=20 --beam=4 --prefix-cache=1 \
+  --prefix-state-cache=1 --plot-every=0 --out=with_state
+./lens_profile --steps=20 --beam=4 --prefix-cache=1 \
+  --prefix-state-cache=0 --plot-every=0 --out=without_state
+```
+
+Use **identical corpus, seed, parameters, lambda, and token map**, and distinct
+`--out` directories. The self-test compares exact legacy and optimized beam
+scores for Ridge and OLS with multiple RHS variants and a nonempty shared
+prefix. `rules.tsv` and Pearson histories should agree apart from tiny
+floating-point differences. The `--prefix-cache` switch continues to govern
+CMS mining/count-vector reuse independently.
+
+New `-d:lensProfile` diagnostics:
+
+- `[profile-rank]`: total ranking calls and branches, prefix builds/hits,
+  evictions, suffix encode time, Ridge solve time, total ranking time, and
+  how often the trailing rewrite was skipped in favor of exact count.
+- `[profile-evaluate]`: number of full `evaluate()` calls and their encode
+  versus Ridge solve times. These calls include mid-chain exploratory
+  exchanges, which still require rebuilding affected downstream features.
+- `[profile-cache] state_entries/state_tokens`: retained prefix states and
+  estimated materialized token payload in the current rotation.
+
+**Build and runtime caveat:** Nim is not installed in the delivery environment;
+this revised Nim code is statically checked but not compiled or benchmarked
+here. Verify the self-test and on/off equality on your machine before trusting
+performance or a long training run.

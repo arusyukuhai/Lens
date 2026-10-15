@@ -10,6 +10,11 @@ type
     steps, maxRules, minNgram, maxGram, maxTotalGram, maxWildcards: int
     maxGap, mineStarts, mineBudget, mineTracked, candidates, beamWidth, swapDepth: int
     minGain, ridgeLambda: float64
+    screenRows, screenCandidates, plotEvery: int # 0 disables respective work
+    cmsWidth, cmsDepth: int
+    useFingerprint: bool # exact no-false-negative match rejection
+    usePrefixCache: bool # reuse mining and exact counts among equal prefixes
+    usePrefixStateCache: bool # reuse pre-swap rewritten rows when ranking branches
     tokenSeed: int
     tokenMapFile: string
 
@@ -90,7 +95,9 @@ proc parseConfig(): Config =
     maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
     candidates: 384, beamWidth: 8, swapDepth: 3, minGain: 1e-9,
-    ridgeLambda: 1.0,
+    ridgeLambda: 0.1, screenRows: 32, screenCandidates: 96,
+    useFingerprint: true, usePrefixCache: true, usePrefixStateCache: true, plotEvery: 1,
+    cmsWidth: 65536, cmsDepth: 4,
     tokenSeed: 1729, tokenMapFile: "")
   if not fileExists(result.corpus) and fileExists("github-code.txt"):
     result.corpus = "github-code.txt"
@@ -103,6 +110,13 @@ proc parseConfig(): Config =
       echo "--max-wildcards=N --max-gap=N --mine-starts=N --mine-budget=N"
       echo "--mine-tracked=N --candidates=N --beam=N --swap-depth=N"
       echo "--ridge-lambda=0.1 (standardized predictors; 0=legacy OLS)"
+      echo "--screen-rows=32 --screen-candidates=96 (0 disables; approximate screen)"
+      echo "--fingerprint=1 (0 disables; exact presence-based matcher skips)"
+      echo "--prefix-cache=1 (0 disables; compare old per-parent mining/counting)"
+      echo "--prefix-state-cache=1 (0 disables; compare full re-encoding for swaps)"
+      echo "--plot-every=1 (5 renders every 5 steps; 0 disables rendering)"
+      echo "--cms-width=65536 --cms-depth=4 (power-of-two width; depth=2/3 faster but noisier)"
+      echo "Build with -d:lensProfile to profile mining, screening and exact scoring"
       echo "--token-seed=N --token-map=FILE (re-use mapping across runs)"
       quit(0)
     if not arg.startsWith("--") or not arg.contains('='): continue
@@ -132,6 +146,14 @@ proc parseConfig(): Config =
     of "beam": result.beamWidth = readInt(val, result.beamWidth)
     of "swap-depth": result.swapDepth = readInt(val, result.swapDepth)
     of "ridge-lambda": result.ridgeLambda = readFloat(val, result.ridgeLambda)
+    of "screen-rows": result.screenRows = readInt(val, result.screenRows)
+    of "screen-candidates": result.screenCandidates = readInt(val, result.screenCandidates)
+    of "fingerprint": result.useFingerprint = readInt(val, 1) != 0
+    of "prefix-cache": result.usePrefixCache = readInt(val, 1) != 0
+    of "prefix-state-cache": result.usePrefixStateCache = readInt(val, 1) != 0
+    of "plot-every": result.plotEvery = readInt(val, result.plotEvery)
+    of "cms-width": result.cmsWidth = readInt(val, result.cmsWidth)
+    of "cms-depth": result.cmsDepth = readInt(val, result.cmsDepth)
     of "lookahead-budget", "lookahead-candidates", "beam-expand", "beam-tolerance":
       stderr.writeLine("[deprecated] ", key,
         " is ignored; the beam now uses direct current-window Pearson only")
@@ -154,6 +176,12 @@ proc parseConfig(): Config =
   result.candidates = max(1, result.candidates)
   result.beamWidth = max(1, result.beamWidth)
   result.swapDepth = max(1, result.swapDepth)
+  result.screenRows = max(0, result.screenRows)
+  result.screenCandidates = max(0, result.screenCandidates)
+  result.plotEvery = max(0, result.plotEvery)
+  if result.cmsWidth <= 0 or (result.cmsWidth and (result.cmsWidth - 1)) != 0 or
+      result.cmsWidth > 1048576 or result.cmsDepth < 1 or result.cmsDepth > 8:
+    quit("Invalid CMS dimensions: width must be a power of two <= 2^20; depth 1..8", 1)
   if classify(result.ridgeLambda) in {fcNan, fcInf, fcNegInf} or result.ridgeLambda < 0.0:
     quit("--ridge-lambda must be finite and nonnegative", 1)
 
@@ -242,6 +270,16 @@ proc makeRows(corpus: seq[seq[int]], cfg: Config, codec: TokenCodec,
       let idx = (step + offset) mod trainPool
       let chunkRows = rowsForChunk(corpus, cfg, codec, idx, cache)
       result.add(chunkRows)
+
+when defined(lensProfile):
+  type EvaluationCounters = object
+    evaluateCalls, rankCalls, rankVariants, rankCacheCalls: int
+    rankPrefixBuilds, rankPrefixHits, rankPrefixEvictions: int
+    rankLastCountOnly: int
+    evaluateEncodeSeconds, evaluateRidgeSeconds: float64
+    rankTotalSeconds, rankPrefixBuildSeconds: float64
+    rankSuffixSeconds, rankRidgeSeconds: float64
+  var profileEval: EvaluationCounters
 
 proc encode(rows: seq[Row], rules: seq[Rule]): Encoded =
   let n = rows.len
@@ -718,9 +756,14 @@ proc offer(m: var MineState, pat: seq[int]) =
   inc m.offers
   # Update AND read the CMS estimate in one hashing/counter pass.
   let estimate = m.sketch.addAndEstimate(pat)
-  if m.positions.hasKey(pat):
-    let idx = m.positions[pat]
-    # A tracked pattern can only gain estimated frequency.
+  # Once full, a key that cannot beat the cached minimum cannot alter
+  # the heap. Avoid hashing every low-frequency key for Table lookup.
+  # An already tracked key with estimate <= minimum is unchanged, too.
+  if m.tracked.len >= m.cfg.mineTracked and
+      estimate <= m.tracked[0].estimate:
+    return
+  let idx = m.positions.getOrDefault(pat, -1)
+  if idx >= 0:
     m.tracked[idx].estimate = estimate
     m.siftDown(idx)
     return
@@ -801,13 +844,11 @@ proc shapeList(cfg: Config, cur: var seq[int], total: int,
     shapeList(cfg, cur, total+gram, dest)
     cur.setLen(cur.len - 1)
 
-proc mine(text: seq[int], cfg: Config): seq[PatternScore] =
-  var shapes: seq[seq[int]] = @[]
-  var cur: seq[int] = @[]
-  shapeList(cfg, cur, 0, shapes)
+proc mine(text: seq[int], cfg: Config,
+          shapes: seq[seq[int]]): seq[PatternScore] =
   if shapes.len == 0: return
   var m = MineState(text: text, cfg: cfg,
-    sketch: initCountMinSketch(65536, 4),
+    sketch: initCountMinSketch(cfg.cmsWidth, cfg.cmsDepth),
     positions: initTable[seq[int], int]())
   let perShape = max(1, cfg.mineBudget div shapes.len)
   for s in shapes:
@@ -822,10 +863,43 @@ proc mine(text: seq[int], cfg: Config): seq[PatternScore] =
   if result.len > cfg.candidates:
     result.setLen(cfg.candidates)
 
-proc countFeatures(texts: seq[seq[int]], pat: seq[int]): seq[float64] =
+# 512-bit per-row token-presence filter. Unlike the approximate candidate
+# screen, this ONLY skips rows which definitely cannot contain the pattern.
+# A false-positive bloom hit costs a normal matcher call; false negatives
+# are impossible for any pattern with at least one literal token.
+type TokenFingerprint = array[8, uint64]
+
+proc tokenFingerprintBit(token: int): int {.inline.} =
+  # Nonnegative tokens only; deterministic multiplicative mixing.
+  int((uint64(token) * 0x9E3779B97F4A7C15'u64) shr 55)
+
+proc fingerprintText(text: openArray[int]): TokenFingerprint =
+  for value in text:
+    if value < 0: continue
+    let bit = tokenFingerprintBit(value)
+    result[bit shr 6] = result[bit shr 6] or (1'u64 shl (bit and 63))
+
+proc fingerprintRows(texts: seq[seq[int]]): seq[TokenFingerprint] =
+  result = newSeq[TokenFingerprint](texts.len)
+  for i in 0..<texts.len:
+    result[i] = fingerprintText(texts[i])
+
+proc mayContainPattern(fp: TokenFingerprint, pat: openArray[int]): bool {.inline.} =
+  for value in pat:
+    if value < 0: continue # wildcards are not literal requirements
+    let bit = tokenFingerprintBit(value)
+    if (fp[bit shr 6] and (1'u64 shl (bit and 63))) == 0'u64:
+      return false
+  true
+
+proc countFeatures(texts: seq[seq[int]], pat: seq[int],
+                   fingerprints: seq[TokenFingerprint] = @[]): seq[float64] =
   let compiled = compileSeqPattern(pat, 1)
   result = newSeq[float64](texts.len)
   for i in 0..<texts.len:
+    if fingerprints.len == texts.len and
+        not mayContainPattern(fingerprints[i], pat):
+      continue
     result[i] = float64(countSeqCompiled(texts[i], compiled))
 
 proc miningSampleIndices(n: int, limit = 8): seq[int] =
@@ -848,30 +922,170 @@ proc mineWindow(texts: seq[seq[int]], cfg: Config): seq[PatternScore] =
   local.mineTracked = max(1, cfg.mineTracked div indices.len)
   local.candidates = max(1, (cfg.candidates + indices.len - 1) div indices.len)
   var seen = initTable[seq[int], bool]()
+  # Every sampled row shares exactly the same set of pattern shapes.
+  # Generate it once per window instead of rebuilding the recursive tree.
+  var shapes: seq[seq[int]] = @[]
+  var cur: seq[int] = @[]
+  shapeList(cfg, cur, 0, shapes)
   for rowIndex in indices:
-    for candidate in mine(texts[rowIndex], local):
-      if not seen.hasKey(candidate.pat):
-        seen[candidate.pat] = true
+    for candidate in mine(texts[rowIndex], local, shapes):
+      if not seen.hasKeyOrPut(candidate.pat, true):
         result.add(candidate)
+
+# Two-stage candidate screening. A sparse sample estimates how strongly
+# candidate firing counts correlate with the current residual. This is a
+# cheap HEURISTIC, not the exact Ridge marginal gain: retaining some CMS
+# frequency leaders reduces the risk of discarding useful rare/indirect keys.
+# Every survivor is still evaluated with exact full-window counts and Ridge.
+proc screenPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
+                    candidates: seq[PatternScore],
+                    fingerprints: seq[TokenFingerprint] = @[]): seq[PatternScore] =
+  if cfg.screenRows <= 0 or cfg.screenCandidates <= 0 or
+      candidates.len <= cfg.screenCandidates or
+      fit.residual.len != texts.len:
+    return candidates
+  let indices = miningSampleIndices(texts.len, cfg.screenRows)
+  if indices.len < 3: return candidates
+  let n = float64(indices.len)
+  var sumResidual = 0.0
+  for i in indices:
+    sumResidual += fit.residual[i]
+
+  type ScreenScore = tuple[index: int, proxy: float64]
+  var ranked: seq[ScreenScore] = @[]
+  for j, candidate in candidates:
+    let pattern = compileSeqPattern(candidate.pat, 1)
+    var sumZ, sumZZ, sumZR = 0.0
+    for i in indices:
+      let z = (if fingerprints.len == texts.len and
+                  not mayContainPattern(fingerprints[i], candidate.pat):
+                 0.0
+               else: float64(countSeqCompiled(texts[i], pattern)))
+      sumZ += z
+      sumZZ += z*z
+      sumZR += z*fit.residual[i]
+    let centeredZ = max(0.0, sumZZ - sumZ*sumZ/n)
+    let centeredCross = sumZR - sumZ*sumResidual/n
+    # Larger |partial-residual covariance| / sigma(z) is preferred.
+    let proxy = (if centeredZ > 1e-12:
+                   abs(centeredCross) / sqrt(centeredZ)
+                 else: 0.0)
+    ranked.add((j, proxy))
+  ranked.sort(proc(a, b: ScreenScore): int =
+    let c = cmp(b.proxy, a.proxy)
+    if c != 0: c else: cmp(candidates[b.index].frequency,
+                          candidates[a.index].frequency))
+
+  let target = min(cfg.screenCandidates, candidates.len)
+  let reserveFreq = max(1, target div 8)
+  var selected = newSeq[bool](candidates.len)
+  var taken = 0
+  for i in 0..<min(target-reserveFreq, ranked.len):
+    selected[ranked[i].index] = true
+    inc taken
+
+  # Protect part of the shortlist by approximate CMS frequency, regardless
+  # of the residual proxy. The final feature counts never use CMS values.
+  var byFreq = ranked
+  byFreq.sort(proc(a, b: ScreenScore): int =
+    let c = cmp(candidates[b.index].frequency,
+                candidates[a.index].frequency)
+    if c != 0: c else: cmp(b.proxy, a.proxy))
+  for entry in byFreq:
+    if taken >= target: break
+    if not selected[entry.index]:
+      selected[entry.index] = true
+      inc taken
+  for j in 0..<candidates.len:
+    if selected[j]: result.add(candidates[j])
+
+# Reuse mining, row fingerprints and EXACT count vectors whenever different
+# beam parents request candidate scoring at the same prefix of the SAME
+# rotated training window. The cache is thrown away between steps.
+# Store only 192 full count vectors per prefix to bound memory use.
+const MaxCachedFeatureVectorsPerPrefix = 192
+# Limits apply to stored token *elements*, not the borrowed row.text references.
+# At most about 48MB of materialized prefix text (plus small metadata).
+const MaxCachedPrefixStateTokens = 6_000_000
+const MaxCachedPrefixStates = 2
+
+type
+  PrefixState = ref object
+    encoded: Encoded
+    tokenElements: int
+  StageEntry = ref object
+    mined: seq[PatternScore]
+    fingerprints: seq[TokenFingerprint]
+    vectors: Table[seq[int], seq[float64]]
+  StageCache = ref object
+    stages: Table[string, StageEntry]
+    reusedMining, reusedCounts: int
+    prefixStates: Table[string, PrefixState]
+    prefixOrder: seq[string]
+    prefixTokenElements: int
+
+proc stageSignature(rules: seq[Rule], stop: int): string =
+  ## Prefix rules completely determine their rewritten diffusion rows,
+  ## within one step. The integers are serialized without hash collisions.
+  for j in 0..<min(stop, rules.len):
+    result.add($rules[j].pat.len & ":" & patternString(rules[j].pat) & "/")
+    result.add($rules[j].rhs.len & ":" & patternString(rules[j].rhs) & ";")
 
 proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
                   exclude: seq[Rule], count: int,
-                  insertionMode = false): seq[PatternScore] =
+                  insertionMode = false,
+                  cache: StageCache = nil, stageKey: string = ""): seq[PatternScore] =
   if texts.len == 0: return
-  let candidates = mineWindow(texts, cfg)
-  var scored: seq[PatternScore] = @[]
-  # Appended-rule Pearson is exact; mid-chain scores remain heuristic.
-  # At mid-chain insertion the candidate also changes downstream count
-  # columns, so the candidate ranking is a HEURISTIC, not a rejection test.
-  for originalCandidate in candidates:
-    var candidate = originalCandidate
+  when defined(lensProfile):
+    let startTime = epochTime()
+  var entry: StageEntry = nil
+  var mined: seq[PatternScore]
+  if cache != nil:
+    if cache.stages.hasKey(stageKey):
+      entry = cache.stages[stageKey]
+      inc cache.reusedMining
+    else:
+      entry = StageEntry(
+        mined: mineWindow(texts, cfg),
+        fingerprints: (if cfg.useFingerprint: fingerprintRows(texts)
+                       else: newSeq[TokenFingerprint](0)),
+        vectors: initTable[seq[int], seq[float64]]())
+      cache.stages[stageKey] = entry
+    mined = entry.mined
+  else:
+    mined = mineWindow(texts, cfg)
+  when defined(lensProfile):
+    let mineTime = epochTime()
+  # Do not spend approximate-screen slots on existing-rule patterns.
+  var eligible: seq[PatternScore] = @[]
+  for candidate in mined:
     var banned = false
     for r in exclude:
       if candidate.pat == r.pat:
         banned = true
         break
-    if banned: continue
-    let counts = countFeatures(texts, candidate.pat)
+    if not banned: eligible.add(candidate)
+  let fingerprints = (if entry != nil: entry.fingerprints
+                      elif cfg.useFingerprint: fingerprintRows(texts)
+                      else: newSeq[TokenFingerprint](0))
+  let candidates = screenPatterns(texts, fit, cfg, eligible, fingerprints)
+  when defined(lensProfile):
+    let screenTime = epochTime()
+  var scored: seq[PatternScore] = @[]
+  # Appended-rule Pearson is exact among surviving candidates;
+  # mid-chain scores remain heuristic.
+  # At mid-chain insertion the candidate also changes downstream count
+  # columns, so the candidate ranking is a HEURISTIC, not a rejection test.
+  for originalCandidate in candidates:
+    var candidate = originalCandidate
+    var counts: seq[float64]
+    if entry != nil and entry.vectors.hasKey(candidate.pat):
+      counts = entry.vectors[candidate.pat]
+      inc cache.reusedCounts
+    else:
+      counts = countFeatures(texts, candidate.pat, fingerprints)
+      if entry != nil and entry.vectors.len < MaxCachedFeatureVectorsPerPrefix:
+        entry.vectors[candidate.pat] = counts
     var actualOccurrences = 0
     for value in counts: actualOccurrences += int(value)
     if actualOccurrences <= 0: continue
@@ -879,6 +1093,21 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
     candidate.gain = candidateGain(counts, fit)
     if insertionMode or candidate.gain > cfg.minGain:
       scored.add(candidate)
+  when defined(lensProfile):
+    var totalTokens = 0
+    var maxTokens = 0
+    for t in texts:
+      totalTokens += t.len
+      maxTokens = max(maxTokens, t.len)
+    stderr.writeLine("[profile] mine=", mineTime-startTime,
+      "s screen=", screenTime-mineTime,
+      "s exact=", epochTime()-screenTime,
+      "s mined=", mined.len, " eligible=", eligible.len,
+      " exact_candidates=", candidates.len,
+      " tokens=", totalTokens, " max_row=", maxTokens,
+      " prefix_cache=", (if entry != nil: "on" else: "off"),
+      " reused_mine=", (if cache != nil: cache.reusedMining else: 0),
+      " reused_vectors=", (if cache != nil: cache.reusedCounts else: 0))
   scored.sort(proc(a,b: PatternScore): int =
     let order = cmp(b.gain, a.gain)
     if order != 0: order else: cmp(b.frequency, a.frequency))
@@ -914,8 +1143,16 @@ proc prefixTexts(rows: seq[Row], rules: seq[Rule], stop: int): seq[seq[int]] =
 
 proc evaluate(rows: seq[Row], rules: seq[Rule],
               ridgeLambda: float64, removal = false): tuple[enc: Encoded, fit: Fit] =
+  when defined(lensProfile):
+    inc profileEval.evaluateCalls
+    let start = epochTime()
   result.enc = encode(rows, rules)
+  when defined(lensProfile):
+    let encodedAt = epochTime()
+    profileEval.evaluateEncodeSeconds += encodedAt - start
   result.fit = ridge(result.enc.cols, result.enc.y, ridgeLambda, removal)
+  when defined(lensProfile):
+    profileEval.evaluateRidgeSeconds += epochTime() - encodedAt
 
 proc alteredIndex(reference: Encoded, current: Encoded,
                   excluded: seq[bool], fit: Fit): int =
@@ -938,34 +1175,167 @@ proc alteredIndex(reference: Encoded, current: Encoded,
       result = j
 
 proc bestInsertion(rows: seq[Row], existing: seq[Rule], at: int,
-                   cfg: Config, codec: TokenCodec, keep: int): seq[Branch] =
+                   cfg: Config, codec: TokenCodec, keep: int,
+                   cache: StageCache = nil): seq[Branch] =
   ## Mine exactly at the insertion point, AFTER earlier rules and BEFORE
   ## later ones. FWL is a prefilter; full rewritten OLS judges acceptance.
   let baseline = evaluate(rows, existing, cfg.ridgeLambda, true)
   let stageTexts = prefixTexts(rows, existing, at)
   let winners = bestPatterns(stageTexts, baseline.fit, cfg, existing,
-                             max(1, keep), true)
+                             max(1, keep), true, cache,
+                             stageSignature(existing, at))
   for candidate in winners:
+    # A replacement at the END of the sequence cannot modify downstream
+    # feature columns. The block Ridge/OLS append formula gives its exact
+    # Pearson, independent of the replacement RHS (plain/sort/reverse/etc.).
+    var tailPearson = 0.0
+    if at == existing.len:
+      if baseline.fit.sst <= 1e-24:
+        tailPearson = baseline.fit.pearson
+      elif baseline.fit.ridgeLambda > 0.0:
+        tailPearson = max(-1.0, min(1.0,
+          baseline.fit.pearson + candidate.gain))
+      else:
+        tailPearson = sqrt(max(0.0, min(1.0,
+          1.0 - max(0.0, baseline.fit.sse-candidate.gain)/baseline.fit.sst)))
     for variant in generateReplacementVariants(candidate.pat, candidate.frequency, codec):
       var rules: seq[Rule] = @[]
       for r in existing: rules.add(r)
       rules.insert(variant, at)
-      result.add(Branch(rules: rules,
+      result.add(Branch(rules: rules, score: tailPearson,
         description: "replace " & $at & " with " & patternString(candidate.pat) &
           " => " & patternString(variant.rhs), editedAt: at))
 
-proc rankBranches(rows: seq[Row], branches: seq[Branch], keep: int,
-                  ridgeLambda: float64): seq[Branch] =
-  ## Simple beam: fit ONLY the present diffusion window. Equal-scoring
-  ## RHS variants are retained independently and compete on the next step.
-  var ranking: seq[Branch] = @[]
+proc sharedPrefixLength(branches: seq[Branch]): int =
+  ## Exact rule identity includes BOTH LHS and RHS, since a prefix output
+  ## depends on all earlier replacement results.
+  if branches.len == 0: return 0
+  result = branches[0].rules.len
   for b in branches:
-    var scored = b
-    scored.score = evaluate(rows, b.rules, ridgeLambda).fit.pearson
-    ranking.add(scored)
+    result = min(result, b.rules.len)
+  for j in 0..<result:
+    let rule = branches[0].rules[j]
+    for k in 1..<branches.len:
+      if branches[k].rules[j].pat != rule.pat or
+          branches[k].rules[j].rhs != rule.rhs:
+        return j
+
+proc encodeSuffixForRanking(prefix: Encoded, rules: seq[Rule],
+                            prefixLength: int): Encoded =
+  ## All rule-count columns preceding the first difference are borrowed,
+  ## read-only. Recompute only suffix columns on the same pre-diffused rows.
+  ## The final RHS never affects any count column, so COUNT the last rule
+  ## without materializing its rewritten output. This is exact, not a proxy.
+  let n = prefix.y.len
+  result.y = prefix.y
+  result.cols = newSeq[seq[float64]](rules.len)
+  for j in 0..<prefixLength:
+    result.cols[j] = prefix.cols[j]
+  if prefixLength >= rules.len: return
+  var programs = newSeq[SeqReplaceProgram](max(0, rules.len-prefixLength-1))
+  for offset in 0..<programs.len:
+    let r = rules[prefixLength + offset]
+    programs[offset] = compileSeqReplaceProgram(r.pat, r.rhs, 1)
+    result.cols[prefixLength + offset] = newSeq[float64](n)
+  let last = rules.len - 1
+  let lastPattern = compileSeqPattern(rules[last].pat, 1)
+  # If the last rewrite *could* exceed the replacement engine's output cap,
+  # execute it normally to preserve the same overflow errors as full encode.
+  # Otherwise its output is dead and only its exact count is required.
+  let safeInputLength = MAX_REPLACE_OUTPUT div max(2, rules[last].rhs.len + 1)
+  var lastProgram = compileSeqReplaceProgram(
+    rules[last].pat, rules[last].rhs, 1)
+  result.cols[last] = newSeq[float64](n)
+  for i in 0..<n:
+    # applyAndCount never mutates the tokens of its input buffer: it builds
+    # a fresh output and reassigns state. The cached prefix is immutable.
+    var state = prefix.finalTexts[i]
+    for offset in 0..<programs.len:
+      result.cols[prefixLength + offset][i] =
+        float64(applyAndCount(state, programs[offset]))
+    if state.len <= safeInputLength:
+      result.cols[last][i] = float64(countSeqCompiled(state, lastPattern))
+    else:
+      result.cols[last][i] = float64(applyAndCount(state, lastProgram))
+
+proc cachedRankingPrefix(rows: seq[Row], branches: seq[Branch],
+                         prefixLength: int, cache: StageCache): Encoded =
+  let key = stageSignature(branches[0].rules, prefixLength)
+  if cache != nil and cache.prefixStates.hasKey(key):
+    when defined(lensProfile):
+      inc profileEval.rankPrefixHits
+    return cache.prefixStates[key].encoded
+  when defined(lensProfile):
+    let start = epochTime()
+    inc profileEval.rankPrefixBuilds
+  var common: seq[Rule] = @[]
+  for j in 0..<prefixLength:
+    common.add(branches[0].rules[j])
+  result = encode(rows, common)
+  when defined(lensProfile):
+    profileEval.rankPrefixBuildSeconds += epochTime()-start
+  # Prefix 0 is just references to input rows. Larger prefixes may own
+  # millions of rewritten tokens, so use a strict step-local LRU budget.
+  if cache != nil:
+    var storedTokens = 0
+    if prefixLength > 0:
+      for row in result.finalTexts:
+        storedTokens += row.len
+    if storedTokens <= MaxCachedPrefixStateTokens:
+      while cache.prefixOrder.len >= MaxCachedPrefixStates or
+          (cache.prefixOrder.len > 0 and
+           cache.prefixTokenElements + storedTokens > MaxCachedPrefixStateTokens):
+        let oldKey = cache.prefixOrder[0]
+        cache.prefixOrder.delete(0)
+        cache.prefixTokenElements -= cache.prefixStates[oldKey].tokenElements
+        cache.prefixStates.del(oldKey)
+        when defined(lensProfile):
+          inc profileEval.rankPrefixEvictions
+      cache.prefixStates[key] = PrefixState(
+        encoded: result, tokenElements: storedTokens)
+      cache.prefixOrder.add(key)
+      cache.prefixTokenElements += storedTokens
+
+proc rankBranches(rows: seq[Row], branches: seq[Branch], keep: int,
+                  ridgeLambda: float64, stateCache: StageCache = nil,
+                  enableStateCache = false): seq[Branch] =
+  ## The pre-swap prefix is the same for all sibling candidates. Cache its
+  ## entire rewritten row state (and earlier exact count columns), then
+  ## apply ONLY the changed suffix. No score approximation is introduced.
+  when defined(lensProfile):
+    let rankStart = epochTime()
+    inc profileEval.rankCalls
+    profileEval.rankVariants += branches.len
+  var ranking: seq[Branch] = @[]
+  if enableStateCache and branches.len > 1:
+    when defined(lensProfile):
+      inc profileEval.rankCacheCalls
+    let prefixLength = sharedPrefixLength(branches)
+    let prefix = cachedRankingPrefix(rows, branches, prefixLength, stateCache)
+    for b in branches:
+      var scored = b
+      when defined(lensProfile):
+        let start = epochTime()
+      let enc = encodeSuffixForRanking(prefix, b.rules, prefixLength)
+      when defined(lensProfile):
+        let afterEncoding = epochTime()
+        profileEval.rankSuffixSeconds += afterEncoding-start
+        if b.rules.len > prefixLength:
+          inc profileEval.rankLastCountOnly
+      scored.score = ridge(enc.cols, enc.y, ridgeLambda, false).pearson
+      when defined(lensProfile):
+        profileEval.rankRidgeSeconds += epochTime()-afterEncoding
+      ranking.add(scored)
+  else:
+    for b in branches:
+      var scored = b
+      scored.score = evaluate(rows, b.rules, ridgeLambda).fit.pearson
+      ranking.add(scored)
   ranking.sort(proc(a, b: Branch): int = cmp(b.score, a.score))
   for i in 0..<min(keep, ranking.len):
     result.add(ranking[i])
+  when defined(lensProfile):
+    profileEval.rankTotalSeconds += epochTime()-rankStart
 
 proc operatorName(branch: Branch): string =
   if branch.editedAt < 0 or branch.editedAt >= branch.rules.len:
@@ -1001,7 +1371,8 @@ proc chooseMove(basePearson, addPearson, replacePearson,
   return moveNone
 
 proc attemptExchange(rows: seq[Row], base: Branch, cfg: Config,
-                     codec: TokenCodec, baseEnc: Encoded, baseFit: Fit): seq[Branch] =
+                     codec: TokenCodec, baseEnc: Encoded, baseFit: Fit,
+                     cache: StageCache = nil): seq[Branch] =
   if base.rules.len == 0: return
   var weakest = -1
   var leastLoss = Inf
@@ -1019,9 +1390,17 @@ proc attemptExchange(rows: seq[Row], base: Branch, cfg: Config,
     var without: seq[Rule] = @[]
     for r in trial.rules: without.add(r)
     without.delete(nextIndex)
-    let options = bestInsertion(rows, without, nextIndex, cfg, codec, cfg.beamWidth)
+    let options = bestInsertion(rows, without, nextIndex, cfg, codec,
+                                cfg.beamWidth,
+                                (if cfg.usePrefixCache: cache else: nil))
     if options.len == 0: break
-    let ranked = rankBranches(rows, options, cfg.beamWidth, cfg.ridgeLambda)
+    let ranked = (if nextIndex == without.len:
+                    # Score was EXACTLY calculated by bestInsertion using
+                    # Ridge/OLS marginal addition; no repeated encode/refit.
+                    bestCurrentBranches(options, cfg.beamWidth)
+                  else:
+                    rankBranches(rows, options, cfg.beamWidth, cfg.ridgeLambda,
+                                 cache, cfg.usePrefixStateCache))
     if ranked.len == 0: break
     trial = ranked[0]
     if trial.score > baseFit.pearson + cfg.minGain:
@@ -1036,9 +1415,13 @@ proc attemptExchange(rows: seq[Row], base: Branch, cfg: Config,
   # No strict improvement => reject the whole speculative chain.
 
 proc attemptAddition(rows: seq[Row], base: Branch, cfg: Config,
-                     codec: TokenCodec, enc: Encoded, fit: Fit): seq[Branch] =
+                     codec: TokenCodec, enc: Encoded, fit: Fit,
+                     cache: StageCache = nil): seq[Branch] =
   if base.rules.len >= cfg.maxRules or fit.sst <= 1e-24: return
-  let best = bestPatterns(enc.finalTexts, fit, cfg, base.rules, cfg.beamWidth)
+  let best = bestPatterns(enc.finalTexts, fit, cfg, base.rules,
+                          cfg.beamWidth, false,
+                          (if cfg.usePrefixCache: cache else: nil),
+                          stageSignature(base.rules, base.rules.len))
   for c in best:
     # Adding a LAST rule affects only its own count column on this window.
     # Its RHS has no influence until later rules are appended. Reuse the
@@ -1149,13 +1532,58 @@ proc selfTest() =
   # mine(texts[0]) implementation could not propose it at all.
   var sampleCfg = Config(minNgram: 1, maxGram: 1, maxTotalGram: 1,
     maxWildcards: 0, maxGap: 1, mineStarts: 8, mineBudget: 200,
-    mineTracked: 200, candidates: 16)
+    mineTracked: 200, candidates: 16,
+    cmsWidth: 1024, cmsDepth: 4)
   let sampleRows = @[@[111, 111, 111], @[222, 222, 222]]
   let sampled = mineWindow(sampleRows, sampleCfg)
   var sawSecond = false
   for c in sampled:
     if c.pat == @[222]: sawSecond = true
   doAssert sawSecond
+  # Reusing exactly the same prefix must not change the selected candidates,
+  # exact match-count vectors, or their incremental Ridge/OLS scores.
+  let cacheFit = ols(@[], @[0.0, 1.0], false)
+  let baselineWinners = bestPatterns(sampleRows, cacheFit, sampleCfg, @[], 2, true)
+  let stageCacheTest = StageCache(stages: initTable[string, StageEntry]())
+  let cachedWinners = bestPatterns(sampleRows, cacheFit, sampleCfg, @[],
+                                  2, true, stageCacheTest, "selftest-prefix")
+  let cachedAgain = bestPatterns(sampleRows, cacheFit, sampleCfg, @[],
+                                2, true, stageCacheTest, "selftest-prefix")
+  doAssert cachedWinners.len == baselineWinners.len
+  doAssert cachedAgain.len == baselineWinners.len
+  for i in 0..<baselineWinners.len:
+    doAssert cachedWinners[i].pat == baselineWinners[i].pat
+    doAssert cachedAgain[i].pat == baselineWinners[i].pat
+    doAssert abs(cachedAgain[i].gain - baselineWinners[i].gain) < 1e-12
+    doAssert cachedAgain[i].frequency == baselineWinners[i].frequency
+  doAssert stageCacheTest.reusedMining == 1
+  doAssert stageCacheTest.reusedCounts > 0
+  # Fingerprint cannot reject any actual match, including wildcards.
+  let fingerprintTexts = @[@[11, 12, 13], @[11, 22, 33], @[11, 11]]
+  let fingerprints = fingerprintRows(fingerprintTexts)
+  for pat in [@[11], @[22], @[12, -1, 13], @[11, -1, 33], @[99]]:
+    doAssert countFeatures(fingerprintTexts, pat) ==
+      countFeatures(fingerprintTexts, pat, fingerprints)
+  doAssert not mayContainPattern(fingerprints[0], @[99999])
+  doAssert mayContainPattern(fingerprints[0], @[12, -1, 13])
+  # Screening is identity when disabled or when the shortlist is small.
+  let screenCfg = Config(screenRows: 3, screenCandidates: 2)
+  let screenTexts = @[@[11], @[22], @[22], @[33]]
+  let screenFit = ols(@[], @[0.0, 1.0, 1.0, 0.0], false)
+  let screenInput = @[
+    PatternScore(pat: @[11], frequency: 5),
+    PatternScore(pat: @[22], frequency: 7),
+    PatternScore(pat: @[33], frequency: 6)]
+  let kept = screenPatterns(screenTexts, screenFit, screenCfg, screenInput)
+  doAssert kept.len == 2
+  var foundCorrelated = false
+  for c in kept:
+    if c.pat == @[22]: foundCorrelated = true
+  doAssert foundCorrelated
+  var exactOnly = screenCfg
+  exactOnly.screenRows = 0
+  doAssert screenPatterns(screenTexts, screenFit, exactOnly,
+    screenInput).len == screenInput.len
   # Full tracking capacity must NOT lock in the first patterns seen.
   # CMS counts *all* offers; after enough repetitions, a late heavy hitter
   # must displace a previously tracked low-frequency key.
@@ -1322,6 +1750,55 @@ proc selfTest() =
   var variantBranches: seq[Branch] = @[]
   for variant in variants:
     variantBranches.add(Branch(rules: @[variant], editedAt: 0))
+  # Tail replacement can use incremental Ridge directly because its RHS
+  # cannot affect any downstream feature. Compare with an entire Ridge refit.
+  var tailCfg = sampleCfg
+  tailCfg.ridgeLambda = 0.1
+  let tailRows = @[
+    Row(text: @[111], target: 0.0),
+    Row(text: @[111, 222], target: 1.0),
+    Row(text: @[111, 222, 222], target: 2.0),
+    Row(text: @[111, 222, 222, 222], target: 3.0)]
+  let tailTrials = bestInsertion(tailRows, @[], 0, tailCfg, codec, 2)
+  doAssert tailTrials.len > 0
+  for branch in tailTrials:
+    let exactPearson = evaluate(tailRows, branch.rules, 0.1).fit.pearson
+    doAssert abs(branch.score - exactPearson) < 1e-9
+  # Sibling RHSs share the same rule-free prefix. Both cached ranking
+  # and legacy full encoding MUST fit to indistinguishable Pearson.
+  let siblingRankCache = StageCache(
+    stages: initTable[string, StageEntry](),
+    prefixStates: initTable[string, PrefixState]())
+  let fastFourOLS = rankBranches(evalRows, variantBranches, 4, 0.0,
+                                siblingRankCache, true)
+  let fastFourRidge = rankBranches(evalRows, variantBranches, 4, 0.1,
+                                  siblingRankCache, true)
+  let slowFourRidge = rankBranches(evalRows, variantBranches, 4, 0.1)
+  doAssert fastFourOLS.len == 4 and fastFourRidge.len == 4
+  doAssert siblingRankCache.prefixStates.len == 1
+  for i in 0..<4:
+    doAssert abs(fastFourRidge[i].score-slowFourRidge[i].score) < 1e-10
+    doAssert abs(fastFourOLS[i].score-baseFit.pearson) < 1e-10
+  # Test an actual shared nonempty prefix and multiple alternative
+  # intermediate rewrites feeding the same downstream rule.
+  let prefixRule = Rule(pat: @[va], rhs: @[1001])
+  let afterRule = Rule(pat: @[1001, -1, vb], rhs: @[2001, -1, 2002])
+  let lastRule = Rule(pat: @[2001], rhs: @[3001])
+  let changedRule = Rule(pat: @[1001, -1, vb], rhs: @[2001, -32, 2002])
+  let midBranches = @[
+    Branch(rules: @[prefixRule, afterRule, lastRule]),
+    Branch(rules: @[prefixRule, changedRule, lastRule])]
+  let midCache = StageCache(stages: initTable[string, StageEntry](),
+    prefixStates: initTable[string, PrefixState]())
+  for lam in [0.0, 0.1, 1.0]:
+    let slowRank = rankBranches(evalRows, midBranches, 2, lam)
+    let quickRank = rankBranches(evalRows, midBranches, 2, lam,
+                                 midCache, true)
+    doAssert slowRank.len == quickRank.len
+    for i in 0..<slowRank.len:
+      doAssert slowRank[i].description == quickRank[i].description
+      doAssert abs(slowRank[i].score-quickRank[i].score) < 1e-9
+  doAssert midCache.prefixStates.len == 1
   let fourBeams = rankBranches(evalRows, variantBranches, 4, 0.0)
   doAssert fourBeams.len == 4
   var seenOps: seq[int] = @[]
@@ -1456,10 +1933,23 @@ proc main() =
   for step in 0..<cfg.steps:
     let tick = epochTime()
     let rows = makeRows(source, cfg, codec, step, false, cache)
+    when defined(lensProfile):
+      let rowsReadyTime = epochTime()
     if rows.len < 3: quit("Training rows insufficient", 1)
+    when defined(lensProfile):
+      profileEval = EvaluationCounters()
+    # All caches live exactly one rotated training window. This matters:
+    # raw rows and their noise schedule change when the window rotates.
+    let stageCache = (if cfg.usePrefixCache or cfg.usePrefixStateCache:
+                        StageCache(stages: initTable[string, StageEntry](),
+                          prefixStates: initTable[string, PrefixState]())
+                      else: nil)
     # Every retained RHS is fitted on THIS rotated window and expanded.
     # No lookahead or speculative score is used for pruning.
-    let parents = rankBranches(rows, beams, cfg.beamWidth, cfg.ridgeLambda)
+    let parents = rankBranches(rows, beams, cfg.beamWidth, cfg.ridgeLambda,
+                               stageCache, cfg.usePrefixStateCache)
+    when defined(lensProfile):
+      let parentsReadyTime = epochTime()
     if parents.len == 0: break
     let incumbent = parents[0]
     var additions: seq[Branch] = @[]
@@ -1468,11 +1958,37 @@ proc main() =
       let parent = parents[parentIndex]
       let state = evaluate(rows, parent.rules, cfg.ridgeLambda, true)
       if parent.rules.len < cfg.maxRules:
-        for b in attemptAddition(rows, parent, cfg, codec, state.enc, state.fit):
+        for b in attemptAddition(rows, parent, cfg, codec,
+                                 state.enc, state.fit, stageCache):
           additions.add(b)
       if parent.rules.len > 0:
-        for b in attemptExchange(rows, parent, cfg, codec, state.enc, state.fit):
+        for b in attemptExchange(rows, parent, cfg, codec,
+                                 state.enc, state.fit, stageCache):
           exchanges.add(b)
+    when defined(lensProfile):
+      let expansionReadyTime = epochTime()
+      if stageCache != nil:
+        stderr.writeLine("[profile-cache] prefixes=", stageCache.stages.len,
+          " reused_mining=", stageCache.reusedMining,
+          " reused_exact_vectors=", stageCache.reusedCounts,
+          " state_entries=", stageCache.prefixStates.len,
+          " state_tokens=", stageCache.prefixTokenElements)
+      else:
+        stderr.writeLine("[profile-cache] disabled")
+      stderr.writeLine("[profile-rank] calls=", profileEval.rankCalls,
+        " branches=", profileEval.rankVariants,
+        " state_cache_calls=", profileEval.rankCacheCalls,
+        " builds=", profileEval.rankPrefixBuilds,
+        " hits=", profileEval.rankPrefixHits,
+        " evictions=", profileEval.rankPrefixEvictions,
+        " last_count_only=", profileEval.rankLastCountOnly,
+        " total=", profileEval.rankTotalSeconds, "s",
+        " prefix_build=", profileEval.rankPrefixBuildSeconds, "s",
+        " suffix_encode=", profileEval.rankSuffixSeconds, "s",
+        " ridge=", profileEval.rankRidgeSeconds, "s")
+      stderr.writeLine("[profile-evaluate] calls=", profileEval.evaluateCalls,
+        " encode=", profileEval.evaluateEncodeSeconds,
+        "s ridge=", profileEval.evaluateRidgeSeconds, "s")
     additions = bestCurrentBranches(additions, cfg.beamWidth)
     exchanges = bestCurrentBranches(exchanges, cfg.beamWidth)
     let addScore = (if additions.len > 0: additions[0].score else: -Inf)
@@ -1506,7 +2022,14 @@ proc main() =
     stream.write(logLine)
     stream.close()
     saveRules(cfg.outDir / "rules.tsv", current.rules)
-    writePlot(cfg.outDir, cfg.ridgeLambda)
+    if cfg.plotEvery > 0 and
+        ((step + 1) mod cfg.plotEvery == 0 or step == cfg.steps - 1):
+      writePlot(cfg.outDir, cfg.ridgeLambda)
+    when defined(lensProfile):
+      stderr.writeLine("[profile-step] rows=", rowsReadyTime-tick,
+        "s rank=", parentsReadyTime-rowsReadyTime,
+        "s expand=", expansionReadyTime-parentsReadyTime,
+        "s selection/evaluation/plot=", epochTime()-expansionReadyTime, "s")
     echo "[step] ", step, " trainPearson=", initial.fit.pearson,
       " validPearson=", valPearson, " -ln(1-rho)=", trainMetric,
       " rules=", current.rules.len, " branch=", current.description,
