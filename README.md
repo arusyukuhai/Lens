@@ -1,4 +1,4 @@
-# Lens: Count-based Incremental OLS Rule Search (Nim)
+# Lens: Count-based Ridge / OLS Rule Search (Nim)
 
 This project is a replacement for the original `cms(7).nim` mining-only script,
 using the user's `replace(9).nim` and `fast_count_min_sketch(7).nim` as a base.
@@ -8,7 +8,8 @@ This revision adds a deterministic frequency-weighted hash alphabet and fresh RH
 
 - `token_codec.nim`: corpus-frequency-weighted byte-to-token map, keyed hashes, frequency-weighted in-alphabet noise and fresh rule-token namespace, stable map persistence.
 - `cms.nim`: corpus loading, deterministic diffusion, pattern mining, count-feature
-  OLS, FWL candidate score, removal score, chained replacement proposals,
+  Ridge with standardized count features, exact Pearson add/delete scoring,
+  chained replacement proposals,
   one-chunk rotation, simple width-4 survivor-beam expansion, fixed holdout diagnostics,
   and guaranteed alternating fresh/capture RHS generation.
 - `replace.nim`: original optimized matcher and replace engine; adds an integrated
@@ -26,13 +27,14 @@ nim c -d:release --opt:speed cms.nim
 ./cms --self-test
 ```
 
-The self-test checks exact FWL increment gains and OLS deletion losses against
-full OLS fits, and tests fused count-and-rewrite semantics for literal and
-wildcard patterns, as well as frequency-tokenization, noise ordering and chained rewrite behavior.
+The self-test compares exact Ridge append/delete Pearson updates against
+full Ridge fits at several penalty strengths, retains legacy OLS/FWL tests,
+and covers replacement, tokenization, diffusion, and chained rewrite behavior.
 
 **Validation caveat:** the delivery environment lacked Nim and gnuplot, so
 these Nim self-tests and the generated gnuplot PNG could not be executed here.
-Algebraic formulas were independently checked against NumPy least squares.
+The Ridge append/delete update formulas were independently checked against
+NumPy full Ridge solves. The Nim build has not been verified in this environment.
 
 ## Run
 
@@ -41,10 +43,20 @@ Algebraic formulas were independently checked against NumPy least squares.
   --out=lens_run --chunks=40 --train=3 --valid=2 \
   --chunk-len=256 --noise-steps=0 \
   --steps=100 --max-rules=24 --beam=4 \
-  --swap-depth=3 --token-seed=1729
+  --swap-depth=3 --ridge-lambda=0.1 --token-seed=1729
 ```
 
 Or use `./run.sh --corpus=... [other flags]` to build and run.
+
+
+### Comparing regularization strengths
+
+Run separate experiments with `--ridge-lambda=0`, `0.01`, `0.1`, and `1.0`,
+**using distinct `--out` directories**. Regularization changes fitting and
+rule-selection history, so runs are not directly interchangeable. You can
+resume a rule set using the same token map, but changing lambda will alter its
+coefficients and future selection. Compare final fixed held-out Pearson, not
+just the training curve.
 
 ### Frequency-weighted hash tokenization (preprocessing)
 
@@ -83,7 +95,7 @@ The deterministic noise transformation makes identical chunk/stage pairs
 reusable. **Processing order for every diffusion row:**
 
 `original bytes -> frequency-weighted hash encoding -> per-position existing-character noise ->
-rule 1 -> rule 2 -> ... -> rule N -> feature-count OLS`
+rule 1 -> rule 2 -> ... -> rule N -> feature-count Ridge`
 
 At each rule the non-overlapping match **count is recorded immediately before
 that rule rewrites the sequence**. Each subsequent rule receives the actual
@@ -108,22 +120,42 @@ the last `--valid` chunks form a fixed held-out set, when available.
   `O(log mineTracked)` per changed retained key, and the minimum is refreshed
   lazily to account for sketch collisions. The sketch's counter update and
   estimate now share a single hash traversal (`addAndEstimate`). CMS estimates
-  are used **only for mining preselection**; accepted OLS feature columns are
+  are used **only for mining preselection**; accepted regression feature columns are
   measured using exact non-overlapping occurrence counts on all diffusion rows.
-- New candidates are evaluated against the **fully transformed text** after all
-  existing rules. The exact fixed-design FWL gain is
-  `(z^T residual)^2 / (||z||² - ||Q^T z||²)`. Only shortlisted candidates
-  produced by the bounded pattern miner are compared, not *all* possible rules.
-- OLS uses two-pass reorthogonalized modified Gram-Schmidt. Full-rank deletion
-  loss uses `beta_j² / ((X^T X)^(-1))[j,j]` via an inverse triangular `R`;
-  a singular design triggers exact reduced-model fits to avoid an invalid inverse.
+- **Default Ridge regression:** `--ridge-lambda=0.1` fits a free intercept
+  and standardized match-count columns. Each nonconstant rule count is
+  centered and divided by its training standard deviation. Minimize
+  `||y - b0 - X*beta||² + n*lambda*sum_j(beta_j*stddev(X_j))²`.
+  This treats low- and high-frequency rules comparably. The effective diagonal
+  regularizer on the standardized Gram matrix is `n * lambda`, and **the
+  intercept is unpenalized**. A constant column remains zero after centering.
+  The printed/raw `beta` used for held-out predictions is converted back to
+  original (unstandardized) rule-count units.
+- **Appending a feature:** for each candidate pattern, evaluate the exact
+  *training Pearson* after augmenting the current Ridge solve using the
+  Schur complement of the `(X_std^T X_std + n*lambda*I)` matrix. Existing
+  sufficient statistics and the inverse penalized Gram matrix are reused.
+  Unlike OLS, `sqrt(R²)` and the classic FWL SSE gain are not generally
+  correct for Ridge. A candidate may even **reduce** training Pearson;
+  only improvements greater than the threshold are accepted.
+- **Deleting a feature:** updating the remaining standardized Ridge weights
+  by `theta'_k = theta_k - C[k,j]*theta_j/C[j,j]` gives each reduced fit,
+  with `C = (X_std^T X_std + n*lambda*I)^(-1)`. The removal priority is the
+  **actual training Pearson difference**, not `beta_j²/C_jj` (which instead
+  measures the increase in the penalized objective).
+- `--ridge-lambda=0` restores the previous unpenalized OLS implementation,
+  including FWL append scoring, with no ridge penalty.
+- Patterns are mined from transformed text following previous rules.
+  Mid-chain insertion can change downstream count features, so its initial
+  candidate ranking is only a heuristic; complete rewritten pipelines are
+  refitted and rescored before acceptance.
 - For a pattern with one wildcard the branch variants include identity,
   `sort`, `reverse`, and `inverse_sort`. For two or more wildcards all pairs
   of captures may be swapped, along with the identity choice.
 - **Simple width-4 beam (no lookahead):** a newly appended rule's match
   count is independent of its RHS operation. For a pattern with one wildcard,
   the learner emits all four possible RHS operators (`plain`, `sort`,
-  `reverse`, `inverse_sort`). Their *immediate* OLS Pearson is identical.
+  `reverse`, `inverse_sort`). Their *immediate* Ridge Pearson is identical.
   These distinct alternatives may therefore survive together in the beam.
   At the NEXT rotated training window, **every surviving branch** applies its
   own complete sequential rewrite chain, mines/tries independent Add and
@@ -132,9 +164,9 @@ the last `--valid` chunks form a fixed held-out set, when available.
   lookahead budgets, tolerance windows, or operator-specific bonuses.
   Width 4 is the default (`--beam=4`); it is a cap on the surviving branches,
   not a promise that each operator survives if higher-scoring branches compete.
-- **Fast last-rule insertion:** each shortlisted pattern's FWL gain produces
-  its exact current-window OLS Pearson once; the score is shared among its
-  RHS variants. For insertion *between* existing rules, the full rewrite
+- **Fast last-rule insertion:** each shortlisted pattern's exact
+  Ridge (or OLS) updated Pearson is computed once and shared among RHS
+  variants. For insertion *between* existing rules, the full rewrite
   chain is still refitted because all later features can change.
 - `sort` and `reverse` are identity transforms when the wildcard captures a
   single token. Their effect is on downstream *token sequences*, not on the
@@ -146,7 +178,7 @@ the last `--valid` chunks form a fixed held-out set, when available.
   incumbent model. Replacement first targets the rule with the smallest
   conditional deletion loss, then (if the first replacement does not improve)
   follows the rule whose count column changed most, up to `--swap-depth`.
-  **Choose replacement only when its full-pipeline refitted OLS Pearson is
+  **Choose replacement only when its full-pipeline refitted Ridge Pearson is
   strictly greater than the best addition's Pearson** and it also improves the
   incumbent by `--min-gain` (internal default: `1e-9`). Ties favor addition.
   If both fail to improve, keep the original rules. After `--max-rules` is
@@ -158,7 +190,7 @@ the last `--valid` chunks form a fixed held-out set, when available.
   changes downstream tokens, so every speculative swap and its acceptance is
   scored by rebuilding the full pipeline, not by trusting the incremental gain.
   During mid-chain replacements, a zero-gain candidate can still change
-  later feature columns, so FWL gain is no longer a hard exclusion condition.
+  later feature columns, so the immediate feature score is never a hard exclusion condition.
   The limited shortlist combines top-gain and top-frequency patterns and then
   evaluates each full pipeline. This is still a heuristic, not a proof that
   the globally best replacement has been found.
@@ -186,9 +218,10 @@ the last `--valid` chunks form a fixed held-out set, when available.
 - `lens_run/training.png`: rendered automatically at each step **if gnuplot is
   installed**. If not installed, the `.dat` and `.gnuplot` outputs are kept.
 
-The *training* Pearson equals `sqrt(R²)` for intercept-including OLS;
-held-out Pearson is computed directly from held-out predictions with the
-training coefficients, so it is not constrained to improve.
+For Ridge, **training Pearson does not generally equal `sqrt(R²)`**.
+Both train and held-out scores are correlations of the actual predictions
+with the targets. Held-out uses coefficients learned on the train window,
+and its Pearson is not constrained to improve.
 
 ## Caveats / recommended controls
 
@@ -196,7 +229,7 @@ training coefficients, so it is not constrained to improve.
   speculative mid-chain replacement pipelines. The former two-ply preview
   has been removed completely. `--beam` directly limits how many parents
   expand at each step (default 4); reduce it to 2 for faster training.
-  Last-rule RHS variants reuse one FWL result rather than each rerunning OLS.
+  Last-rule RHS variants share one exact appended-regression Pearson update.
   Because both Add and Replace compete whenever eligible, increasing beam
   width still raises computation. Current-window scores are refreshed after
   the single-chunk rotation, not carried over as if the data were unchanged.
@@ -236,7 +269,7 @@ heap/table index consistency and stable tracking capacity.
 collisions, and the bounded mining budget samples only part of the possible
 pattern space. Consequently the candidate set is not guaranteed to contain
 the globally best rule. `bestPatterns` recomputes the real occurrence counts
-before using any candidate for OLS. Neither this nor prior changes imply
+before using any candidate for Ridge/OLS. Neither this nor prior changes imply
 out-of-sample improvements.
 
 **Build verification:** No Nim compiler or gnuplot was available in the

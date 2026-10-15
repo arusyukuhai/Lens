@@ -9,7 +9,7 @@ type
     chunks, trainChunks, validChunks, chunkLen, noiseSteps: int
     steps, maxRules, minNgram, maxGram, maxTotalGram, maxWildcards: int
     maxGap, mineStarts, mineBudget, mineTracked, candidates, beamWidth, swapDepth: int
-    minGain: float64
+    minGain, ridgeLambda: float64
     tokenSeed: int
     tokenMapFile: string
 
@@ -33,6 +33,14 @@ type
     removalLoss: seq[float64]
     sse, sst, pearson: float64
     rank: int
+    # Ridge-specific sufficient statistics, based on centered, variance-normalized
+    # counts (the intercept is deliberately excluded from the penalty).
+    ridgeLambda: float64
+    featureCols: seq[seq[float64]]
+    featureMeans, featureScales: seq[float64]
+    standardizedGram, inversePenalizedGram: seq[float64]
+    standardizedXty, standardizedBeta: seq[float64]
+    targetMean: float64
 
   PatternScore = object
     pat: seq[int]
@@ -56,7 +64,7 @@ type
   Branch = object
     rules: seq[Rule]
     description: string
-    score: float64 # Current training-window OLS Pearson, refreshed by rankBranches
+    score: float64 # Current training-window fitted Pearson, refreshed by rankBranches
     editedAt: int # index of the rule most recently added/replaced, or -1
 
   MoveKind = enum
@@ -79,20 +87,22 @@ proc parseConfig(): Config =
   result = Config(corpus: "github-code-dataset.txt", outDir: "lens_run",
     chunks: 65536, trainChunks: 3, validChunks: 2, chunkLen: 1500,
     noiseSteps: 0, steps: 100, maxRules: 24, minNgram: 1,
-    maxGram: 3, maxTotalGram: 6, maxWildcards: 3, maxGap: 16,
+    maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
     candidates: 384, beamWidth: 4, swapDepth: 3, minGain: 1e-9,
+    ridgeLambda: 1.0,
     tokenSeed: 1729, tokenMapFile: "")
   if not fileExists(result.corpus) and fileExists("github-code.txt"):
     result.corpus = "github-code.txt"
   for arg in commandLineParams():
     if arg == "--help" or arg == "-h":
-      echo "Lens incremental OLS training"
+      echo "Lens Ridge/OLS count-rule training"
       echo "--self-test | --corpus=FILE --out=DIR --resume=FILE --chunks=N --train=N --valid=N"
       echo "--chunk-len=N --noise-steps=N (0=one step per character) --steps=N"
       echo "--max-rules=N --min-ngram=N --max-gram=N --max-total-gram=N"
       echo "--max-wildcards=N --max-gap=N --mine-starts=N --mine-budget=N"
       echo "--mine-tracked=N --candidates=N --beam=N --swap-depth=N"
+      echo "--ridge-lambda=0.1 (standardized predictors; 0=legacy OLS)"
       echo "--token-seed=N --token-map=FILE (re-use mapping across runs)"
       quit(0)
     if not arg.startsWith("--") or not arg.contains('='): continue
@@ -121,6 +131,7 @@ proc parseConfig(): Config =
     of "candidates": result.candidates = readInt(val, result.candidates)
     of "beam": result.beamWidth = readInt(val, result.beamWidth)
     of "swap-depth": result.swapDepth = readInt(val, result.swapDepth)
+    of "ridge-lambda": result.ridgeLambda = readFloat(val, result.ridgeLambda)
     of "lookahead-budget", "lookahead-candidates", "beam-expand", "beam-tolerance":
       stderr.writeLine("[deprecated] ", key,
         " is ignored; the beam now uses direct current-window Pearson only")
@@ -143,6 +154,8 @@ proc parseConfig(): Config =
   result.candidates = max(1, result.candidates)
   result.beamWidth = max(1, result.beamWidth)
   result.swapDepth = max(1, result.swapDepth)
+  if classify(result.ridgeLambda) in {fcNan, fcInf, fcNegInf} or result.ridgeLambda < 0.0:
+    quit("--ridge-lambda must be finite and nonnegative", 1)
 
 proc loadCorpus(cfg: Config): seq[seq[int]] =
   if not fileExists(cfg.corpus):
@@ -327,7 +340,202 @@ proc ols(cols: seq[seq[float64]], y: seq[float64],
         let reducedFit = ols(reduced, y, false)
         result.removalLoss[j] = max(0.0, reducedFit.sse - result.sse)
 
+# Ridge regression with free intercept and per-feature standardization.
+# Minimize ||y - intercept - sum_j x_j*beta_j||^2 + n*lambda*sum_j(theta_j)^2,
+# with theta_j=beta_j*stddev(x_j). This avoids count-frequency-dependent
+# regularization and gives a positive-definite solve for lambda > 0.
+proc choleskySolve(l: seq[float64], n: int,
+                   rhs: openArray[float64]): seq[float64] =
+  var tmp = newSeq[float64](n)
+  result = newSeq[float64](n)
+  for i in 0..<n:
+    var v = rhs[i]
+    for k in 0..<i:
+      v -= l[i*n+k] * tmp[k]
+    tmp[i] = v / l[i*n+i]
+  for i in countdown(n-1, 0):
+    var v = tmp[i]
+    for k in i+1..<n:
+      v -= l[k*n+i] * result[k]
+    result[i] = v / l[i*n+i]
+
+proc standardizedPearson(theta: seq[float64],
+                         crossY, gram: seq[float64], sst: float64): float64 =
+  let m = theta.len
+  if m == 0 or sst <= 1e-24: return 0.0
+  var cov, normSq = 0.0
+  for j in 0..<m:
+    cov += theta[j] * crossY[j]
+    var dotRow = 0.0
+    for k in 0..<m:
+      dotRow += gram[j*m+k] * theta[k]
+    normSq += theta[j] * dotRow
+  if normSq <= 1e-24: return 0.0
+  result = max(-1.0, min(1.0, cov / sqrt(sst * normSq)))
+
+proc ridge(cols: seq[seq[float64]], y: seq[float64],
+           ridgeLambda: float64, computeDeletion = true): Fit =
+  ## lambda is relative to N because each column has variance one.
+  ## lambda = 0 retains exactly the previous OLS behavior.
+  if ridgeLambda == 0.0:
+    return ols(cols, y, computeDeletion)
+  let n = y.len
+  let m = cols.len
+  result.beta = newSeq[float64](m+1)
+  result.residual = newSeq[float64](n)
+  result.removalLoss = newSeq[float64](m)
+  result.ridgeLambda = ridgeLambda
+  result.featureCols = cols
+  result.featureMeans = newSeq[float64](m)
+  result.featureScales = newSeq[float64](m)
+  result.standardizedGram = newSeq[float64](m*m)
+  result.standardizedXty = newSeq[float64](m)
+  result.standardizedBeta = newSeq[float64](m)
+  if computeDeletion:
+    result.inversePenalizedGram = newSeq[float64](m*m)
+  if n == 0: return
+  let nf = float64(n)
+  for v in y: result.targetMean += v
+  result.targetMean /= nf
+  result.beta[0] = result.targetMean
+  for v in y:
+    result.sst += (v-result.targetMean)*(v-result.targetMean)
+  for j in 0..<m:
+    var mean = 0.0
+    for v in cols[j]: mean += v
+    mean /= nf
+    result.featureMeans[j] = mean
+    var variance = 0.0
+    for v in cols[j]:
+      variance += (v-mean)*(v-mean)
+    let std = sqrt(max(0.0, variance/nf))
+    # A constant column contains no new information; Ridge handles it safely.
+    if std > 1e-12 * max(1.0, abs(mean)):
+      result.featureScales[j] = std
+    else:
+      result.featureScales[j] = 1.0
+    var xy = 0.0
+    for i in 0..<n:
+      xy += (cols[j][i]-mean)*(y[i]-result.targetMean)
+    result.standardizedXty[j] = xy/result.featureScales[j]
+  for j in 0..<m:
+    for k in 0..j:
+      var cross = 0.0
+      for i in 0..<n:
+        cross += (cols[j][i]-result.featureMeans[j]) *
+          (cols[k][i]-result.featureMeans[k])
+      cross /= result.featureScales[j]*result.featureScales[k]
+      result.standardizedGram[j*m+k] = cross
+      result.standardizedGram[k*m+j] = cross
+  if m > 0:
+    var penalized = newSeq[float64](m*m)
+    for k in 0..<m*m: penalized[k] = result.standardizedGram[k]
+    for j in 0..<m: penalized[j*m+j] += nf*ridgeLambda
+    var l = newSeq[float64](m*m)
+    for i in 0..<m:
+      for j in 0..i:
+        var value = penalized[i*m+j]
+        for k in 0..<j:
+          value -= l[i*m+k]*l[j*m+k]
+        if i == j:
+          if value <= 0.0:
+            raise newException(ValueError, "Ridge Cholesky failed: invalid Gram")
+          l[i*m+j] = sqrt(value)
+        else:
+          l[i*m+j] = value/l[j*m+j]
+    result.standardizedBeta = choleskySolve(l, m, result.standardizedXty)
+    if computeDeletion:
+      for col in 0..<m:
+        var rhs = newSeq[float64](m)
+        rhs[col] = 1.0
+        let solution = choleskySolve(l, m, rhs)
+        for j in 0..<m:
+          result.inversePenalizedGram[j*m+col] = solution[j]
+    for j in 0..<m:
+      result.beta[j+1] = result.standardizedBeta[j] /
+        result.featureScales[j]
+      result.beta[0] -= result.beta[j+1]*result.featureMeans[j]
+  result.rank = m + 1
+  for i in 0..<n:
+    var pred = result.beta[0]
+    for j in 0..<m:
+      pred += result.beta[j+1] * cols[j][i]
+    result.residual[i] = y[i] - pred
+    result.sse += result.residual[i]*result.residual[i]
+  result.pearson = standardizedPearson(result.standardizedBeta,
+    result.standardizedXty, result.standardizedGram, result.sst)
+  if computeDeletion:
+    # Removing j and refitting the other Ridge weights via one Schur update:
+    # theta'_k = theta_k - C[k,j]/C[j,j]*theta_j (k != j).
+    # Unlike OLS, beta_j^2/C_jj measures PENALIZED-OBJECTIVE loss,
+    # not Pearson loss. Rank deletions by true Pearson change instead.
+    for j in 0..<m:
+      let denom = result.inversePenalizedGram[j*m+j]
+      if denom <= 1e-24: continue
+      var reduced = newSeq[float64](m)
+      for k in 0..<m:
+        if k != j:
+          reduced[k] = result.standardizedBeta[k] -
+            result.inversePenalizedGram[k*m+j]/denom *
+              result.standardizedBeta[j]
+      let reducedPearson = standardizedPearson(reduced,
+        result.standardizedXty, result.standardizedGram, result.sst)
+      result.removalLoss[j] = result.pearson - reducedPearson
+
+proc ridgeAppendedPearson(z: seq[float64], fit: Fit): float64 =
+  ## Exact *Pearson* of the Ridge solution after appending z, calculated
+  ## through a one-column block inverse. No complete refit needed.
+  let n = z.len
+  let m = fit.standardizedBeta.len
+  if n == 0 or fit.sst <= 1e-24: return fit.pearson
+  let nf = float64(n)
+  var meanZ = 0.0
+  for value in z: meanZ += value
+  meanZ /= nf
+  var ss = 0.0
+  for value in z: ss += (value-meanZ)*(value-meanZ)
+  let scale = sqrt(max(0.0, ss/nf))
+  if scale <= 1e-12*max(1.0, abs(meanZ)):
+    return fit.pearson
+  let zz = ss/(scale*scale)
+  var residualCross = 0.0
+  for i in 0..<n:
+    residualCross += (z[i]-meanZ)*fit.residual[i]
+  residualCross /= scale
+  var cross = newSeq[float64](m)
+  for j in 0..<m:
+    for i in 0..<n:
+      cross[j] += (z[i]-meanZ) *
+        (fit.featureCols[j][i]-fit.featureMeans[j])
+    cross[j] /= scale*fit.featureScales[j]
+  var projection = newSeq[float64](m)
+  for j in 0..<m:
+    for k in 0..<m:
+      projection[j] += fit.inversePenalizedGram[j*m+k]*cross[k]
+  # g = z_std^T(y_center - X_std*theta) is the Ridge residual cross-product.
+  let g = residualCross
+  var denom = zz + nf*fit.ridgeLambda
+  for j in 0..<m: denom -= cross[j]*projection[j]
+  if denom <= 1e-15: return fit.pearson
+  let alpha = g/denom
+  var newTheta = newSeq[float64](m)
+  for j in 0..<m:
+    newTheta[j] = fit.standardizedBeta[j] - projection[j]*alpha
+  var cov = alpha*(g + dot(cross, fit.standardizedBeta))
+  for j in 0..<m: cov += newTheta[j]*fit.standardizedXty[j]
+  var predictionNorm = alpha*alpha*zz
+  for j in 0..<m:
+    predictionNorm += 2.0*alpha*newTheta[j]*cross[j]
+    var row = 0.0
+    for k in 0..<m:
+      row += fit.standardizedGram[j*m+k]*newTheta[k]
+    predictionNorm += newTheta[j]*row
+  if predictionNorm <= 1e-24: return 0.0
+  result = max(-1.0, min(1.0, cov/sqrt(fit.sst*predictionNorm)))
+
 proc candidateGain(z: seq[float64], fit: Fit): float64 =
+  if fit.ridgeLambda > 0.0:
+    return ridgeAppendedPearson(z, fit) - fit.pearson
   var g = dot(z, fit.residual)
   var s = dot(z, z)
   for q in fit.q:
@@ -652,9 +860,9 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
   if texts.len == 0: return
   let candidates = mineWindow(texts, cfg)
   var scored: seq[PatternScore] = @[]
-  # A feature's FWL gain is exact ONLY when appending at the end.
+  # Appended-rule Pearson is exact; mid-chain scores remain heuristic.
   # At mid-chain insertion the candidate also changes downstream count
-  # columns, so gain is a HEURISTIC, not a valid rejection test.
+  # columns, so the candidate ranking is a HEURISTIC, not a rejection test.
   for originalCandidate in candidates:
     var candidate = originalCandidate
     var banned = false
@@ -705,9 +913,9 @@ proc prefixTexts(rows: seq[Row], rules: seq[Rule], stop: int): seq[seq[int]] =
     result[i] = state
 
 proc evaluate(rows: seq[Row], rules: seq[Rule],
-              removal = false): tuple[enc: Encoded, fit: Fit] =
+              ridgeLambda: float64, removal = false): tuple[enc: Encoded, fit: Fit] =
   result.enc = encode(rows, rules)
-  result.fit = ols(result.enc.cols, result.enc.y, removal)
+  result.fit = ridge(result.enc.cols, result.enc.y, ridgeLambda, removal)
 
 proc alteredIndex(reference: Encoded, current: Encoded,
                   excluded: seq[bool], fit: Fit): int =
@@ -733,7 +941,7 @@ proc bestInsertion(rows: seq[Row], existing: seq[Rule], at: int,
                    cfg: Config, codec: TokenCodec, keep: int): seq[Branch] =
   ## Mine exactly at the insertion point, AFTER earlier rules and BEFORE
   ## later ones. FWL is a prefilter; full rewritten OLS judges acceptance.
-  let baseline = evaluate(rows, existing)
+  let baseline = evaluate(rows, existing, cfg.ridgeLambda, true)
   let stageTexts = prefixTexts(rows, existing, at)
   let winners = bestPatterns(stageTexts, baseline.fit, cfg, existing,
                              max(1, keep), true)
@@ -746,13 +954,14 @@ proc bestInsertion(rows: seq[Row], existing: seq[Rule], at: int,
         description: "replace " & $at & " with " & patternString(candidate.pat) &
           " => " & patternString(variant.rhs), editedAt: at))
 
-proc rankBranches(rows: seq[Row], branches: seq[Branch], keep: int): seq[Branch] =
+proc rankBranches(rows: seq[Row], branches: seq[Branch], keep: int,
+                  ridgeLambda: float64): seq[Branch] =
   ## Simple beam: fit ONLY the present diffusion window. Equal-scoring
   ## RHS variants are retained independently and compete on the next step.
   var ranking: seq[Branch] = @[]
   for b in branches:
     var scored = b
-    scored.score = evaluate(rows, b.rules).fit.pearson
+    scored.score = evaluate(rows, b.rules, ridgeLambda).fit.pearson
     ranking.add(scored)
   ranking.sort(proc(a, b: Branch): int = cmp(b.score, a.score))
   for i in 0..<min(keep, ranking.len):
@@ -812,7 +1021,7 @@ proc attemptExchange(rows: seq[Row], base: Branch, cfg: Config,
     without.delete(nextIndex)
     let options = bestInsertion(rows, without, nextIndex, cfg, codec, cfg.beamWidth)
     if options.len == 0: break
-    let ranked = rankBranches(rows, options, cfg.beamWidth)
+    let ranked = rankBranches(rows, options, cfg.beamWidth, cfg.ridgeLambda)
     if ranked.len == 0: break
     trial = ranked[0]
     if trial.score > baseFit.pearson + cfg.minGain:
@@ -822,7 +1031,7 @@ proc attemptExchange(rows: seq[Row], base: Branch, cfg: Config,
         if b.score > baseFit.pearson + cfg.minGain:
           result.add(b)
       return
-    let fitTrial = evaluate(rows, trial.rules, true)
+    let fitTrial = evaluate(rows, trial.rules, cfg.ridgeLambda, true)
     nextIndex = alteredIndex(baseEnc, fitTrial.enc, blocked, fitTrial.fit)
   # No strict improvement => reject the whole speculative chain.
 
@@ -832,10 +1041,15 @@ proc attemptAddition(rows: seq[Row], base: Branch, cfg: Config,
   let best = bestPatterns(enc.finalTexts, fit, cfg, base.rules, cfg.beamWidth)
   for c in best:
     # Adding a LAST rule affects only its own count column on this window.
-    # Its RHS has no influence until later rules are appended. FWL therefore
-    # computes the exact immediate OLS score for ALL RHS variants at once.
-    let newSse = max(0.0, fit.sse - c.gain)
-    let newPearson = sqrt(max(0.0, min(1.0, 1.0 - newSse / fit.sst)))
+    # Its RHS has no influence until later rules are appended. Reuse the
+    # exact appended-fit Pearson across all variants; OLS gain measures
+    # delta-SSE, Ridge gain directly measures delta-Pearson.
+    var newPearson: float64
+    if fit.ridgeLambda > 0.0:
+      newPearson = max(-1.0, min(1.0, fit.pearson + c.gain))
+    else:
+      newPearson = sqrt(max(0.0, min(1.0,
+        1.0 - max(0.0, fit.sse - c.gain) / fit.sst)))
     if newPearson <= fit.pearson + cfg.minGain: continue
     for r in generateReplacementVariants(c.pat, c.frequency, codec):
       var rules: seq[Rule] = @[]
@@ -893,7 +1107,7 @@ proc addPearson(m: var PearsonMovingAverage, r: float64): float64 =
   m.nextIndex = (m.nextIndex + 1) mod MovingAverageWidth
   result = m.total / float64(m.count)
 
-proc writePlot(dir: string) =
+proc writePlot(dir: string, ridgeLambda: float64) =
   let script = """
 set terminal pngcairo size 1450,820 enhanced font 'Arial,13'
 set output 'training.png'
@@ -914,7 +1128,10 @@ plot 'training.dat' using 1:2 with linespoints ls 1 title 'Train (raw)', \
      'training.dat' using 1:8 with lines ls 3 title 'Train (Pearson MA15)', \
      'training.dat' using 1:9 with lines ls 4 title 'Held-out (Pearson MA15)'
 """
-  writeFile(dir / "training.gnuplot", script)
+  let regressionName = (if ridgeLambda > 0.0:
+    "Ridge count-rule search" else: "OLS count-rule search")
+  writeFile(dir / "training.gnuplot",
+    script.replace("Incremental OLS count-rule search", regressionName))
   if findExe("gnuplot").len > 0:
     let previous = getCurrentDir()
     try:
@@ -1014,6 +1231,24 @@ proc selfTest() =
   let fwPearson = sqrt(max(0.0, min(1.0,
     1.0 - max(0.0, current.sse - candidateGain(z, current)) / current.sst)))
   doAssert abs(fwPearson - added.pearson) < 1e-10
+  # Ridge tests: regularized intercept-free penalty, correlations NOT sqrt(R²),
+  # fast appended-rule Pearson and deletion scores equal complete Ridge refits.
+  for lam in [0.01, 0.1, 3.0]:
+    let cur = ridge(@[a, b], y, lam)
+    let appended = ridge(@[a, b, z], y, lam, false)
+    let removedA = ridge(@[b], y, lam, false)
+    let removedB = ridge(@[a], y, lam, false)
+    doAssert abs(cur.pearson + candidateGain(z, cur) -
+      appended.pearson) < 1e-9
+    doAssert abs(cur.removalLoss[0] - (cur.pearson-removedA.pearson)) < 1e-9
+    doAssert abs(cur.removalLoss[1] - (cur.pearson-removedB.pearson)) < 1e-9
+    doAssert abs(cur.beta[0] - (cur.targetMean -
+      cur.beta[1]*cur.featureMeans[0] -
+      cur.beta[2]*cur.featureMeans[1])) < 1e-9
+  let ridgeConstant = ridge(@[newSeqWith(y.len, 1.0)], y, 0.1)
+  doAssert abs(ridgeConstant.beta[0] - (0.0+1.0+3.0+5.0+8.0+13.0)/float64(y.len)) < 1e-9
+  doAssert abs(ridgeConstant.beta[1]) < 1e-10
+  doAssert candidateGain(newSeqWith(y.len, 1.0), ridgeConstant) == 0.0
   let wildcard = compileSeqPattern(@[65, -1, 66], 1)
   var txt = @[65, 49, 50, 66, 65, 51, 52, 66]
   let reference = countSeqCompiled(txt, wildcard)
@@ -1082,12 +1317,12 @@ proc selfTest() =
   doAssert candidateGain(plainCounts, baseFit) >
     candidateGain(reverseCounts, baseFit) + 1e-9
   for variant in variants:
-    doAssert abs(evaluate(evalRows, @[variant]).fit.pearson -
+    doAssert abs(evaluate(evalRows, @[variant], 0.0).fit.pearson -
       baseFit.pearson) < 1e-10
   var variantBranches: seq[Branch] = @[]
   for variant in variants:
     variantBranches.add(Branch(rules: @[variant], editedAt: 0))
-  let fourBeams = rankBranches(evalRows, variantBranches, 4)
+  let fourBeams = rankBranches(evalRows, variantBranches, 4, 0.0)
   doAssert fourBeams.len == 4
   var seenOps: seq[int] = @[]
   for branch in fourBeams:
@@ -1176,7 +1411,7 @@ proc selfTest() =
   doAssert chained.cols[1][0] == 4.0
   doAssert chained.finalTexts[0][0] == fresh + 1
   # Captures may still be transformed via sort/reverse/inverse_sort.
-  echo "Numerical OLS, width-4 beam, add/replace policy, alternating RHS, tokenization, diffusion and sequential-rewrite self-tests passed"
+  echo "Numerical Ridge/OLS, width-4 beam, add/replace policy, alternating RHS, tokenization, diffusion and sequential-rewrite self-tests passed"
 
 proc main() =
   if "--self-test" in commandLineParams():
@@ -1201,6 +1436,9 @@ proc main() =
     " map=", cfg.outDir / "token_map.tsv",
     " noise=observed-frequency-weighted-different-byte",
     " noise-before-rules=true sequential-rewrite=true")
+  stderr.writeLine("[regression] type=", (if cfg.ridgeLambda > 0.0: "Ridge" else: "OLS"),
+    " lambda=", cfg.ridgeLambda, " standardized=", cfg.ridgeLambda > 0.0,
+    " intercept_penalty=false")
   stderr.writeLine("[corpus] chunks=", source.len, " chunkLen<=", cfg.chunkLen,
     " train=", cfg.trainChunks, " valid=", cfg.validChunks,
     " noiseSteps=", cfg.noiseSteps, " (0=all)")
@@ -1221,14 +1459,14 @@ proc main() =
     if rows.len < 3: quit("Training rows insufficient", 1)
     # Every retained RHS is fitted on THIS rotated window and expanded.
     # No lookahead or speculative score is used for pruning.
-    let parents = rankBranches(rows, beams, cfg.beamWidth)
+    let parents = rankBranches(rows, beams, cfg.beamWidth, cfg.ridgeLambda)
     if parents.len == 0: break
     let incumbent = parents[0]
     var additions: seq[Branch] = @[]
     var exchanges: seq[Branch] = @[]
     for parentIndex in 0..<parents.len:
       let parent = parents[parentIndex]
-      let state = evaluate(rows, parent.rules, true)
+      let state = evaluate(rows, parent.rules, cfg.ridgeLambda, true)
       if parent.rules.len < cfg.maxRules:
         for b in attemptAddition(rows, parent, cfg, codec, state.enc, state.fit):
           additions.add(b)
@@ -1253,7 +1491,7 @@ proc main() =
       beams = parents
     # Record the best actual current-window fitted model, NOT the forecast.
     let current = beams[0]
-    let initial = evaluate(rows, current.rules, true)
+    let initial = evaluate(rows, current.rules, cfg.ridgeLambda, true)
     let valPearson = predictPearson(validation, current.rules, initial.fit.beta)
     let elapsed = epochTime() - tick
     let trainMetric = plotMeasure(initial.fit.pearson)
@@ -1268,7 +1506,7 @@ proc main() =
     stream.write(logLine)
     stream.close()
     saveRules(cfg.outDir / "rules.tsv", current.rules)
-    writePlot(cfg.outDir)
+    writePlot(cfg.outDir, cfg.ridgeLambda)
     echo "[step] ", step, " trainPearson=", initial.fit.pearson,
       " validPearson=", valPearson, " -ln(1-rho)=", trainMetric,
       " rules=", current.rules.len, " branch=", current.description,
