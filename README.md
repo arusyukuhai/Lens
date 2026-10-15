@@ -30,8 +30,10 @@ Examples for `L = 25`:
 
 The union applies identically to `--coarse-power`, `--fine-power`, and
 `--eval-power` because their row generation already uses one shared function.
-`--eval-every=N` is unchanged: the Fine selection and detailed Train/Validation
-still run at the first/last generations and every Nth generation.
+**New in this optimized revision:** Fine is used to rerank the Coarse shortlist
+**EVERY generation**, independently of `--eval-every=N`. The latter controls
+**only detailed train/held-out evaluation and plotted checkpoints** (always
+first and last generation, plus every Nth generation).
 
 ## Usage
 
@@ -63,15 +65,18 @@ verified here.
 ## Coarse/Fine/validation selection semantics
 
 - Every generation: the Coarse grid is used to mine and score Add/Replace.
-- On `--eval-every` checkpoints, the top `--fine-top` candidates per move type
-  are reassessed with the Fine grid; the chosen move comes from its Fine score.
-- On other generations, the selection stays on the Coarse score and there is
-  no periodic Train/Validation diagnostic pass.
+- **Every generation**, Coarse produces candidate Add/Replace finalists; the
+  top `--fine-top` candidates per move type are reranked on the Fine grid.
+  Parent baselines and all move candidates are compared on **the same Fine
+  rows**. Never mix Coarse and Fine Pearson to choose a rule.
+- Between `--eval-every` checkpoints, the selection still uses Fine scores,
+  but there is **no detailed Train/Validation diagnostic pass**.
 - At each checkpoint, `--eval-power` controls a separate diagnostic training
   and held-out grid (defaults to `--fine-power`). Fixed held-out uses the
   same deterministic corruption pattern, with no fitting on held-out rows.
-- `--eval-every=1` invokes Fine/diagnostics each generation; `--eval-every=5`
-  evaluates first, fifth, tenth, final generations.
+- `--eval-every=1` computes diagnostics each generation; `--eval-every=5`
+  computes diagnostics at first, fifth, tenth, final generations. **Fine
+  selection happens every generation in both cases.**
 - `rules.tsv` is saved after each generation; plots only update at checkpoints.
 - The optimization affects observation density and thus search selections:
   changing it can change validation Pearson and learned rules. It does not
@@ -80,6 +85,26 @@ verified here.
 
 ### Preserved fast paths
 
-Fingerprint8192, prefix state/vector reuse and optional `--delta-suffix=1`
-continue working unchanged. `--noise-steps` remains a mutually exclusive
+Fingerprint8192 and prefix state/vector reuse remain. **`--delta-suffix=1`
+is now the default**, and adjacent-token-pair Fingerprint filtering is enabled
+by default (`--pair-fingerprint=1`). Neither changes match counts. When
+`--coarse-power == --fine-power`, the program shares identical Coarse and Fine
+rows and prefix-state cache to avoid duplicate generation/re-encoding. `--noise-steps` remains a mutually exclusive
 legacy row-sampling flag (when set, all powers must be 1.0).
+
+## Optimization and knobs (this revision)
+
+- `--pair-fingerprint=1` (default): an additional 8192-bit per-row bitmap for
+  *adjacent literal pairs*, with no false-negative rejection. Helps only on
+  patterns with neighboring fixed tokens; it does not help `A,-1,B` patterns.
+  Set `--pair-fingerprint=0` to compare.
+- `--delta-suffix=1` (default): reuse unchanged suffix features when swapping
+  rules; `--delta-suffix=0` disables for a benchmark.
+- `--eval-every=N` does **not** change Fine frequency. Keep `--fine-top` small
+  enough that every-generation Fine rescoring remains affordable.
+- `--coarse-power=2.0 --fine-power=1.5 --eval-power=2.0 --eval-every=5` is an
+  illustrative configuration, not a measured optimum.
+
+The Nim compiler was **not available** in the creation environment. Python
+structural/formula tests ran, but runtime speedups and Nim compilation are
+unverified. See `verify_pair_fingerprint.py` and `verify_eval_schedule.py`.

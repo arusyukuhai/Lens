@@ -11,10 +11,11 @@ type
     maxGap, mineStarts, mineBudget, mineTracked, candidates, beamWidth, swapDepth: int
     minGain, ridgeLambda: float64
     coarsePower, finePower, evalPower: float64 # union: floor(k^power) + floor(k*L^(1-1/power)) schedules
-    fineTop, evalEvery: int # evaluate/validate and Fine-select each evalEvery generations
+    fineTop, evalEvery: int # Fine-select EVERY generation; diagnostics each evalEvery
     screenRows, screenCandidates, plotEvery: int # 0 disables respective work
     cmsWidth, cmsDepth: int
     useFingerprint: bool # exact no-false-negative match rejection
+    usePairFingerprint: bool # reject absent mandatory adjacent literal pairs
     usePrefixCache: bool # reuse mining and exact counts among equal prefixes
     usePrefixStateCache: bool # reuse pre-swap rewritten rows when ranking branches
     useDeltaSuffix: bool # skip downstream rewrites on rows with no new-rule matches
@@ -109,7 +110,8 @@ proc parseConfig(): Config =
     ridgeLambda: 0.01, coarsePower: 2.0, finePower: 1.0, evalPower: 0.0,
     fineTop: 12, evalEvery: 5,
     screenRows: 32, screenCandidates: 96,
-    useFingerprint: true, usePrefixCache: true, usePrefixStateCache: true,
+    useFingerprint: true, usePairFingerprint: true,
+    usePrefixCache: true, usePrefixStateCache: true,
     useDeltaSuffix: true, plotEvery: 1,
     cmsWidth: 65536, cmsDepth: 4,
     tokenSeed: 1729, tokenMapFile: "")
@@ -122,18 +124,18 @@ proc parseConfig(): Config =
       echo "--self-test | --corpus=FILE --out=DIR --resume=FILE --chunks=N --train=N --valid=N"
       echo "--chunk-len=N --noise-steps=N (legacy, 0=all; requires both powers 1) --steps=N"
       echo "--coarse-power=2.0 --fine-power=1.0 (union floor(k^p) and floor(k*L^(1-1/p)); p>=1)"
-      echo "--fine-top=12 (per-move Coarse finalists scored on Fine when evaluation is due)"
+      echo "--fine-top=12 (per-move Coarse finalists rescored on Fine EVERY generation)"
       echo "--eval-power=1.0 (same dual-grid schedule for diagnostics; defaults to fine-power)"
-      echo "--eval-every=1 (Fine reassessment + train/held-out evaluation every N generations)"
+      echo "--eval-every=1 (train/held-out diagnostic evaluation every N generations; Fine always)"
       echo "--max-rules=N --min-ngram=N --max-gram=N --max-total-gram=N"
       echo "--max-wildcards=N --max-gap=N --mine-starts=N --mine-budget=N"
       echo "--mine-tracked=N --candidates=N --beam=N --swap-depth=N"
       echo "--ridge-lambda=0.1 (standardized predictors; 0=legacy OLS)"
       echo "--screen-rows=32 --screen-candidates=96 (0 disables; approximate screen)"
-      echo "--fingerprint=1 (0 disables; exact presence-based matcher skips)"
+      echo "--fingerprint=1 --pair-fingerprint=1 (no-false-negative token and adjacent-pair filters)"
       echo "--prefix-cache=1 (0 disables; compare old per-parent mining/counting)"
       echo "--prefix-state-cache=1 (0 disables; compare full re-encoding for swaps)"
-      echo "--delta-suffix=1 (0 disables; compare regular prefix-state cache)"
+      echo "--delta-suffix=1 (now enabled by default; 0 disables for benchmark)"
       echo "--plot-every=1 (5 renders every 5 steps; 0 disables rendering)"
       echo "--cms-width=65536 --cms-depth=4 (power-of-two width; depth=2/3 faster but noisier)"
       echo "Build with -d:lensProfile to profile mining, screening and exact scoring"
@@ -176,6 +178,7 @@ proc parseConfig(): Config =
     of "screen-rows": result.screenRows = readInt(val, result.screenRows)
     of "screen-candidates": result.screenCandidates = readInt(val, result.screenCandidates)
     of "fingerprint": result.useFingerprint = readInt(val, 1) != 0
+    of "pair-fingerprint": result.usePairFingerprint = readInt(val, 1) != 0
     of "prefix-cache": result.usePrefixCache = readInt(val, 1) != 0
     of "prefix-state-cache": result.usePrefixStateCache = readInt(val, 1) != 0
     of "delta-suffix": result.useDeltaSuffix = readInt(val, 1) != 0
@@ -1041,7 +1044,7 @@ proc mine(text: seq[int], cfg: Config,
   if result.len > cfg.candidates:
     result.setLen(cfg.candidates)
 
-# 8192-bit per-row token-presence filter. No false negatives: each token sets
+# 8192-bit per-row token-presence AND adjacent-token-pair filters. No false negatives: each token sets
 # one bit, and a row is skipped only when a mandatory literal bit is absent.
 # The old 512-bit filter can saturate on ~2000-token rows, forcing avoidable
 # exact wildcard scans despite a missing literal. This enlarges the bitmap
@@ -1054,43 +1057,68 @@ else:
   const TokenFingerprintWords = 128 # 8192 bits = 1024 bytes per row
   const TokenFingerprintShift = 51 # top 13 bits of 64-bit mixed token
 
-type TokenFingerprint = array[TokenFingerprintWords, uint64]
+type
+  TokenFingerprint = array[TokenFingerprintWords, uint64]
+  RowFingerprint = object
+    tokens: TokenFingerprint
+    adjacentPairs: TokenFingerprint
 
 proc tokenFingerprintBit(token: int): int {.inline.} =
-  # Nonnegative tokens only; deterministic multiplicative mixing.
   int((uint64(token) * 0x9E3779B97F4A7C15'u64) shr TokenFingerprintShift)
 
-proc fingerprintText(text: openArray[int]): TokenFingerprint =
-  for value in text:
+proc pairFingerprintBit(a, b: int): int {.inline.} =
+  ## Order-sensitive mixing of two *adjacent* literal tokens.
+  ## A false positive collision is allowed; a false negative is impossible.
+  var hash = (uint64(a) * 0x9E3779B97F4A7C15'u64) xor
+             (uint64(b) * 0xBF58476D1CE4E5B9'u64)
+  hash = (hash xor (hash shr 30)) * 0xBF58476D1CE4E5B9'u64
+  hash = (hash xor (hash shr 27)) * 0x94D049BB133111EB'u64
+  int((hash xor (hash shr 31)) shr TokenFingerprintShift)
+
+proc fingerprintText(text: openArray[int], includePairs = true): RowFingerprint =
+  for i, value in text:
     if value < 0: continue
     let bit = tokenFingerprintBit(value)
-    result[bit shr 6] = result[bit shr 6] or (1'u64 shl (bit and 63))
+    result.tokens[bit shr 6] = result.tokens[bit shr 6] or
+      (1'u64 shl (bit and 63))
+    if includePairs and i > 0 and text[i-1] >= 0:
+      let pairBit = pairFingerprintBit(text[i-1], value)
+      result.adjacentPairs[pairBit shr 6] =
+        result.adjacentPairs[pairBit shr 6] or
+        (1'u64 shl (pairBit and 63))
 
-proc fingerprintRows(texts: seq[seq[int]]): seq[TokenFingerprint] =
-  result = newSeq[TokenFingerprint](texts.len)
+proc fingerprintRows(texts: seq[seq[int]], includePairs = true): seq[RowFingerprint] =
+  result = newSeq[RowFingerprint](texts.len)
   for i in 0..<texts.len:
-    result[i] = fingerprintText(texts[i])
+    result[i] = fingerprintText(texts[i], includePairs)
 
-proc mayContainPattern(fp: TokenFingerprint, pat: openArray[int]): bool {.inline.} =
-  for value in pat:
-    if value < 0: continue # wildcards are not literal requirements
+proc mayContainPattern(fp: RowFingerprint, pat: openArray[int],
+                       checkPairs = true): bool {.inline.} =
+  for i, value in pat:
+    if value < 0: continue # wildcard: cannot impose an adjacent-pair test
     let bit = tokenFingerprintBit(value)
-    if (fp[bit shr 6] and (1'u64 shl (bit and 63))) == 0'u64:
+    if (fp.tokens[bit shr 6] and (1'u64 shl (bit and 63))) == 0'u64:
       return false
+    if checkPairs and i > 0 and pat[i-1] >= 0:
+      # Any exact match must contain this adjacent token pair in this order.
+      let pairBit = pairFingerprintBit(pat[i-1], value)
+      if (fp.adjacentPairs[pairBit shr 6] and
+          (1'u64 shl (pairBit and 63))) == 0'u64:
+        return false
   true
 
 proc countFeatures(texts: seq[seq[int]], pat: seq[int],
-                   fingerprints: seq[TokenFingerprint] = @[],
+                   fingerprints: seq[RowFingerprint] = @[],
                    originalLengths: seq[int] = @[],
-                   profileSkipped: ptr[int] = nil): seq[float64] =
-  ## Every candidate feature uses the same denominator as encoded rules.
-  ## Production callers pass pre-noise originalLengths, NEVER rewritten size.
+                   profileSkipped: ptr[int] = nil,
+                   checkPairs = true): seq[float64] =
+  ## Skip only provably impossible literal/pair matches, with exact counts.
   doAssert originalLengths.len == 0 or originalLengths.len == texts.len
   let compiled = compileSeqPattern(pat, 1)
   result = newSeq[float64](texts.len)
   for i in 0..<texts.len:
     if fingerprints.len == texts.len and
-        not mayContainPattern(fingerprints[i], pat):
+        not mayContainPattern(fingerprints[i], pat, checkPairs):
       when defined(lensProfile):
         if profileSkipped != nil: inc profileSkipped[]
       continue
@@ -1135,7 +1163,7 @@ proc mineWindow(texts: seq[seq[int]], cfg: Config): seq[PatternScore] =
 # Every survivor is still evaluated with exact full-window counts and Ridge.
 proc screenPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
                     candidates: seq[PatternScore],
-                    fingerprints: seq[TokenFingerprint] = @[],
+                    fingerprints: seq[RowFingerprint] = @[],
                     originalLengths: seq[int] = @[]): seq[PatternScore] =
   doAssert originalLengths.len == 0 or originalLengths.len == texts.len
   if cfg.screenRows <= 0 or cfg.screenCandidates <= 0 or
@@ -1158,7 +1186,8 @@ proc screenPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
       let denominator = (if originalLengths.len == texts.len:
                            originalLengths[i] else: texts[i].len)
       let z = (if fingerprints.len == texts.len and
-                  not mayContainPattern(fingerprints[i], candidate.pat):
+                  not mayContainPattern(fingerprints[i], candidate.pat,
+                                        cfg.usePairFingerprint):
                  0.0
                else: firingDensity(
                  countSeqCompiled(texts[i], pattern), denominator))
@@ -1217,7 +1246,7 @@ type
     ridgeMoments: RidgePrefixMoments # lazy per-step Gram cache
   StageEntry = ref object
     mined: seq[PatternScore]
-    fingerprints: seq[TokenFingerprint]
+    fingerprints: seq[RowFingerprint]
     vectors: Table[seq[int], seq[float64]]
   StageCache = ref object
     stages: Table[string, StageEntry]
@@ -1251,8 +1280,8 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
     else:
       entry = StageEntry(
         mined: mineWindow(texts, cfg),
-        fingerprints: (if cfg.useFingerprint: fingerprintRows(texts)
-                       else: newSeq[TokenFingerprint](0)),
+        fingerprints: (if cfg.useFingerprint: fingerprintRows(texts, cfg.usePairFingerprint)
+                       else: newSeq[RowFingerprint](0)),
         vectors: initTable[seq[int], seq[float64]]())
       cache.stages[stageKey] = entry
     mined = entry.mined
@@ -1270,8 +1299,8 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
         break
     if not banned: eligible.add(candidate)
   let fingerprints = (if entry != nil: entry.fingerprints
-                      elif cfg.useFingerprint: fingerprintRows(texts)
-                      else: newSeq[TokenFingerprint](0))
+                      elif cfg.useFingerprint: fingerprintRows(texts, cfg.usePairFingerprint)
+                      else: newSeq[RowFingerprint](0))
   let candidates = screenPatterns(texts, fit, cfg, eligible,
     fingerprints, originalLengths)
   when defined(lensProfile):
@@ -1296,11 +1325,11 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
         countedExactRows += texts.len
         let countStart = epochTime()
         counts = countFeatures(texts, candidate.pat, fingerprints,
-          originalLengths, addr skippedExactRows)
+          originalLengths, addr skippedExactRows, cfg.usePairFingerprint)
         exactCountSeconds += epochTime() - countStart
       else:
         counts = countFeatures(texts, candidate.pat, fingerprints,
-          originalLengths)
+          originalLengths, checkPairs = cfg.usePairFingerprint)
       if entry != nil and entry.vectors.len < MaxCachedFeatureVectorsPerPrefix:
         entry.vectors[candidate.pat] = counts
     var actualOccurrences = 0
@@ -1335,6 +1364,7 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
       " reused_mine=", (if cache != nil: cache.reusedMining else: 0),
       " reused_vectors=", (if cache != nil: cache.reusedCounts else: 0),
       " fingerprint_bits=", TokenFingerprintWords*64,
+      " pair_filter=", cfg.usePairFingerprint,
       " exact_skipped_rows=", skippedExactRows,
       " exact_total_rows=", countedExactRows,
       " exact_match_seconds=", exactCountSeconds,
@@ -1411,10 +1441,19 @@ proc bestInsertion(rows: seq[Row], existing: seq[Rule], at: int,
   ## Mine exactly at the insertion point, AFTER earlier rules and BEFORE
   ## later ones. FWL is a prefilter; full rewritten OLS judges acceptance.
   let baseline = evaluate(rows, existing, cfg.ridgeLambda, true)
-  let stageTexts = prefixTexts(rows, existing, at)
+  let prefixKey = stageSignature(existing, at)
+  var stageTexts: seq[seq[int]]
+  if at == existing.len:
+    # The full baseline evaluation has already computed the final text.
+    stageTexts = baseline.enc.finalTexts
+  elif cache != nil and cache.prefixStates.hasKey(prefixKey):
+    # The same immutable prefix was encoded while ranking sibling branches.
+    stageTexts = cache.prefixStates[prefixKey].encoded.finalTexts
+  else:
+    stageTexts = prefixTexts(rows, existing, at)
   let winners = bestPatterns(stageTexts, baseline.fit, cfg, existing,
                              max(1, keep), true, cache,
-                             stageSignature(existing, at), sourceLengths(rows))
+                             prefixKey, sourceLengths(rows))
   for candidate in winners:
     # A replacement at the END of the sequence cannot modify downstream
     # feature columns. The block Ridge/OLS append formula gives its exact
@@ -1862,7 +1901,17 @@ proc attemptAddition(rows: seq[Row], base: Branch, cfg: Config,
 
 proc predictPearson(rows: seq[Row], rules: seq[Rule], beta: seq[float64]): float64 =
   if rows.len == 0 or beta.len != rules.len+1: return 0.0
-  let enc = encode(rows, rules)
+  # Validation needs each rule's feature count, never the *last rule's*
+  # rewritten output. Use the existing exact count-only final rule path.
+  var initial: Encoded
+  initial.y = newSeq[float64](rows.len)
+  initial.originalLengths = newSeq[int](rows.len)
+  initial.finalTexts = newSeq[seq[int]](rows.len)
+  for i, row in rows:
+    initial.y[i] = row.target
+    initial.originalLengths[i] = sourceLength(row)
+    initial.finalTexts[i] = row.text
+  let enc = encodeSuffixForRanking(initial, rules, 0)
   var meanY, meanP = 0.0
   var predictions = newSeq[float64](rows.len)
   for i in 0..<rows.len:
@@ -1977,6 +2026,24 @@ proc selfTest() =
   doAssert stageCacheTest.reusedCounts > 0
   # Fingerprint cannot reject any actual match, including wildcards.
   let fingerprintTexts = @[@[11, 12, 13], @[11, 22, 33], @[11, 11]]
+  # A required adjacent literal pair can reject a row containing BOTH
+  # individual tokens in the wrong order, but wildcards never assert adjacency.
+  let reorderedRows = @[@[100001, 100003, 100002],
+                         @[100001, 100002, 100003],
+                         @[100002, 100001, 100003]]
+  let joinedFP = fingerprintRows(reorderedRows)
+  doAssert not mayContainPattern(joinedFP[0], @[100001, 100002])
+  doAssert mayContainPattern(joinedFP[1], @[100001, 100002])
+  doAssert mayContainPattern(joinedFP[0], @[100001, -1, 100002])
+  doAssert not mayContainPattern(joinedFP[2], @[100001, 100002])
+  # Raw matcher and filtered matcher must report identical results, including
+  # wildcard patterns and duplicated adjacent literals.
+  for pat in [@[100001, 100002], @[100001, -1, 100002],
+              @[100003, 100002], @[100001, 100001], @[100002]]:
+    doAssert countFeatures(reorderedRows, pat) ==
+      countFeatures(reorderedRows, pat, joinedFP)
+    doAssert countFeatures(reorderedRows, pat) ==
+      countFeatures(reorderedRows, pat, joinedFP, checkPairs = false)
   let fingerprints = fingerprintRows(fingerprintTexts)
   for pat in [@[11], @[22], @[12, -1, 13], @[11, -1, 33], @[99]]:
     doAssert countFeatures(fingerprintTexts, pat) ==
@@ -2419,6 +2486,9 @@ proc selfTest() =
   let rateSuffix = encodeSuffixForRanking(encode(rateRows, @[rateRule]),
     @[rateRule, rateNext], 1)
   doAssert rateSuffix.cols == rateEnc.cols
+  let rateFit = ridge(rateEnc.cols, rateEnc.y, 0.1, false)
+  doAssert abs(predictPearson(rateRows, @[rateRule, rateNext], rateFit.beta) -
+    rateFit.pearson) < 1e-9
   let rateBranches = @[
     Branch(rules: @[rateRule, rateNext], editedAt: 0),
     Branch(rules: @[Rule(pat: @[71], rhs: @[81, 82, 83, 84]), rateNext],
@@ -2464,6 +2534,9 @@ proc main() =
     " map=", cfg.outDir / "token_map.tsv",
     " noise=observed-frequency-weighted-different-byte",
     " noise-before-rules=true sequential-rewrite=true")
+  stderr.writeLine("[matching] fingerprint=", cfg.useFingerprint,
+    " pair_fingerprint=", cfg.usePairFingerprint,
+    " delta_suffix=", cfg.useDeltaSuffix)
   stderr.writeLine("[regression] type=", (if cfg.ridgeLambda > 0.0: "Ridge" else: "OLS"),
     " lambda=", cfg.ridgeLambda, " standardized=", cfg.ridgeLambda > 0.0,
     " intercept_penalty=false")
@@ -2492,7 +2565,7 @@ proc main() =
   stderr.writeLine("[coarse-fine] power=", cfg.coarsePower,
     " finePower=", cfg.finePower, " fineTop=", cfg.fineTop,
     " evalPower=", cfg.evalPower, " evalEvery=", cfg.evalEvery,
-    " endpoints=0,N")
+    " fineEvery=1 endpoints=0,N")
   let plotPath = cfg.outDir / "training.dat"
   writeFile(plotPath, "# step train_nlog1mpearson heldout_nlog1mpearson rules train_pearson heldout_pearson seconds train_ma15_nlog1mpearson heldout_ma15_nlog1mpearson\n")
   var trainMA, heldoutMA: PearsonMovingAverage
@@ -2563,51 +2636,46 @@ proc main() =
         " baseline_built_rows=", profileEval.deltaBaselineBuilds,
         " total=", profileEval.deltaSeconds, "s",
         " ridge=", profileEval.deltaRidgeSeconds, "s")
-    # Fine re-ranking is deliberately optional: on the other generations,
-    # comparisons use the SAME Coarse rows and their Pearson, never mix
-    # scores from different schedules in the same chooseMove() call.
+    # IMPORTANT: Fine reranking is an EVERY-GENERATION selection gate.
+    # --eval-every controls only the separate, costly diagnostic pass below.
+    # Selection scores must all be from the SAME Fine rows.
     let doEvaluate = evaluationDue(step, cfg.steps, cfg.evalEvery)
     let shortlistAdd = coarseFinalists(additions, cfg.fineTop)
     let shortlistReplace = coarseFinalists(exchanges, cfg.fineTop)
-    var selectedParents, selectedAdd, selectedReplace: seq[Branch]
-    var selectedBaseline: float64
-    var fineRows: seq[Row] = @[]
-    if doEvaluate:
-      when defined(lensProfile):
-        let startFine = epochTime()
+    when defined(lensProfile):
+      let startFine = epochTime()
+    # When grids coincide, reuse Coarse rows/state instead of recomputing
+    # identical diffusion and prefix features. Otherwise caches stay isolated.
+    let sameGrid = cfg.finePower == cfg.coarsePower
+    var fineRows: seq[Row]
+    var fineStageCache: StageCache = nil
+    if sameGrid:
+      fineRows = rows
+      fineStageCache = stageCache
+    else:
       fineRows = makeRows(source, cfg, codec, step, false, fineCache,
                           cfg.finePower)
-      if fineRows.len < 3: quit("Fine training rows insufficient", 1)
-      # Ranking caches are row-dependent: Fine must NOT reuse Coarse states.
-      let fineStageCache = (if cfg.usePrefixCache or cfg.usePrefixStateCache:
-                             StageCache(stages: initTable[string, StageEntry](),
-                               prefixStates: initTable[string, PrefixState]())
-                           else: nil)
-      selectedParents = rankBranches(fineRows, parents, cfg.beamWidth,
-        cfg.ridgeLambda, fineStageCache, cfg.usePrefixStateCache,
-        cfg.useDeltaSuffix)
-      selectedAdd = rankBranches(fineRows, shortlistAdd, cfg.beamWidth,
-        cfg.ridgeLambda, fineStageCache, cfg.usePrefixStateCache,
-        cfg.useDeltaSuffix)
-      selectedReplace = rankBranches(fineRows, shortlistReplace, cfg.beamWidth,
-        cfg.ridgeLambda, fineStageCache, cfg.usePrefixStateCache,
-        cfg.useDeltaSuffix)
-      when defined(lensProfile):
-        stderr.writeLine("[profile-fine] step=", step,
-          " rows=", fineRows.len, " shortlisted=",
-          shortlistAdd.len + shortlistReplace.len,
-          " elapsed=", epochTime() - startFine, "s")
-      selectedBaseline = selectedParents[0].score
-    else:
-      # Use the already evaluated Coarse scores. Sorting still preserves
-      # the best beam variants without re-encoding any Fine rows.
-      selectedParents = parents
-      selectedAdd = bestCurrentBranches(shortlistAdd, cfg.beamWidth)
-      selectedReplace = bestCurrentBranches(shortlistReplace, cfg.beamWidth)
-      selectedBaseline = incumbent.score
-      when defined(lensProfile):
-        stderr.writeLine("[profile-fine] step=", step,
-          " skipped=true evalEvery=", cfg.evalEvery)
+      if cfg.usePrefixCache or cfg.usePrefixStateCache:
+        fineStageCache = StageCache(stages: initTable[string, StageEntry](),
+          prefixStates: initTable[string, PrefixState]())
+    if fineRows.len < 3: quit("Fine training rows insufficient", 1)
+    let selectedParents = rankBranches(fineRows, parents, cfg.beamWidth,
+      cfg.ridgeLambda, fineStageCache, cfg.usePrefixStateCache,
+      cfg.useDeltaSuffix)
+    let selectedAdd = rankBranches(fineRows, shortlistAdd, cfg.beamWidth,
+      cfg.ridgeLambda, fineStageCache, cfg.usePrefixStateCache,
+      cfg.useDeltaSuffix)
+    let selectedReplace = rankBranches(fineRows, shortlistReplace, cfg.beamWidth,
+      cfg.ridgeLambda, fineStageCache, cfg.usePrefixStateCache,
+      cfg.useDeltaSuffix)
+    if selectedParents.len == 0: quit("Fine beam unexpectedly empty", 1)
+    let selectedBaseline = selectedParents[0].score
+    when defined(lensProfile):
+      stderr.writeLine("[profile-fine] step=", step,
+        " rows=", fineRows.len, " shortlisted=",
+        shortlistAdd.len + shortlistReplace.len,
+        " elapsed=", epochTime() - startFine, "s",
+        " reused_coarse_grid=", sameGrid)
     let addScore = (if selectedAdd.len > 0: selectedAdd[0].score else: -Inf)
     let replaceScore = (if selectedReplace.len > 0:
                           selectedReplace[0].score else: -Inf)
@@ -2618,8 +2686,7 @@ proc main() =
       " shortlistReplace=", shortlistReplace.len,
       " coarseBaseline=", incumbent.score,
       " selectedBaseline=", selectedBaseline
-    echo "[compare] step=", step, " scoring=",
-      (if doEvaluate: "fine" else: "coarse"),
+    echo "[compare] step=", step, " scoring=fine",
       " baseline=", selectedBaseline,
       " add=", (if selectedAdd.len > 0: $addScore else: "n/a"),
       " replace=", (if selectedReplace.len > 0: $replaceScore else: "n/a"),
@@ -2677,15 +2744,15 @@ proc main() =
         " operator=", operatorName(current),
         " evaluation=", cfg.evalPower, " time=", elapsed, "s"
     else:
-      # Coarse-only steps have no held-out evaluation. Never reuse stale
-      # held-out Pearson or append fabricated/mixed-density graph points.
-      echo "[step] ", step, " coarsePearson=", current.score,
+      # Fine decides every move. Only the diagnostic evaluation is skipped.
+      # Do not append stale or mixed-density graph points.
+      echo "[step] ", step, " finePearson=", current.score,
         " validPearson=skipped rules=", current.rules.len,
         " branch=", current.description, " operator=", operatorName(current),
         " evaluation=skipped time=", epochTime() - tick, "s"
     when defined(lensProfile):
-      # This counter now includes both mandatory coarse search evaluations
-      # and infrequent diagnostic evaluation on the chosen eval-power rows.
+      # This counter covers Coarse search, every-step Fine reranking,
+      # and diagnostic evaluation on eval-power rows only at checkpoints.
       stderr.writeLine("[profile-evaluate] calls=", profileEval.evaluateCalls,
         " encode=", profileEval.evaluateEncodeSeconds,
         "s ridge=", profileEval.evaluateRidgeSeconds,
