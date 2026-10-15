@@ -15,6 +15,7 @@ type
     useFingerprint: bool # exact no-false-negative match rejection
     usePrefixCache: bool # reuse mining and exact counts among equal prefixes
     usePrefixStateCache: bool # reuse pre-swap rewritten rows when ranking branches
+    useDeltaSuffix: bool # skip downstream rewrites on rows with no new-rule matches
     tokenSeed: int
     tokenMapFile: string
 
@@ -94,9 +95,10 @@ proc parseConfig(): Config =
     noiseSteps: 0, steps: 100, maxRules: 24, minNgram: 1,
     maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
-    candidates: 384, beamWidth: 8, swapDepth: 3, minGain: 1e-9,
+    candidates: 384, beamWidth: 4, swapDepth: 3, minGain: 1e-9,
     ridgeLambda: 0.1, screenRows: 32, screenCandidates: 96,
-    useFingerprint: true, usePrefixCache: true, usePrefixStateCache: true, plotEvery: 1,
+    useFingerprint: true, usePrefixCache: true, usePrefixStateCache: true,
+    useDeltaSuffix: false, plotEvery: 1,
     cmsWidth: 65536, cmsDepth: 4,
     tokenSeed: 1729, tokenMapFile: "")
   if not fileExists(result.corpus) and fileExists("github-code.txt"):
@@ -114,6 +116,7 @@ proc parseConfig(): Config =
       echo "--fingerprint=1 (0 disables; exact presence-based matcher skips)"
       echo "--prefix-cache=1 (0 disables; compare old per-parent mining/counting)"
       echo "--prefix-state-cache=1 (0 disables; compare full re-encoding for swaps)"
+      echo "--delta-suffix=1 (0 disables; compare regular prefix-state cache)"
       echo "--plot-every=1 (5 renders every 5 steps; 0 disables rendering)"
       echo "--cms-width=65536 --cms-depth=4 (power-of-two width; depth=2/3 faster but noisier)"
       echo "Build with -d:lensProfile to profile mining, screening and exact scoring"
@@ -151,6 +154,7 @@ proc parseConfig(): Config =
     of "fingerprint": result.useFingerprint = readInt(val, 1) != 0
     of "prefix-cache": result.usePrefixCache = readInt(val, 1) != 0
     of "prefix-state-cache": result.usePrefixStateCache = readInt(val, 1) != 0
+    of "delta-suffix": result.useDeltaSuffix = readInt(val, 1) != 0
     of "plot-every": result.plotEvery = readInt(val, result.plotEvery)
     of "cms-width": result.cmsWidth = readInt(val, result.cmsWidth)
     of "cms-depth": result.cmsDepth = readInt(val, result.cmsDepth)
@@ -279,6 +283,10 @@ when defined(lensProfile):
     evaluateEncodeSeconds, evaluateRidgeSeconds: float64
     rankTotalSeconds, rankPrefixBuildSeconds: float64
     rankSuffixSeconds, rankRidgeSeconds: float64
+    deltaCalls, deltaFallbacks, deltaRowsScanned: int
+    deltaMatchedRows, deltaReusedRows, deltaBaselineBuilds: int
+    deltaPatternCacheHits: int
+    deltaSeconds, deltaRidgeSeconds: float64
   var profileEval: EvaluationCounters
 
 proc encode(rows: seq[Row], rules: seq[Rule]): Encoded =
@@ -1296,9 +1304,129 @@ proc cachedRankingPrefix(rows: seq[Row], branches: seq[Branch],
       cache.prefixOrder.add(key)
       cache.prefixTokenElements += storedTokens
 
+# In a group of exchange siblings only the rule at editedAt changes.
+# If the new rule does not match one particular pre-rule row, its input to
+# every later rule is IDENTICAL to the input with that rule omitted. Cache
+# that omitted-rule suffix once per row, and reuse all downstream counts.
+# Unlike a prefix-only cache, this avoids the costly suffix traversal itself.
+
+type DeltaSuffixWork = object
+  middlePrograms: seq[SeqReplaceProgram] # suffix except last, shared by siblings
+  lastPattern: SeqPattern
+  lastProgram: SeqReplaceProgram
+  lastSafeInputLength: int
+  baselineReady: seq[bool]
+  baselineCols: seq[seq[float64]] # tail-local columns; allocated on demand
+
+proc identicalExchangeSuffix(branches: seq[Branch], at: int): bool =
+  if branches.len <= 1 or at < 0: return false
+  let reference = branches[0].rules
+  if at >= reference.len - 1: return false # no downstream work to avoid
+  for b in branches:
+    if b.rules.len != reference.len or b.editedAt != at:
+      return false
+    for j in at+1..<reference.len:
+      if b.rules[j].pat != reference[j].pat or
+          b.rules[j].rhs != reference[j].rhs:
+        return false
+  result = true
+
+proc initDeltaSuffixWork(rules: seq[Rule], at, n: int): DeltaSuffixWork =
+  let last = rules.len - 1
+  for j in at+1..<last:
+    result.middlePrograms.add(compileSeqReplaceProgram(
+      rules[j].pat, rules[j].rhs, 1))
+  result.lastPattern = compileSeqPattern(rules[last].pat, 1)
+  result.lastProgram = compileSeqReplaceProgram(
+    rules[last].pat, rules[last].rhs, 1)
+  result.lastSafeInputLength = MAX_REPLACE_OUTPUT div
+    max(2, rules[last].rhs.len + 1)
+  result.baselineReady = newSeq[bool](n)
+  result.baselineCols = newSeq[seq[float64]](rules.len - at - 1)
+  for j in 0..<result.baselineCols.len:
+    result.baselineCols[j] = newSeq[float64](n)
+
+proc runDeltaTail(state: var seq[int], cols: var seq[seq[float64]],
+                  colStart, row: int, work: var DeltaSuffixWork) =
+  for offset in 0..<work.middlePrograms.len:
+    cols[colStart + offset][row] =
+      float64(applyAndCount(state, work.middlePrograms[offset]))
+  let last = colStart + work.middlePrograms.len
+  if state.len <= work.lastSafeInputLength:
+    cols[last][row] = float64(countSeqCompiled(state, work.lastPattern))
+  else:
+    cols[last][row] = float64(applyAndCount(state, work.lastProgram))
+
+proc rankDeltaExchange(prefix: Encoded, branches: seq[Branch],
+                       at: int, ridgeLambda: float64): seq[Branch] =
+  ## Count each distinct candidate LHS once, even when RHS differs through
+  ## plain/sort/reverse/inverse_sort. A cache miss in downstream counts is
+  ## computed lazily from the pre-rule text, with the candidate OMITTED.
+  ## No sampled/approximate features enter the Ridge regression.
+  let n = prefix.y.len
+  let totalRules = branches[0].rules.len
+  var work = initDeltaSuffixWork(branches[0].rules, at, n)
+  var occurrenceCache = initTable[seq[int], seq[int]]()
+  for b in branches:
+    var counts: seq[int]
+    if occurrenceCache.hasKey(b.rules[at].pat):
+      counts = occurrenceCache[b.rules[at].pat]
+      when defined(lensProfile):
+        inc profileEval.deltaPatternCacheHits
+    else:
+      let pattern = compileSeqPattern(b.rules[at].pat, 1)
+      counts = newSeq[int](n)
+      for i in 0..<n:
+        counts[i] = countSeqCompiled(prefix.finalTexts[i], pattern)
+      occurrenceCache[b.rules[at].pat] = counts
+      when defined(lensProfile):
+        profileEval.deltaRowsScanned += n
+    var encoded: Encoded
+    encoded.y = prefix.y
+    encoded.cols = newSeq[seq[float64]](totalRules)
+    for j in 0..<at:
+      encoded.cols[j] = prefix.cols[j]
+    for j in at..<totalRules:
+      encoded.cols[j] = newSeq[float64](n)
+    var program = compileSeqReplaceProgram(b.rules[at].pat,
+                                           b.rules[at].rhs, 1)
+    for i in 0..<n:
+      let hits = counts[i]
+      encoded.cols[at][i] = float64(hits)
+      if hits == 0:
+        if not work.baselineReady[i]:
+          var state = prefix.finalTexts[i]
+          runDeltaTail(state, work.baselineCols, 0, i, work)
+          work.baselineReady[i] = true
+          when defined(lensProfile):
+            inc profileEval.deltaBaselineBuilds
+        for j in 0..<work.baselineCols.len:
+          encoded.cols[at + 1 + j][i] = work.baselineCols[j][i]
+        when defined(lensProfile):
+          inc profileEval.deltaReusedRows
+      else:
+        var state = prefix.finalTexts[i]
+        let observed = applyAndCount(state, program)
+        when defined(lensDebug):
+          doAssert observed == hits # independent count/rewrite equivalence
+        discard observed
+        runDeltaTail(state, encoded.cols, at + 1, i, work)
+        when defined(lensProfile):
+          inc profileEval.deltaMatchedRows
+    var scored = b
+    when defined(lensProfile):
+      let startRidge = epochTime()
+    scored.score = ridge(encoded.cols, encoded.y, ridgeLambda, false).pearson
+    when defined(lensProfile):
+      let ridgeElapsed = epochTime() - startRidge
+      profileEval.deltaRidgeSeconds += ridgeElapsed
+      profileEval.rankRidgeSeconds += ridgeElapsed
+    result.add(scored)
+
 proc rankBranches(rows: seq[Row], branches: seq[Branch], keep: int,
                   ridgeLambda: float64, stateCache: StageCache = nil,
-                  enableStateCache = false): seq[Branch] =
+                  enableStateCache = false,
+                  enableDeltaSuffix = true): seq[Branch] =
   ## The pre-swap prefix is the same for all sibling candidates. Cache its
   ## entire rewritten row state (and earlier exact count columns), then
   ## apply ONLY the changed suffix. No score approximation is introduced.
@@ -1312,20 +1440,35 @@ proc rankBranches(rows: seq[Row], branches: seq[Branch], keep: int,
       inc profileEval.rankCacheCalls
     let prefixLength = sharedPrefixLength(branches)
     let prefix = cachedRankingPrefix(rows, branches, prefixLength, stateCache)
-    for b in branches:
-      var scored = b
+    if enableDeltaSuffix and identicalExchangeSuffix(branches, prefixLength):
       when defined(lensProfile):
-        let start = epochTime()
-      let enc = encodeSuffixForRanking(prefix, b.rules, prefixLength)
+        let deltaStart = epochTime()
+        let oldDeltaRidge = profileEval.deltaRidgeSeconds
+        inc profileEval.deltaCalls
+      ranking = rankDeltaExchange(prefix, branches, prefixLength, ridgeLambda)
       when defined(lensProfile):
-        let afterEncoding = epochTime()
-        profileEval.rankSuffixSeconds += afterEncoding-start
-        if b.rules.len > prefixLength:
-          inc profileEval.rankLastCountOnly
-      scored.score = ridge(enc.cols, enc.y, ridgeLambda, false).pearson
+        let deltaElapsed = epochTime() - deltaStart
+        profileEval.deltaSeconds += deltaElapsed
+        # Track suffix time separately from Ridge for apples-to-apples logs.
+        profileEval.rankSuffixSeconds += max(0.0,
+          deltaElapsed - profileEval.deltaRidgeSeconds + oldDeltaRidge)
+    else:
       when defined(lensProfile):
-        profileEval.rankRidgeSeconds += epochTime()-afterEncoding
-      ranking.add(scored)
+        if enableDeltaSuffix: inc profileEval.deltaFallbacks
+      for b in branches:
+        var scored = b
+        when defined(lensProfile):
+          let start = epochTime()
+        let enc = encodeSuffixForRanking(prefix, b.rules, prefixLength)
+        when defined(lensProfile):
+          let afterEncoding = epochTime()
+          profileEval.rankSuffixSeconds += afterEncoding-start
+          if b.rules.len > prefixLength:
+            inc profileEval.rankLastCountOnly
+        scored.score = ridge(enc.cols, enc.y, ridgeLambda, false).pearson
+        when defined(lensProfile):
+          profileEval.rankRidgeSeconds += epochTime()-afterEncoding
+        ranking.add(scored)
   else:
     for b in branches:
       var scored = b
@@ -1400,7 +1543,8 @@ proc attemptExchange(rows: seq[Row], base: Branch, cfg: Config,
                     bestCurrentBranches(options, cfg.beamWidth)
                   else:
                     rankBranches(rows, options, cfg.beamWidth, cfg.ridgeLambda,
-                                 cache, cfg.usePrefixStateCache))
+                                 cache, cfg.usePrefixStateCache,
+                                 cfg.useDeltaSuffix))
     if ranked.len == 0: break
     trial = ranked[0]
     if trial.score > baseFit.pearson + cfg.minGain:
@@ -1786,8 +1930,8 @@ proc selfTest() =
   let lastRule = Rule(pat: @[2001], rhs: @[3001])
   let changedRule = Rule(pat: @[1001, -1, vb], rhs: @[2001, -32, 2002])
   let midBranches = @[
-    Branch(rules: @[prefixRule, afterRule, lastRule]),
-    Branch(rules: @[prefixRule, changedRule, lastRule])]
+    Branch(rules: @[prefixRule, afterRule, lastRule], editedAt: 1),
+    Branch(rules: @[prefixRule, changedRule, lastRule], editedAt: 1)]
   let midCache = StageCache(stages: initTable[string, StageEntry](),
     prefixStates: initTable[string, PrefixState]())
   for lam in [0.0, 0.1, 1.0]:
@@ -1799,6 +1943,45 @@ proc selfTest() =
       doAssert slowRank[i].description == quickRank[i].description
       doAssert abs(slowRank[i].score-quickRank[i].score) < 1e-9
   doAssert midCache.prefixStates.len == 1
+  # Delta suffix must agree with full encoding for mixed firing/non-firing
+  # rows, and must correctly reuse following-rule counts on non-firing rows.
+  let mixedRows = @[
+    Row(text: @[va, 100, 200, vb], target: 0.0),
+    Row(text: @[va, 2001, 200, vb], target: 0.2),
+    Row(text: @[va, 300, 100, 200, vb], target: 0.4),
+    Row(text: @[va, 100, 200], target: 0.6),
+    Row(text: @[va, 2001, 300, vb], target: 0.8),
+    Row(text: @[va, 100, 300, 200, vb], target: 1.0)]
+  let suffix1 = Rule(pat: @[2001], rhs: @[3001])
+  let suffix2 = Rule(pat: @[3001], rhs: @[4001])
+  let altAbsent = Rule(pat: @[999998, -1, 999999],
+                       rhs: @[9001, -1, 9002])
+  let variedBranches = @[
+    Branch(rules: @[prefixRule, afterRule, suffix1, suffix2],
+           editedAt: 1, description: "plain"),
+    Branch(rules: @[prefixRule, changedRule, suffix1, suffix2],
+           editedAt: 1, description: "reverse"),
+    Branch(rules: @[prefixRule, altAbsent, suffix1, suffix2],
+           editedAt: 1, description: "absent")]
+  for lam in [0.0, 0.1, 1.0]:
+    let slow = rankBranches(mixedRows, variedBranches, 3, lam)
+    let cached = rankBranches(mixedRows, variedBranches, 3, lam,
+                              nil, true, false)
+    let delta = rankBranches(mixedRows, variedBranches, 3, lam,
+                             nil, true, true)
+    doAssert delta.len == slow.len and delta.len == cached.len
+    for i in 0..<slow.len:
+      doAssert delta[i].description == slow[i].description
+      doAssert abs(delta[i].score - slow[i].score) < 1e-9
+      doAssert abs(delta[i].score - cached[i].score) < 1e-9
+  # A pure RHS variation (identical LHS) shares its match vector, but may
+  # still produce distinct later counts; both must be evaluated exactly.
+  for lam in [0.0, 0.1]:
+    let direct = rankBranches(evalRows, midBranches, 2, lam)
+    let delta = rankBranches(evalRows, midBranches, 2, lam,
+                             nil, true, true)
+    for i in 0..<direct.len:
+      doAssert abs(direct[i].score - delta[i].score) < 1e-9
   let fourBeams = rankBranches(evalRows, variantBranches, 4, 0.0)
   doAssert fourBeams.len == 4
   var seenOps: seq[int] = @[]
@@ -1947,7 +2130,8 @@ proc main() =
     # Every retained RHS is fitted on THIS rotated window and expanded.
     # No lookahead or speculative score is used for pruning.
     let parents = rankBranches(rows, beams, cfg.beamWidth, cfg.ridgeLambda,
-                               stageCache, cfg.usePrefixStateCache)
+                               stageCache, cfg.usePrefixStateCache,
+                               cfg.useDeltaSuffix)
     when defined(lensProfile):
       let parentsReadyTime = epochTime()
     if parents.len == 0: break
@@ -1986,6 +2170,15 @@ proc main() =
         " prefix_build=", profileEval.rankPrefixBuildSeconds, "s",
         " suffix_encode=", profileEval.rankSuffixSeconds, "s",
         " ridge=", profileEval.rankRidgeSeconds, "s")
+      stderr.writeLine("[profile-delta] calls=", profileEval.deltaCalls,
+        " fallback=", profileEval.deltaFallbacks,
+        " scanned_rows=", profileEval.deltaRowsScanned,
+        " pattern_reuses=", profileEval.deltaPatternCacheHits,
+        " matched_rows=", profileEval.deltaMatchedRows,
+        " skipped_suffix_rows=", profileEval.deltaReusedRows,
+        " baseline_built_rows=", profileEval.deltaBaselineBuilds,
+        " total=", profileEval.deltaSeconds, "s",
+        " ridge=", profileEval.deltaRidgeSeconds, "s")
       stderr.writeLine("[profile-evaluate] calls=", profileEval.evaluateCalls,
         " encode=", profileEval.evaluateEncodeSeconds,
         "s ridge=", profileEval.evaluateRidgeSeconds, "s")

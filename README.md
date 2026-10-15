@@ -456,3 +456,27 @@ New `-d:lensProfile` diagnostics:
 this revised Nim code is statically checked but not compiled or benchmarked
 here. Verify the self-test and on/off equality on your machine before trusting
 performance or a long training run.
+
+## 差分Suffix評価（2026-10-15 追加）
+
+この版では `--delta-suffix=1` を既定で有効にしました。`--prefix-state-cache=1` と組み合わせることで、**同じ位置のルールを交換した複数の候補**をスコアリングする際に、後続ルールを走査する回数を減らします。
+
+- 交換直前の文章と既存の特徴量列は、従来のPrefix State Cacheを利用します。
+- 各候補ルールの **左辺パターン** の出現回数を全行で一度だけ正確に計測します。置換先だけ異なる演算（plain / sort / reverse / inverse_sort）は出現回数を共用します。
+- 出現回数が0の行では、候補を適用せずに「**そのルールを省いて後続を適用した場合**」の特徴量を再利用します。この基準Suffixは同一行につき必要になったとき一度だけ計算します。
+- 出現回数が1以上の行では、通常の規則適用と後続の再適用を行います。最後の規則は従来通り安全な場合のみ出現回数だけを数えます。
+- 連鎖交換で後続ルール群が一致しない場合、または末尾ルールの交換では、既存の評価経路に自動フォールバックします。
+- **候補のスクリーニング、Ridge回帰の値、Add/Replaceの選択条件は変更しません。** 差分計算によって走査する行を削減する最適化です。候補が全行に発火する場合は遅くなる可能性もあるので切替可能にしています。
+
+実行例：
+
+```bash
+nim c -d:release --opt:speed -d:lensProfile -o:lens_profile cms.nim
+./lens_profile --self-test
+./lens_profile --steps=20 --delta-suffix=1 --prefix-state-cache=1 --out=lens_delta
+./lens_profile --steps=20 --delta-suffix=0 --prefix-state-cache=1 --out=lens_baseline
+```
+
+`[profile-delta]` には `scanned_rows`（ユニーク左辺の正確なマッチング行数）、`pattern_reuses`（左辺ヒット列の再利用回数）、`matched_rows`（ルールを実際に適用した候補×行数）、`skipped_suffix_rows`（Suffixを省略した候補×行数）、`baseline_built_rows`（基準Suffixを一度だけ計算した行数）と実行時間を表示します。`skipped_suffix_rows` に対して `baseline_built_rows` が小さければ、差分キャッシュによる効果が大きい可能性があります。`--delta-suffix=0` で、従来のPrefix State Cacheとの速度・結果の比較が可能です。
+
+注意：新設のセルフテストには、発火・不発火の混在、途中の複数後続ルール、異なるRHS、Ridge λ=0/0.1/1.0 に対する通常評価との比較を含めています。ただし、この環境にはNimコンパイラがないため、実際のコンパイル・テスト実行は未確認です。
