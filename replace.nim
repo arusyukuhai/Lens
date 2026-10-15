@@ -9,9 +9,8 @@
 ##    -1..-15    capture 0..14
 ##   -16..-31    sorted capture 0..15
 ##   -32..-47    reversed capture 0..15
-##   -48..-63    inverse_sort capture 0..15 (stable ascending ranks)
-##                Example: [30, 10, 20] -> [2, 0, 1].
-##                Ties are broken by original index.
+##   -48..-63    inverse_sort capture 0..15 (descending token sort)
+##                Example: [30, 10, 20] -> [30, 20, 10].
 ##   -64..-111   invalid (removed arithmetic opcodes)
 ##
 ## The implementation preserves the original hot-path optimizations:
@@ -50,8 +49,6 @@ type
     nextSearch: int
     exhausted: bool
 
-  SortIndexEntry = tuple[value: int, index: int]
-
   ReplacementOp = object
     kind: uint8       # 0 literal, 1 capture, 2 sort, 3 reverse, 4 inverse_sort
     arg: uint8        # capture index 0..15
@@ -66,18 +63,9 @@ type
     cursors: array[17, LiteralCursor]
     captures: array[16, Capture]
     sortBuf: seq[int]
-    inverseSortBuf: seq[SortIndexEntry]
 
 const
   MAX_REPLACE_OUTPUT* = 1_048_576
-
-proc cmpSortIndexEntry(a, b: SortIndexEntry): int {.inline.} =
-  ## Sort by token value and break ties by original position.
-  if a.value < b.value: return -1
-  if a.value > b.value: return 1
-  if a.index < b.index: return -1
-  if a.index > b.index: return 1
-  return 0
 
 proc buildPrefix(p: openArray[int]): seq[int] =
   result = newSeq[int](p.len)
@@ -392,7 +380,7 @@ proc appendReplacementPlan(
         dec ri
         outp.add(input[ri])
 
-    of 4'u8: # inverse_sort: rank of each captured element in stable sort order
+    of 4'u8: # inverse_sort: sort the captured tokens in descending order
       var n = int(op.arg)
       if wildcardCount == 0 or captures.len == 0:
         continue
@@ -404,26 +392,15 @@ proc appendReplacementPlan(
         raise newException(SeqReplaceError,
           "invalid capture: start=" & $c.start & " len=" & $c.len &
           " input.len=" & $input.len & " op=" & $op.kind)
-      if c.len > maxOutput - outp.len:
-        overflow = true
-        return
-
-      # Sort (value, original_index), then invert the permutation.
-      # Using the original index as a tie breaker gives deterministic ranks
-      # even when the captured sequence contains duplicate values.
-      scratch.inverseSortBuf.setLen(c.len)
-      for j in 0 ..< c.len:
-        scratch.inverseSortBuf[j] = (value: input[c.start + j], index: j)
-      # std/algorithm.sort requires a {.closure.} comparator.  A top-level
-      # cmpSortIndexEntry uses the default Nim calling convention, so adapt it.
-      sort(scratch.inverseSortBuf,
-        proc(a, b: SortIndexEntry): int {.closure.} =
-          cmpSortIndexEntry(a, b))
-
-      let dst = outp.len
-      outp.setLen(dst + c.len)
-      for rank, entry in scratch.inverseSortBuf:
-        outp[dst + entry.index] = rank
+      if c.len > 0:
+        if c.len > maxOutput - outp.len:
+          overflow = true
+          return
+        scratch.sortBuf.setLen(c.len)
+        copyMem(addr scratch.sortBuf[0], unsafeAddr input[c.start],
+                c.len * sizeof(int))
+        sort(scratch.sortBuf, order = Descending)
+        appendIntValuesBulk(outp, scratch.sortBuf)
 
     else:
       raise newException(SeqReplaceError, "Unknown replacement opcode")
