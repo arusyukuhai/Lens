@@ -1,4 +1,4 @@
-## Lens count-feature greedy/beam symbolic learner.
+## Lens firing-density (matches / original tokens) greedy/beam symbolic learner.
 ## Uses the optimized matcher/replacer in replace.nim and the bounded CMS miner.
 import std/[os, strutils, sequtils, tables, hashes, algorithm, math, times]
 import replace, fast_count_min_sketch, token_codec
@@ -26,11 +26,13 @@ type
   Row = object
     text: seq[int]
     target: float64
+    originalLength: int # tokens before noise and ALL rule rewrites
 
   Encoded = object
-    cols: seq[seq[float64]] # each old rule's number of non-overlapping matches
+    cols: seq[seq[float64]] # non-overlapping match count / originalLength
     finalTexts: seq[seq[int]]
     y: seq[float64]
+    originalLengths: seq[int] # fixed across all rewrite stages
 
   Fit = object
     q: seq[seq[float64]] # orthonormal column basis, including intercept
@@ -91,12 +93,12 @@ proc readFloat(s: string, fallback: float64): float64 =
 
 proc parseConfig(): Config =
   result = Config(corpus: "github-code-dataset.txt", outDir: "lens_run",
-    chunks: 65536*4, trainChunks: 8, validChunks: 2, chunkLen: 1500,
+    chunks: 65536*4, trainChunks: 4, validChunks: 2, chunkLen: 1500,
     noiseSteps: 0, steps: 100, maxRules: 24, minNgram: 1,
     maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
     candidates: 384, beamWidth: 4, swapDepth: 3, minGain: 1e-9,
-    ridgeLambda: 0.01, screenRows: 32, screenCandidates: 96,
+    ridgeLambda: 0.1, screenRows: 32, screenCandidates: 96,
     useFingerprint: true, usePrefixCache: true, usePrefixStateCache: true,
     useDeltaSuffix: false, plotEvery: 1,
     cmsWidth: 65536, cmsDepth: 4,
@@ -241,7 +243,9 @@ proc appendDiffusion(rows: var seq[Row], original: seq[int], chunkId: int,
       inc previous
     var snapshot = newSeq[int](data.len)
     for i, v in data: snapshot[i] = v
-    rows.add(Row(text: snapshot, target: 1.0 - float64(changed) / float64(original.len)))
+    rows.add(Row(text: snapshot,
+      target: 1.0 - float64(changed) / float64(original.len),
+      originalLength: original.len))
 
 proc rowsForChunk(corpus: seq[seq[int]], cfg: Config, codec: TokenCodec,
                   chunkId: int, cache: var DiffusionCache): seq[Row] =
@@ -289,9 +293,24 @@ when defined(lensProfile):
     deltaSeconds, deltaRidgeSeconds: float64
   var profileEval: EvaluationCounters
 
+proc sourceLength(row: Row): int {.inline.} =
+  ## Legacy/synthetic Row fixtures omit originalLength; actual diffusion
+  ## rows always record the pre-noise length explicitly.
+  if row.originalLength > 0: row.originalLength else: row.text.len
+
+proc sourceLengths(rows: seq[Row]): seq[int] =
+  result = newSeq[int](rows.len)
+  for i, row in rows:
+    result[i] = sourceLength(row)
+
+proc firingDensity(matches, originalLength: int): float64 {.inline.} =
+  if originalLength <= 0: return 0.0
+  float64(matches) / float64(originalLength)
+
 proc encode(rows: seq[Row], rules: seq[Rule]): Encoded =
   let n = rows.len
   result.y = newSeq[float64](n)
+  result.originalLengths = sourceLengths(rows)
   result.finalTexts = newSeq[seq[int]](n)
   result.cols = newSeq[seq[float64]](rules.len)
   var programs = newSeq[SeqReplaceProgram](rules.len)
@@ -302,7 +321,8 @@ proc encode(rows: seq[Row], rules: seq[Rule]): Encoded =
     result.y[i] = rows[i].target
     var state = rows[i].text
     for j in 0..<rules.len:
-      result.cols[j][i] = float64(applyAndCount(state, programs[j]))
+      result.cols[j][i] = firingDensity(
+        applyAndCount(state, programs[j]), result.originalLengths[i])
     result.finalTexts[i] = state
 
 proc dot(a, b: seq[float64]): float64 {.inline.} =
@@ -901,14 +921,20 @@ proc mayContainPattern(fp: TokenFingerprint, pat: openArray[int]): bool {.inline
   true
 
 proc countFeatures(texts: seq[seq[int]], pat: seq[int],
-                   fingerprints: seq[TokenFingerprint] = @[]): seq[float64] =
+                   fingerprints: seq[TokenFingerprint] = @[],
+                   originalLengths: seq[int] = @[]): seq[float64] =
+  ## Every candidate feature uses the same denominator as encoded rules.
+  ## Production callers pass pre-noise originalLengths, NEVER rewritten size.
+  doAssert originalLengths.len == 0 or originalLengths.len == texts.len
   let compiled = compileSeqPattern(pat, 1)
   result = newSeq[float64](texts.len)
   for i in 0..<texts.len:
     if fingerprints.len == texts.len and
         not mayContainPattern(fingerprints[i], pat):
       continue
-    result[i] = float64(countSeqCompiled(texts[i], compiled))
+    let denominator = (if originalLengths.len == texts.len:
+                         originalLengths[i] else: texts[i].len)
+    result[i] = firingDensity(countSeqCompiled(texts[i], compiled), denominator)
 
 proc miningSampleIndices(n: int, limit = 8): seq[int] =
   ## Sample the ENTIRE rotated diffusion window, not just the untouched
@@ -947,7 +973,9 @@ proc mineWindow(texts: seq[seq[int]], cfg: Config): seq[PatternScore] =
 # Every survivor is still evaluated with exact full-window counts and Ridge.
 proc screenPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
                     candidates: seq[PatternScore],
-                    fingerprints: seq[TokenFingerprint] = @[]): seq[PatternScore] =
+                    fingerprints: seq[TokenFingerprint] = @[],
+                    originalLengths: seq[int] = @[]): seq[PatternScore] =
+  doAssert originalLengths.len == 0 or originalLengths.len == texts.len
   if cfg.screenRows <= 0 or cfg.screenCandidates <= 0 or
       candidates.len <= cfg.screenCandidates or
       fit.residual.len != texts.len:
@@ -965,10 +993,13 @@ proc screenPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
     let pattern = compileSeqPattern(candidate.pat, 1)
     var sumZ, sumZZ, sumZR = 0.0
     for i in indices:
+      let denominator = (if originalLengths.len == texts.len:
+                           originalLengths[i] else: texts[i].len)
       let z = (if fingerprints.len == texts.len and
                   not mayContainPattern(fingerprints[i], candidate.pat):
                  0.0
-               else: float64(countSeqCompiled(texts[i], pattern)))
+               else: firingDensity(
+                 countSeqCompiled(texts[i], pattern), denominator))
       sumZ += z
       sumZZ += z*z
       sumZR += z*fit.residual[i]
@@ -1042,7 +1073,9 @@ proc stageSignature(rules: seq[Rule], stop: int): string =
 proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
                   exclude: seq[Rule], count: int,
                   insertionMode = false,
-                  cache: StageCache = nil, stageKey: string = ""): seq[PatternScore] =
+                  cache: StageCache = nil, stageKey: string = "",
+                  originalLengths: seq[int] = @[]): seq[PatternScore] =
+  doAssert originalLengths.len == 0 or originalLengths.len == texts.len
   if texts.len == 0: return
   when defined(lensProfile):
     let startTime = epochTime()
@@ -1076,7 +1109,8 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
   let fingerprints = (if entry != nil: entry.fingerprints
                       elif cfg.useFingerprint: fingerprintRows(texts)
                       else: newSeq[TokenFingerprint](0))
-  let candidates = screenPatterns(texts, fit, cfg, eligible, fingerprints)
+  let candidates = screenPatterns(texts, fit, cfg, eligible,
+    fingerprints, originalLengths)
   when defined(lensProfile):
     let screenTime = epochTime()
   var scored: seq[PatternScore] = @[]
@@ -1091,11 +1125,17 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
       counts = entry.vectors[candidate.pat]
       inc cache.reusedCounts
     else:
-      counts = countFeatures(texts, candidate.pat, fingerprints)
+      counts = countFeatures(texts, candidate.pat, fingerprints,
+        originalLengths)
       if entry != nil and entry.vectors.len < MaxCachedFeatureVectorsPerPrefix:
         entry.vectors[candidate.pat] = counts
     var actualOccurrences = 0
-    for value in counts: actualOccurrences += int(value)
+    # CMS/replacement-token salts still depend on a RAW integer frequency.
+    # Recover it from the density using the fixed per-row denominator.
+    for i, density in counts:
+      let denominator = (if originalLengths.len == texts.len:
+                           originalLengths[i] else: texts[i].len)
+      actualOccurrences += int(round(density * float64(denominator)))
     if actualOccurrences <= 0: continue
     candidate.frequency = actualOccurrences
     candidate.gain = candidateGain(counts, fit)
@@ -1191,7 +1231,7 @@ proc bestInsertion(rows: seq[Row], existing: seq[Rule], at: int,
   let stageTexts = prefixTexts(rows, existing, at)
   let winners = bestPatterns(stageTexts, baseline.fit, cfg, existing,
                              max(1, keep), true, cache,
-                             stageSignature(existing, at))
+                             stageSignature(existing, at), sourceLengths(rows))
   for candidate in winners:
     # A replacement at the END of the sequence cannot modify downstream
     # feature columns. The block Ridge/OLS append formula gives its exact
@@ -1236,6 +1276,7 @@ proc encodeSuffixForRanking(prefix: Encoded, rules: seq[Rule],
   ## without materializing its rewritten output. This is exact, not a proxy.
   let n = prefix.y.len
   result.y = prefix.y
+  result.originalLengths = prefix.originalLengths
   result.cols = newSeq[seq[float64]](rules.len)
   for j in 0..<prefixLength:
     result.cols[j] = prefix.cols[j]
@@ -1259,12 +1300,14 @@ proc encodeSuffixForRanking(prefix: Encoded, rules: seq[Rule],
     # a fresh output and reassigns state. The cached prefix is immutable.
     var state = prefix.finalTexts[i]
     for offset in 0..<programs.len:
-      result.cols[prefixLength + offset][i] =
-        float64(applyAndCount(state, programs[offset]))
+      result.cols[prefixLength + offset][i] = firingDensity(
+        applyAndCount(state, programs[offset]), prefix.originalLengths[i])
     if state.len <= safeInputLength:
-      result.cols[last][i] = float64(countSeqCompiled(state, lastPattern))
+      result.cols[last][i] = firingDensity(
+        countSeqCompiled(state, lastPattern), prefix.originalLengths[i])
     else:
-      result.cols[last][i] = float64(applyAndCount(state, lastProgram))
+      result.cols[last][i] = firingDensity(
+        applyAndCount(state, lastProgram), prefix.originalLengths[i])
 
 proc cachedRankingPrefix(rows: seq[Row], branches: seq[Branch],
                          prefixLength: int, cache: StageCache): Encoded =
@@ -1347,15 +1390,17 @@ proc initDeltaSuffixWork(rules: seq[Rule], at, n: int): DeltaSuffixWork =
     result.baselineCols[j] = newSeq[float64](n)
 
 proc runDeltaTail(state: var seq[int], cols: var seq[seq[float64]],
-                  colStart, row: int, work: var DeltaSuffixWork) =
+                  colStart, row, originalLength: int, work: var DeltaSuffixWork) =
   for offset in 0..<work.middlePrograms.len:
-    cols[colStart + offset][row] =
-      float64(applyAndCount(state, work.middlePrograms[offset]))
+    cols[colStart + offset][row] = firingDensity(
+      applyAndCount(state, work.middlePrograms[offset]), originalLength)
   let last = colStart + work.middlePrograms.len
   if state.len <= work.lastSafeInputLength:
-    cols[last][row] = float64(countSeqCompiled(state, work.lastPattern))
+    cols[last][row] = firingDensity(
+      countSeqCompiled(state, work.lastPattern), originalLength)
   else:
-    cols[last][row] = float64(applyAndCount(state, work.lastProgram))
+    cols[last][row] = firingDensity(
+      applyAndCount(state, work.lastProgram), originalLength)
 
 proc rankDeltaExchange(prefix: Encoded, branches: seq[Branch],
                        at: int, ridgeLambda: float64): seq[Branch] =
@@ -1383,6 +1428,7 @@ proc rankDeltaExchange(prefix: Encoded, branches: seq[Branch],
         profileEval.deltaRowsScanned += n
     var encoded: Encoded
     encoded.y = prefix.y
+    encoded.originalLengths = prefix.originalLengths
     encoded.cols = newSeq[seq[float64]](totalRules)
     for j in 0..<at:
       encoded.cols[j] = prefix.cols[j]
@@ -1392,11 +1438,12 @@ proc rankDeltaExchange(prefix: Encoded, branches: seq[Branch],
                                            b.rules[at].rhs, 1)
     for i in 0..<n:
       let hits = counts[i]
-      encoded.cols[at][i] = float64(hits)
+      encoded.cols[at][i] = firingDensity(hits, prefix.originalLengths[i])
       if hits == 0:
         if not work.baselineReady[i]:
           var state = prefix.finalTexts[i]
-          runDeltaTail(state, work.baselineCols, 0, i, work)
+          runDeltaTail(state, work.baselineCols, 0, i,
+            prefix.originalLengths[i], work)
           work.baselineReady[i] = true
           when defined(lensProfile):
             inc profileEval.deltaBaselineBuilds
@@ -1410,7 +1457,8 @@ proc rankDeltaExchange(prefix: Encoded, branches: seq[Branch],
         when defined(lensDebug):
           doAssert observed == hits # independent count/rewrite equivalence
         discard observed
-        runDeltaTail(state, encoded.cols, at + 1, i, work)
+        runDeltaTail(state, encoded.cols, at + 1, i,
+          prefix.originalLengths[i], work)
         when defined(lensProfile):
           inc profileEval.deltaMatchedRows
     var scored = b
@@ -1565,7 +1613,8 @@ proc attemptAddition(rows: seq[Row], base: Branch, cfg: Config,
   let best = bestPatterns(enc.finalTexts, fit, cfg, base.rules,
                           cfg.beamWidth, false,
                           (if cfg.usePrefixCache: cache else: nil),
-                          stageSignature(base.rules, base.rules.len))
+                          stageSignature(base.rules, base.rules.len),
+                          enc.originalLengths)
   for c in best:
     # Adding a LAST rule affects only its own count column on this window.
     # Its RHS has no influence until later rules are appended. Reuse the
@@ -1867,7 +1916,7 @@ proc selfTest() =
   let span = @[va, 300, 100, 200, vb]
   let expectedSpans = @[
     @[300, 100, 200], @[100, 200, 300],
-    @[200, 100, 300], @[2, 0, 1]]
+    @[200, 100, 300], @[300, 200, 100]]
   for opIndex, variant in variants:
     var input = span
     var compiledOp = compileSeqReplaceProgram(variant.pat, variant.rhs, 1)
@@ -2030,6 +2079,8 @@ proc selfTest() =
   appendDiffusion(diffused, hashed[0], 0, tinyCfg, codec)
   doAssert diffused.len == hashed[0].len + 1
   doAssert diffused[0].text == hashed[0]
+  for row in diffused:
+    doAssert row.originalLength == hashed[0].len
   for stage, row in diffused:
     var changedPositions = 0
     for i, value in row.text:
@@ -2062,13 +2113,43 @@ proc selfTest() =
   except ValueError:
     failedAsExpected = true
   doAssert failedAsExpected
+  # Firing density always uses PRE-NOISE source length, even when the
+  # actual (rewritten) text has expanded. Verify fast suffix and delta paths.
+  let rateRows = @[
+    Row(text: @[71, 71, 71, 71], target: 1.0, originalLength: 10),
+    Row(text: @[71, 71], target: 0.0, originalLength: 20)]
+  let rateRule = Rule(pat: @[71], rhs: @[81, 82, 83])
+  let rateNext = Rule(pat: @[81], rhs: @[91])
+  let rateEnc = encode(rateRows, @[rateRule, rateNext])
+  doAssert abs(rateEnc.cols[0][0] - 0.4) < 1e-12
+  doAssert abs(rateEnc.cols[0][1] - 0.1) < 1e-12
+  doAssert abs(rateEnc.cols[1][0] - 0.4) < 1e-12
+  doAssert abs(rateEnc.cols[1][1] - 0.1) < 1e-12
+  let rateCounts = countFeatures(rateEnc.finalTexts, @[91], @[],
+    rateEnc.originalLengths)
+  doAssert abs(rateCounts[0] - 0.4) < 1e-12
+  doAssert abs(rateCounts[1] - 0.1) < 1e-12
+  let rateSuffix = encodeSuffixForRanking(encode(rateRows, @[rateRule]),
+    @[rateRule, rateNext], 1)
+  doAssert rateSuffix.cols == rateEnc.cols
+  let rateBranches = @[
+    Branch(rules: @[rateRule, rateNext], editedAt: 0),
+    Branch(rules: @[Rule(pat: @[71], rhs: @[81, 82, 83, 84]), rateNext],
+      editedAt: 0)]
+  for lam in [0.0, 0.1]:
+    let directRates = rankBranches(rateRows, rateBranches, 2, lam)
+    let cachedRates = rankBranches(rateRows, rateBranches, 2, lam,
+      nil, true, true)
+    doAssert directRates.len == cachedRates.len
+    for i in 0..<directRates.len:
+      doAssert abs(directRates[i].score - cachedRates[i].score) < 1e-9
   # Rule 2 MUST receive the output of rule 1 (never the pre-rule row).
   let chainRules = @[
     Rule(pat: @[codec.alphabet[65]], rhs: @[fresh]),
     Rule(pat: @[fresh], rhs: @[fresh + 1])]
   let chained = encode(@[Row(text: hashed[0], target: 1.0)], chainRules)
-  doAssert chained.cols[0][0] == 4.0
-  doAssert chained.cols[1][0] == 4.0
+  doAssert abs(chained.cols[0][0] - 4.0 / float64(hashed[0].len)) < 1e-12
+  doAssert abs(chained.cols[1][0] - 4.0 / float64(hashed[0].len)) < 1e-12
   doAssert chained.finalTexts[0][0] == fresh + 1
   # Captures may still be transformed via sort/reverse/inverse_sort.
   echo "Numerical Ridge/OLS, width-4 beam, add/replace policy, alternating RHS, tokenization, diffusion and sequential-rewrite self-tests passed"
