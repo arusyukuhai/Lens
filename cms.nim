@@ -110,7 +110,7 @@ proc parseConfig(): Config =
     maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
     candidates: 384, beamWidth: 4, swapDepth: 3, minGain: 1e-9,
-    ridgeLambda: 0.1, coarsePower: 2.0, finePower: 1.5, evalPower: 1.0,
+    ridgeLambda: 0.0005, coarsePower: 2.0, finePower: 1.5, evalPower: 1.0,
     fineTop: 12, evalEvery: 1,
     screenRows: 32, screenCandidates: 96,
     progressive: true, progressiveStart: 64, progressiveKeep: 24,
