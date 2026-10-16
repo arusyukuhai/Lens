@@ -13,6 +13,9 @@ type
     coarsePower, finePower, evalPower: float64 # union: floor(k^power) + floor(k*L^(1-1/power)) schedules
     fineTop, evalEvery: int # Fine-select EVERY generation; diagnostics each evalEvery
     screenRows, screenCandidates, plotEvery: int # 0 disables respective work
+    progressive: bool # Online residual-Pearson candidate survival before exact count
+    progressiveStart, progressiveKeep: int
+    progressiveFactor: float64 # fraction of survivors per successive checkpoint
     cmsWidth, cmsDepth: int
     useFingerprint: bool # exact no-false-negative match rejection
     usePairFingerprint: bool # reject absent mandatory adjacent literal pairs
@@ -102,14 +105,16 @@ proc readFloat(s: string, fallback: float64): float64 =
 
 proc parseConfig(): Config =
   result = Config(corpus: "github-code-dataset.txt", outDir: "lens_run",
-    chunks: 65536*4, trainChunks: 8, validChunks: 2, chunkLen: 1500,
+    chunks: 65536*4, trainChunks: 32, validChunks: 3, chunkLen: 1500,
     noiseSteps: 0, steps: 100, maxRules: 24, minNgram: 1,
     maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
     candidates: 384, beamWidth: 4, swapDepth: 3, minGain: 1e-9,
-    ridgeLambda: 0.01, coarsePower: 2.0, finePower: 1.333, evalPower: 2.0,
+    ridgeLambda: 0.1, coarsePower: 2.0, finePower: 1.5, evalPower: 1.0,
     fineTop: 12, evalEvery: 1,
     screenRows: 32, screenCandidates: 96,
+    progressive: true, progressiveStart: 64, progressiveKeep: 24,
+    progressiveFactor: 0.5,
     useFingerprint: true, usePairFingerprint: true,
     usePrefixCache: true, usePrefixStateCache: true,
     useDeltaSuffix: true, plotEvery: 1,
@@ -132,6 +137,9 @@ proc parseConfig(): Config =
       echo "--mine-tracked=N --candidates=N --beam=N --swap-depth=N"
       echo "--ridge-lambda=0.1 (standardized predictors; 0=legacy OLS)"
       echo "--screen-rows=32 --screen-candidates=96 (0 disables; approximate screen)"
+      echo "--progressive=1 --progressive-start=64 --progressive-keep=24"
+      echo "--progressive-factor=0.5 (online Pearson, halve survivors each checkpoint)"
+      echo "Progressive is heuristic; 0 restores previous exact candidate scoring"
       echo "--fingerprint=1 --pair-fingerprint=1 (no-false-negative token and adjacent-pair filters)"
       echo "--prefix-cache=1 (0 disables; compare old per-parent mining/counting)"
       echo "--prefix-state-cache=1 (0 disables; compare full re-encoding for swaps)"
@@ -177,6 +185,10 @@ proc parseConfig(): Config =
     of "ridge-lambda": result.ridgeLambda = readFloat(val, result.ridgeLambda)
     of "screen-rows": result.screenRows = readInt(val, result.screenRows)
     of "screen-candidates": result.screenCandidates = readInt(val, result.screenCandidates)
+    of "progressive": result.progressive = readInt(val, 1) != 0
+    of "progressive-start": result.progressiveStart = readInt(val, result.progressiveStart)
+    of "progressive-keep": result.progressiveKeep = readInt(val, result.progressiveKeep)
+    of "progressive-factor": result.progressiveFactor = readFloat(val, result.progressiveFactor)
     of "fingerprint": result.useFingerprint = readInt(val, 1) != 0
     of "pair-fingerprint": result.usePairFingerprint = readInt(val, 1) != 0
     of "prefix-cache": result.usePrefixCache = readInt(val, 1) != 0
@@ -225,6 +237,11 @@ proc parseConfig(): Config =
   result.swapDepth = max(1, result.swapDepth)
   result.screenRows = max(0, result.screenRows)
   result.screenCandidates = max(0, result.screenCandidates)
+  result.progressiveStart = max(3, result.progressiveStart)
+  result.progressiveKeep = max(1, result.progressiveKeep)
+  if classify(result.progressiveFactor) in {fcNan, fcInf, fcNegInf} or
+      result.progressiveFactor <= 0.0 or result.progressiveFactor >= 1.0:
+    quit("--progressive-factor must be finite and in (0,1)", 1)
   result.plotEvery = max(0, result.plotEvery)
   if result.cmsWidth <= 0 or (result.cmsWidth and (result.cmsWidth - 1)) != 0 or
       result.cmsWidth > 1048576 or result.cmsDepth < 1 or result.cmsDepth > 8:
@@ -1255,6 +1272,189 @@ type
     prefixOrder: seq[string]
     prefixTokenElements: int
 
+# Online residual correlation is a screening proxy ONLY. Each pair (new
+# diffusion row, candidate firing density) updates moments in O(1); the
+# matching work dominates. Final survivors still receive their exact
+# full-window Ridge/OLS scores. These snapshots are correlated and the
+# pruning is NOT a statistical proof or a bound on final Ridge gain.
+type
+  OnlinePearson = object
+    n: int
+    meanX, meanY, m2X, m2Y, cross: float64
+
+proc observe(s: var OnlinePearson, x, y: float64) {.inline.} =
+  inc s.n
+  let dx = x - s.meanX
+  let dy = y - s.meanY
+  s.meanX += dx / float64(s.n)
+  s.meanY += dy / float64(s.n)
+  s.m2X += dx*(x - s.meanX)
+  s.m2Y += dy*(y - s.meanY)
+  s.cross += dx*(y - s.meanY)
+
+proc proxyCorrelation(s: OnlinePearson): float64 {.inline.} =
+  if s.n < 3 or s.m2X <= 1e-24 or s.m2Y <= 1e-24: return 0.0
+  result = min(1.0, abs(s.cross) / sqrt(s.m2X*s.m2Y))
+
+proc progressiveRowOrder(n: int): seq[int] =
+  ## Breadth-first bisection evenly covers ALL chunks and noise rates from
+  ## the first checkpoints. No rows are ever repeated.
+  if n <= 0: return
+  type Segment = tuple[lo, hi: int]
+  var queue: seq[Segment] = @[(0, n)]
+  var at = 0
+  while at < queue.len:
+    let segment = queue[at]
+    inc at
+    if segment.lo >= segment.hi: continue
+    let mid = segment.lo + (segment.hi-segment.lo) div 2
+    result.add(mid)
+    if segment.lo < mid: queue.add((segment.lo, mid))
+    if mid+1 < segment.hi: queue.add((mid+1, segment.hi))
+
+type
+  ProgressiveSamples = object
+    # Sampled row positions are common to all final survivors, and their
+    # values were already measured for their incremental correlations.
+    indices: seq[int]
+    values: seq[seq[float64]] # parallel to survivor candidates
+
+  ProgressiveInfo = object
+    survivors, sampledRows, examinedPairs, fullPairs: int
+    pruned, checkpoints, filterSkips, reusedPairs: int
+
+proc progressiveSurvivors(texts: seq[seq[int]], fit: Fit, cfg: Config,
+                         candidates: seq[PatternScore],
+                         fingerprints: seq[RowFingerprint],
+                         originalLengths: seq[int],
+                         entry: StageEntry, minKeep: int,
+                         stats: var ProgressiveInfo,
+                         samples: var ProgressiveSamples): seq[PatternScore] =
+  let n = texts.len
+  stats.fullPairs = n*candidates.len
+  stats.survivors = candidates.len
+  if not cfg.progressive or n < cfg.progressiveStart or
+      candidates.len <= max(cfg.progressiveKeep, minKeep) or
+      fit.residual.len != n: return candidates
+  doAssert originalLengths.len == 0 or originalLengths.len == n
+  let keep = min(candidates.len, max(cfg.progressiveKeep, minKeep))
+  # If a candidate had been measured on all rows by a sibling parent,
+  # access its exact count vector instead of matching any new text.
+  var programs = newSeq[SeqPattern](candidates.len)
+  var cached = newSeq[seq[float64]](candidates.len)
+  var hasCached = newSeq[bool](candidates.len)
+  for j, c in candidates:
+    if entry != nil and entry.vectors.hasKey(c.pat):
+      cached[j] = entry.vectors[c.pat]
+      hasCached[j] = true
+    else:
+      programs[j] = compileSeqPattern(c.pat, 1)
+  var active: seq[int] = @[]
+  for j in 0..<candidates.len: active.add(j)
+  var online = newSeq[OnlinePearson](candidates.len)
+  var measured = newSeq[seq[float64]](candidates.len)
+  let order = progressiveRowOrder(n)
+  var consumed = 0
+  var checkpoint = min(n, cfg.progressiveStart)
+  while consumed < n and active.len > keep:
+    let untilRow = min(n, checkpoint)
+    for q in consumed..<untilRow:
+      let i = order[q]
+      for j in active:
+        var x = 0.0
+        if hasCached[j]:
+          x = cached[j][i]
+          inc stats.reusedPairs
+        elif fingerprints.len == n and
+            not mayContainPattern(fingerprints[i], candidates[j].pat,
+                                  cfg.usePairFingerprint):
+          inc stats.filterSkips
+        else:
+          let length = (if originalLengths.len == n:
+                          originalLengths[i] else: texts[i].len)
+          x = firingDensity(countSeqCompiled(texts[i], programs[j]), length)
+        online[j].observe(x, fit.residual[i])
+        measured[j].add(x)
+        inc stats.examinedPairs
+    consumed = untilRow
+    stats.sampledRows = consumed
+    if active.len <= keep: break
+    # Reserve some survival capacity for frequent candidates, to prevent
+    # residual-only selection from deleting rare downstream-valuable RHSs.
+    type Ranked = tuple[index: int, proxy: float64]
+    var ranked: seq[Ranked] = @[]
+    for j in active: ranked.add((j, online[j].proxyCorrelation))
+    ranked.sort(proc(a,b: Ranked): int =
+      let c = cmp(b.proxy, a.proxy)
+      if c != 0: return c
+      let f = cmp(candidates[b.index].frequency, candidates[a.index].frequency)
+      if f != 0: return f
+      cmp(a.index, b.index))
+    var nextCount = max(keep, int(ceil(float64(active.len)*cfg.progressiveFactor)))
+    if nextCount >= active.len:
+      nextCount = active.len-1
+    if nextCount < keep: nextCount = keep
+    let frequencySlots = min(nextCount div 8, nextCount-1)
+    var selected = newSeq[bool](candidates.len)
+    for k in 0..<min(nextCount-frequencySlots, ranked.len):
+      selected[ranked[k].index] = true
+    var byFrequency = ranked
+    byFrequency.sort(proc(a,b: Ranked): int =
+      let f = cmp(candidates[b.index].frequency, candidates[a.index].frequency)
+      if f != 0: return f
+      let sc = cmp(b.proxy, a.proxy)
+      if sc != 0: return sc
+      cmp(a.index, b.index))
+    var retained = nextCount - frequencySlots
+    for e in byFrequency:
+      if retained >= nextCount: break
+      if not selected[e.index]:
+        selected[e.index] = true
+        inc retained
+    var nextActive: seq[int] = @[]
+    for j in active:
+      if selected[j]: nextActive.add(j)
+    stats.pruned += active.len-nextActive.len
+    inc stats.checkpoints
+    active = nextActive
+    if consumed == n: break
+    checkpoint = min(n, max(checkpoint+1, checkpoint*2))
+  if consumed > 0:
+    samples.indices = order[0..<consumed]
+  for j in active:
+    result.add(candidates[j])
+    samples.values.add(measured[j])
+    doAssert measured[j].len == consumed
+  stats.survivors = result.len
+
+proc countWithProgressiveSamples(texts: seq[seq[int]], pat: seq[int],
+                                fingerprints: seq[RowFingerprint],
+                                originalLengths: seq[int],
+                                indices: seq[int], samples: seq[float64],
+                                checkPairs: bool,
+                                profileSkipped: ptr[int] = nil): seq[float64] =
+  ## Exact full vector, but reuse already-matched rows for surviving
+  ## candidates. The fingerprint can only reject an impossible match.
+  doAssert indices.len == samples.len
+  doAssert originalLengths.len == 0 or originalLengths.len == texts.len
+  let compiled = compileSeqPattern(pat, 1)
+  result = newSeq[float64](texts.len)
+  var measured = newSeq[bool](texts.len)
+  for k, i in indices:
+    doAssert i >= 0 and i < texts.len and not measured[i]
+    measured[i] = true
+    result[i] = samples[k]
+  for i in 0..<texts.len:
+    if measured[i]: continue
+    if fingerprints.len == texts.len and
+        not mayContainPattern(fingerprints[i], pat, checkPairs):
+      when defined(lensProfile):
+        if profileSkipped != nil: inc profileSkipped[]
+      continue
+    let length = (if originalLengths.len == texts.len:
+                    originalLengths[i] else: texts[i].len)
+    result[i] = firingDensity(countSeqCompiled(texts[i], compiled), length)
+
 proc stageSignature(rules: seq[Rule], stop: int): string =
   ## Prefix rules completely determine their rewritten diffusion rows,
   ## within one step. The integers are serialized without hash collisions.
@@ -1301,8 +1501,13 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
   let fingerprints = (if entry != nil: entry.fingerprints
                       elif cfg.useFingerprint: fingerprintRows(texts, cfg.usePairFingerprint)
                       else: newSeq[RowFingerprint](0))
-  let candidates = screenPatterns(texts, fit, cfg, eligible,
+  let screened = screenPatterns(texts, fit, cfg, eligible,
     fingerprints, originalLengths)
+  var progressiveInfo: ProgressiveInfo
+  var progressiveSamples: ProgressiveSamples
+  let candidates = progressiveSurvivors(texts, fit, cfg, screened,
+    fingerprints, originalLengths, entry, max(count, cfg.beamWidth),
+    progressiveInfo, progressiveSamples)
   when defined(lensProfile):
     let screenTime = epochTime()
   var scored: seq[PatternScore] = @[]
@@ -1314,22 +1519,29 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
   # mid-chain scores remain heuristic.
   # At mid-chain insertion the candidate also changes downstream count
   # columns, so the candidate ranking is a HEURISTIC, not a rejection test.
-  for originalCandidate in candidates:
+  for scoredCandidateIndex, originalCandidate in candidates:
     var candidate = originalCandidate
     var counts: seq[float64]
     if entry != nil and entry.vectors.hasKey(candidate.pat):
       counts = entry.vectors[candidate.pat]
       inc cache.reusedCounts
     else:
+      # Every survivor has already been matched on the SAME progressively
+      # sampled rows. Reuse those counts; visit only the remaining rows.
+      let priorIndices = progressiveSamples.indices
+      let priorCounts = (if progressiveSamples.values.len == candidates.len:
+                           progressiveSamples.values[scoredCandidateIndex]
+                         else: newSeq[float64](0))
       when defined(lensProfile):
-        countedExactRows += texts.len
+        countedExactRows += texts.len - priorIndices.len
         let countStart = epochTime()
-        counts = countFeatures(texts, candidate.pat, fingerprints,
-          originalLengths, addr skippedExactRows, cfg.usePairFingerprint)
+        counts = countWithProgressiveSamples(texts, candidate.pat, fingerprints,
+          originalLengths, priorIndices, priorCounts, cfg.usePairFingerprint,
+          addr skippedExactRows)
         exactCountSeconds += epochTime() - countStart
       else:
-        counts = countFeatures(texts, candidate.pat, fingerprints,
-          originalLengths, checkPairs = cfg.usePairFingerprint)
+        counts = countWithProgressiveSamples(texts, candidate.pat, fingerprints,
+          originalLengths, priorIndices, priorCounts, cfg.usePairFingerprint)
       if entry != nil and entry.vectors.len < MaxCachedFeatureVectorsPerPrefix:
         entry.vectors[candidate.pat] = counts
     var actualOccurrences = 0
@@ -1358,7 +1570,14 @@ proc bestPatterns(texts: seq[seq[int]], fit: Fit, cfg: Config,
       "s screen=", screenTime-mineTime,
       "s exact=", epochTime()-screenTime,
       "s mined=", mined.len, " eligible=", eligible.len,
+      " screened_candidates=", screened.len,
       " exact_candidates=", candidates.len,
+      " progressive_pruned=", progressiveInfo.pruned,
+      " progressive_rows=", progressiveInfo.sampledRows,
+      " progressive_pairs=", progressiveInfo.examinedPairs,
+      " progressive_full_pairs=", progressiveInfo.fullPairs,
+      " progressive_reused_pairs=", progressiveInfo.reusedPairs,
+      " progressive_checkpoints=", progressiveInfo.checkpoints,
       " tokens=", totalTokens, " max_row=", maxTokens,
       " prefix_cache=", (if entry != nil: "on" else: "off"),
       " reused_mine=", (if cache != nil: cache.reusedMining else: 0),
@@ -2062,6 +2281,76 @@ proc selfTest() =
               @[17, 23], @[9999999], @[100000, -1, 23]]:
     doAssert countFeatures(diverseTexts, pat) ==
       countFeatures(diverseTexts, pat, largeFingerprints)
+  # Progressive ordering covers every row exactly once and samples
+  # distributed positions before visiting adjacent diffusion stages.
+  for n in [1, 2, 3, 7, 8, 16, 17, 41, 256]:
+    let sampleOrder = progressiveRowOrder(n)
+    doAssert sampleOrder.len == n
+    var visited = newSeq[bool](n)
+    for index in sampleOrder:
+      doAssert index >= 0 and index < n and not visited[index]
+      visited[index] = true
+    for seen in visited: doAssert seen
+  var moments: OnlinePearson
+  moments.observe(1.0, 1.0)
+  moments.observe(2.0, 2.0)
+  moments.observe(3.0, 3.0)
+  doAssert abs(moments.proxyCorrelation - 1.0) < 1e-12
+  var testTexts: seq[seq[int]] = @[]
+  var testY: seq[float64] = @[]
+  for i in 0..<96:
+    testTexts.add(@[(if i mod 2 == 0: 100 else: 200),
+                    (if i mod 3 == 0: 300 else: 400)])
+    testY.add(float64(i mod 2))
+  let testFit = ols(@[], testY, false)
+  let testCandidates = @[
+    PatternScore(pat: @[100], frequency: 48),
+    PatternScore(pat: @[200], frequency: 48),
+    PatternScore(pat: @[300], frequency: 32),
+    PatternScore(pat: @[400], frequency: 64),
+    PatternScore(pat: @[999], frequency: 1)]
+  let testFP = fingerprintRows(testTexts)
+  var progressiveCfg = Config(progressive: true, progressiveStart: 12,
+    progressiveKeep: 2, progressiveFactor: 0.5, usePairFingerprint: true)
+  var pruningInfo: ProgressiveInfo
+  var pruningSamples: ProgressiveSamples
+  let survivors = progressiveSurvivors(testTexts, testFit, progressiveCfg,
+    testCandidates, testFP, @[], nil, 2, pruningInfo, pruningSamples)
+  doAssert pruningSamples.indices.len == pruningInfo.sampledRows
+  for j, survivor in survivors:
+    let restored = countWithProgressiveSamples(testTexts, survivor.pat,
+      testFP, @[], pruningSamples.indices, pruningSamples.values[j], true)
+    doAssert restored == countFeatures(testTexts, survivor.pat, testFP)
+  doAssert survivors.len == 2
+  doAssert pruningInfo.pruned == 3
+  doAssert pruningInfo.examinedPairs < pruningInfo.fullPairs
+  doAssert pruningInfo.sampledRows < testTexts.len
+  var keptCorrelated = false
+  for candidate in survivors:
+    if candidate.pat == @[100] or candidate.pat == @[200]:
+      keptCorrelated = true
+  doAssert keptCorrelated
+  progressiveCfg.progressive = false
+  var bypassInfo: ProgressiveInfo
+  var bypassSamples: ProgressiveSamples
+  doAssert progressiveSurvivors(testTexts, testFit, progressiveCfg,
+    testCandidates, testFP, @[], nil, 2, bypassInfo, bypassSamples).len ==
+    testCandidates.len
+  # When a sibling has already produced a full vector, progressive proxy
+  # scores must be the SAME; cached counts are not rewritten or estimated.
+  let tinyEntry = StageEntry(vectors: initTable[seq[int], seq[float64]]())
+  for c in testCandidates:
+    tinyEntry.vectors[c.pat] = countFeatures(testTexts, c.pat, testFP)
+  progressiveCfg.progressive = true
+  var cachedInfo: ProgressiveInfo
+  var cachedSamples: ProgressiveSamples
+  let cachedSurvivors = progressiveSurvivors(testTexts, testFit,
+    progressiveCfg, testCandidates, testFP, @[], tinyEntry, 2, cachedInfo,
+    cachedSamples)
+  doAssert cachedSurvivors.len == survivors.len
+  doAssert cachedInfo.reusedPairs > 0
+  for i in 0..<survivors.len:
+    doAssert cachedSurvivors[i].pat == survivors[i].pat
   # Screening is identity when disabled or when the shortlist is small.
   let screenCfg = Config(screenRows: 3, screenCandidates: 2)
   let screenTexts = @[@[11], @[22], @[22], @[33]]
@@ -2565,6 +2854,8 @@ proc main() =
   stderr.writeLine("[coarse-fine] power=", cfg.coarsePower,
     " finePower=", cfg.finePower, " fineTop=", cfg.fineTop,
     " evalPower=", cfg.evalPower, " evalEvery=", cfg.evalEvery,
+    " progressive=", cfg.progressive, " progressiveStart=", cfg.progressiveStart,
+    " progressiveKeep=", cfg.progressiveKeep,
     " fineEvery=1 endpoints=0,N")
   let plotPath = cfg.outDir / "training.dat"
   writeFile(plotPath, "# step train_nlog1mpearson heldout_nlog1mpearson rules train_pearson heldout_pearson seconds train_ma15_nlog1mpearson heldout_ma15_nlog1mpearson\n")
