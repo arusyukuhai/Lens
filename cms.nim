@@ -105,7 +105,7 @@ proc readFloat(s: string, fallback: float64): float64 =
 
 proc parseConfig(): Config =
   result = Config(corpus: "github-code-dataset.txt", outDir: "lens_run",
-    chunks: 65536*4, trainChunks: 4, validChunks: 3, chunkLen: 1500,
+    chunks: 65536*4, trainChunks: 6, validChunks: 3, chunkLen: 1500,
     noiseSteps: 0, steps: 100, maxRules: 24, minNgram: 1,
     maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
@@ -2158,7 +2158,7 @@ proc plotMeasure(r: float64): float64 =
 # Fixed-width, trailing moving average of the *raw Pearson* coefficients.
 # Maintain the sum in O(1), rather than rereading training.dat every step.
 # For the first 14 steps use all observations available so far.
-const MovingAverageWidth = 15
+const MovingAverageWidth = 75
 
 type PearsonMovingAverage = object
   values: array[MovingAverageWidth, float64]
@@ -2193,8 +2193,8 @@ set style line 3 lc rgb '#3265c9' lw 3.0
 set style line 4 lc rgb '#189567' lw 3.0
 plot 'training.dat' using 1:2 with linespoints ls 1 title 'Train (raw)', \
      'training.dat' using 1:3 with linespoints ls 2 title 'Held-out (raw)', \
-     'training.dat' using 1:8 with lines ls 3 title 'Train (Pearson MA15)', \
-     'training.dat' using 1:9 with lines ls 4 title 'Held-out (Pearson MA15)'
+     'training.dat' using 1:8 with lines ls 3 title 'Train (Pearson MA75)', \
+     'training.dat' using 1:9 with lines ls 4 title 'Held-out (Pearson MA75)'
 """
   let regressionName = (if ridgeLambda > 0.0:
     "Ridge count-rule search" else: "OLS count-rule search")
@@ -2858,7 +2858,7 @@ proc main() =
     " progressiveKeep=", cfg.progressiveKeep,
     " fineEvery=1 endpoints=0,N")
   let plotPath = cfg.outDir / "training.dat"
-  writeFile(plotPath, "# step train_nlog1mpearson heldout_nlog1mpearson rules train_pearson heldout_pearson seconds train_ma15_nlog1mpearson heldout_ma15_nlog1mpearson\n")
+  writeFile(plotPath, "# step train_nlog1mpearson heldout_nlog1mpearson rules train_pearson heldout_pearson seconds train_ma25_nlog1mpearson heldout_ma25_nlog1mpearson\n")
   var trainMA, heldoutMA: PearsonMovingAverage
   for step in 0..<cfg.steps:
     let tick = epochTime()
@@ -3011,7 +3011,7 @@ proc main() =
       let elapsed = epochTime() - tick
       let trainMetric = plotMeasure(evaluated.fit.pearson)
       let valMetric = plotMeasure(valPearson)
-      # MA15 is over the last 15 *evaluation checkpoints*, NOT 15 steps.
+      # MA25 is over the last 25 *evaluation checkpoints*, NOT 25 steps.
       let trainSmoothed = plotMeasure(trainMA.addPearson(evaluated.fit.pearson))
       let valSmoothed = plotMeasure(heldoutMA.addPearson(valPearson))
       let logLine = $step & " " & $trainMetric & " " & $valMetric & " " &

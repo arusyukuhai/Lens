@@ -14,5 +14,5 @@ set style line 3 lc rgb '#3265c9' lw 3.0
 set style line 4 lc rgb '#189567' lw 3.0
 plot 'training.dat' using 1:2 with linespoints ls 1 title 'Train (raw)', \
      'training.dat' using 1:3 with linespoints ls 2 title 'Held-out (raw)', \
-     'training.dat' using 1:8 with lines ls 3 title 'Train (Pearson MA15)', \
-     'training.dat' using 1:9 with lines ls 4 title 'Held-out (Pearson MA15)'
+     'training.dat' using 1:8 with lines ls 3 title 'Train (Pearson MA75)', \
+     'training.dat' using 1:9 with lines ls 4 title 'Held-out (Pearson MA75)'
