@@ -1,3 +1,0 @@
-fixed_reference_LOO=0.999954337863899
-generation=736
-reference_chunk_ids=35998,36930,52271,21476

@@ -1,7 +1,0 @@
-{"step": 0, "sequence_nll": 6.239574410749029, "entropy_penalty": 0.9996786113928959, "entropy_coefficient": 0.0, "decoded_training_errors": 3, "pattern_expected_length": 1.4899757004525696, "replacement_expected_length": 1.0109974940786866}
-{"step": 100, "sequence_nll": 0.05425145501611845, "entropy_penalty": 0.049026507150797864, "entropy_coefficient": 0.0, "decoded_training_errors": 0, "pattern_expected_length": 2.977176868016663, "replacement_expected_length": 1.984437068420292}
-{"step": 200, "sequence_nll": 0.02357632483722161, "entropy_penalty": 0.024055101449371494, "entropy_coefficient": 0.025, "decoded_training_errors": 0, "pattern_expected_length": 2.990085837596319, "replacement_expected_length": 1.9933052691793145}
-{"step": 300, "sequence_nll": 0.013456463097102711, "entropy_penalty": 0.014749146519922155, "entropy_coefficient": 0.05, "decoded_training_errors": 0, "pattern_expected_length": 2.994362662265519, "replacement_expected_length": 1.996220670471773}
-{"step": 400, "sequence_nll": 0.008849250384616774, "entropy_penalty": 0.010197330588824284, "entropy_coefficient": 0.05, "decoded_training_errors": 0, "pattern_expected_length": 2.9963030422843615, "replacement_expected_length": 1.9975327608252456}
-{"hessian_vector_norm": 0.0076022641405270736}
-{"discrete_pattern": [97, -1, 98], "discrete_replacement": [-1, -1], "all_training_examples_exact": true}

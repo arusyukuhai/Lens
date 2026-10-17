@@ -1,3 +1,0 @@
-{"iteration": 0, "warmup": true, "seconds": 9.487498253000012, "loss": 0.00038861556095071137}
-{"iteration": 1, "warmup": false, "seconds": 9.07003103399984, "loss": 0.00038861556095071137}
-{"settings": {"device": "cpu", "rules": 1500, "hidden": 2048, "length": 16, "batch": 2, "max_capture": 1, "checkpoint_every": 25, "iterations": 1, "threads": 1, "output": "lens_gpu/serial1500_cpu.json"}, "device": "cpu", "torch": "2.14.1+cpu", "seconds": [9.07003103399984], "rows_per_second": 0.22050641199603588, "first_rule_grad_norm": 3.470688702254289e-14, "last_rule_grad_norm": 6.881297615057846e-11, "parameters": 19069099}

@@ -1,9 +1,0 @@
-{"phase": "curriculum", "layer": 0, "step": 0, "loss": 0.8200235366821289, "probabilities": [0.33623892068862915, 0.3401491343975067, 0.3236119747161865]}
-{"phase": "curriculum", "layer": 0, "step": 79, "loss": 0.0011705808574333787, "probabilities": [0.0020873798057436943, 0.997890055179596, 2.259496795886662e-05]}
-{"phase": "curriculum", "layer": 1, "step": 0, "loss": 0.8200235366821289, "probabilities": [0.34569618105888367, 0.3276538550853729, 0.3266499638557434]}
-{"phase": "curriculum", "layer": 1, "step": 79, "loss": 0.0011643891921266913, "probabilities": [0.999854564666748, 7.287273911060765e-05, 7.254746742546558e-05]}
-{"phase": "curriculum", "layer": 2, "step": 0, "loss": 12.12662124633789, "probabilities": [0.4280516505241394, 0.2819434106349945, 0.2900049090385437]}
-{"phase": "curriculum", "layer": 2, "step": 79, "loss": 0.0015027632471174002, "probabilities": [5.184504698263481e-05, 0.4929121434688568, 0.507036030292511]}
-{"phase": "end_to_end", "step": 0, "loss": 0.0014701493782922626}
-{"phase": "end_to_end", "step": 39, "loss": 0.0009017306729219854}
-{"training_seconds": 54.21542941200005, "held_out_exact": 6, "held_out_total": 6, "soft_held_out": [{"input_bytes": 1057, "noise": 0.001, "loss": 0.0009013991220854223, "position_accuracy": 1.0, "predicted_length": 1216.000244140625, "true_length": 1216}, {"input_bytes": 1057, "noise": 0.01, "loss": 0.008730168454349041, "position_accuracy": 1.0, "predicted_length": 1216.000244140625, "true_length": 1216}, {"input_bytes": 1057, "noise": 0.1, "loss": 0.09118816256523132, "position_accuracy": 1.0, "predicted_length": 1215.998779296875, "true_length": 1216}, {"input_bytes": 4122, "noise": 0.1, "loss": 0.0909091904759407, "position_accuracy": 1.0, "predicted_length": 4754.99658203125, "true_length": 4755}, {"input_bytes": 16413, "noise": 0.1, "loss": 0.09100820124149323, "position_accuracy": 1.0, "predicted_length": 18939.984375, "true_length": 18940}]}

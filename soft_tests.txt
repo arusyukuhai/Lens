@@ -1,9 +1,0 @@
-test_full_layer_derivatives (__main__.Tests.test_full_layer_derivatives) ... ok
-test_hard_rules (__main__.Tests.test_hard_rules) ... ok
-test_scan_second_derivatives (__main__.Tests.test_scan_second_derivatives) ... ok
-test_trainable_literal_parameters (__main__.Tests.test_trainable_literal_parameters) ... ok
-
-----------------------------------------------------------------------
-Ran 4 tests in 0.841s
-
-OK
