@@ -105,12 +105,12 @@ proc readFloat(s: string, fallback: float64): float64 =
 
 proc parseConfig(): Config =
   result = Config(corpus: "github-code-dataset.txt", outDir: "lens_run",
-    chunks: 65536*4, trainChunks: 6, validChunks: 3, chunkLen: 1500,
+    chunks: 65536*4, trainChunks: 8, validChunks: 8, chunkLen: 1500,
     noiseSteps: 0, steps: 100, maxRules: 24, minNgram: 1,
-    maxGram: 4, maxTotalGram: 8, maxWildcards: 3, maxGap: 16,
+    maxGram: 5, maxTotalGram: 10, maxWildcards: 4, maxGap: 16,
     mineStarts: 12, mineBudget: 180000, mineTracked: 25000,
-    candidates: 384, beamWidth: 4, swapDepth: 3, minGain: 1e-9,
-    ridgeLambda: 0.0005, coarsePower: 2.0, finePower: 1.5, evalPower: 1.0,
+    candidates: 384, beamWidth: 6, swapDepth: 3, minGain: 1e-9,
+    ridgeLambda: 0.0, coarsePower: 2.0, finePower: 1.5, evalPower: 1.0,
     fineTop: 12, evalEvery: 1,
     screenRows: 32, screenCandidates: 96,
     progressive: true, progressiveStart: 64, progressiveKeep: 24,
@@ -2155,25 +2155,58 @@ proc predictPearson(rows: seq[Row], rules: seq[Rule], beta: seq[float64]): float
 proc plotMeasure(r: float64): float64 =
   -ln(max(1e-15, 1.0 - r))
 
-# Fixed-width, trailing moving average of the *raw Pearson* coefficients.
-# Maintain the sum in O(1), rather than rereading training.dat every step.
-# For the first 14 steps use all observations available so far.
-const MovingAverageWidth = 75
+# Online OLS forecast for the plotted metric: -ln(1 - Pearson).
+# Model: metric(step) = beta0 + beta1*step + beta2*ln(step + 1).
+# At observed step t, predict metric(2*t) using only checkpoints up to t.
+# Centered sufficient statistics make each update/prediction O(1), even
+# when --eval-every skips steps. No moving average or look-ahead is used.
+type LogStepForecast = object
+  count: int
+  meanStep, meanLogStep, meanMetric: float64
+  ssStep, ssLog, ssStepLog, ssStepMetric, ssLogMetric: float64
 
-type PearsonMovingAverage = object
-  values: array[MovingAverageWidth, float64]
-  nextIndex, count: int
-  total: float64
+proc addAndForecastDoubleStep(f: var LogStepForecast,
+                              step: int, metric: float64): float64 =
+  let x = float64(step)
+  let logX = ln(x + 1.0)
+  inc f.count
+  let n = float64(f.count)
+  let dx = x - f.meanStep
+  let dl = logX - f.meanLogStep
+  let dy = metric - f.meanMetric
+  f.meanStep += dx / n
+  f.meanLogStep += dl / n
+  f.meanMetric += dy / n
+  # Numerically stable, centered online covariance updates.
+  f.ssStep += dx * (x - f.meanStep)
+  f.ssLog += dl * (logX - f.meanLogStep)
+  f.ssStepLog += dx * (logX - f.meanLogStep)
+  f.ssStepMetric += dx * (metric - f.meanMetric)
+  f.ssLogMetric += dl * (metric - f.meanMetric)
 
-proc addPearson(m: var PearsonMovingAverage, r: float64): float64 =
-  if m.count == MovingAverageWidth:
-    m.total -= m.values[m.nextIndex]
+  let futureStep = 2.0 * x
+  let futureLog = ln(futureStep + 1.0)
+  # Three observations are required for an intercept and two regressors.
+  # Fall back to a step-only fit with two observations, or the single
+  # observed value at the very first checkpoint.
+  if f.count == 1: return metric
+  let scale = f.ssStep * f.ssLog
+  let determinant = scale - f.ssStepLog * f.ssStepLog
+  if f.count >= 3 and scale > 0.0 and
+      determinant > 1e-12 * scale:
+    let betaStep = (f.ssStepMetric * f.ssLog -
+                    f.ssLogMetric * f.ssStepLog) / determinant
+    let betaLog = (f.ssLogMetric * f.ssStep -
+                   f.ssStepMetric * f.ssStepLog) / determinant
+    result = f.meanMetric + betaStep * (futureStep - f.meanStep) +
+             betaLog * (futureLog - f.meanLogStep)
+  elif f.ssStep > 1e-20:
+    let betaStep = f.ssStepMetric / f.ssStep
+    result = f.meanMetric + betaStep * (futureStep - f.meanStep)
   else:
-    inc m.count
-  m.values[m.nextIndex] = r
-  m.total += r
-  m.nextIndex = (m.nextIndex + 1) mod MovingAverageWidth
-  result = m.total / float64(m.count)
+    result = f.meanMetric
+  if classify(result) in {fcNan, fcInf, fcNegInf}:
+    result = f.meanMetric
 
 proc writePlot(dir: string, ridgeLambda: float64) =
   let script = """
@@ -2193,8 +2226,8 @@ set style line 3 lc rgb '#3265c9' lw 3.0
 set style line 4 lc rgb '#189567' lw 3.0
 plot 'training.dat' using 1:2 with linespoints ls 1 title 'Train (raw)', \
      'training.dat' using 1:3 with linespoints ls 2 title 'Held-out (raw)', \
-     'training.dat' using 1:8 with lines ls 3 title 'Train (Pearson MA75)', \
-     'training.dat' using 1:9 with lines ls 4 title 'Held-out (Pearson MA75)'
+     'training.dat' using 1:8 with lines ls 3 title 'Train (forecast at 2x step)', \
+     'training.dat' using 1:9 with lines ls 4 title 'Held-out (forecast at 2x step)'
 """
   let regressionName = (if ridgeLambda > 0.0:
     "Ridge count-rule search" else: "OLS count-rule search")
@@ -2409,19 +2442,34 @@ proc selfTest() =
   doAssert replacementPicks.len == 1
   doAssert replacementPicks[0].pat == @[333]
   doAssert abs(replacementPicks[0].gain) < 1e-12
-  # The smoothing is applied to raw Pearson, BEFORE the nonlinear -ln(1-rho).
-  var moving: PearsonMovingAverage
-  doAssert abs(addPearson(moving, 0.2) - 0.2) < 1e-12
-  let averaged = addPearson(moving, 0.4)
-  doAssert abs(averaged - 0.3) < 1e-12
-  doAssert abs(plotMeasure(averaged) - (-ln(0.7))) < 1e-12
-  doAssert abs(plotMeasure(averaged) -
-    (plotMeasure(0.2) + plotMeasure(0.4)) / 2.0) > 1e-4
-  var full: PearsonMovingAverage
-  for i in 1..MovingAverageWidth:
-    discard addPearson(full, float64(i) / 100.0)
-  doAssert abs(full.total - 1.2) < 1e-12 # (1 + ... + 15) / 100
-  doAssert abs(addPearson(full, 0.16) - 0.09) < 1e-12
+  # The forecast learns the displayed -ln(1-Pearson), not the raw Pearson.
+  # A synthetic exactly linear combination must extrapolate correctly at 2*t.
+  var forecast: LogStepForecast
+  for step in 0..40:
+    let t = float64(step)
+    let observed = 0.4 + 0.03 * t + 0.72 * ln(t + 1.0)
+    let predicted = addAndForecastDoubleStep(forecast, step, observed)
+    if step == 0:
+      doAssert abs(predicted - observed) < 1e-12
+    elif step == 1:
+      doAssert abs(predicted - (0.4 + 2.0 * (observed - 0.4))) < 1e-12
+    else:
+      let future = float64(2 * step)
+      let expected = 0.4 + 0.03 * future + 0.72 * ln(future + 1.0)
+      doAssert abs(predicted - expected) < 1e-8
+  # Skipped evaluations use actual step indices rather than sample indices.
+  var sparseForecast: LogStepForecast
+  for step in [0, 5, 11, 20, 30, 50]:
+    let t = float64(step)
+    let observed = 0.2 + 0.04 * t + 0.6 * ln(t + 1.0)
+    let predicted = addAndForecastDoubleStep(sparseForecast, step, observed)
+    if sparseForecast.count >= 3:
+      let future = float64(2 * step)
+      let expected = 0.2 + 0.04 * future + 0.6 * ln(future + 1.0)
+      doAssert abs(predicted - expected) < 1e-8
+  var flatForecast: LogStepForecast
+  for step in 0..12:
+    doAssert abs(addAndForecastDoubleStep(flatForecast, step, 1.5) - 1.5) < 1e-10
   # Move policy: add wins ties, replace only wins by strictly higher Pearson.
   doAssert chooseMove(0.70, 0.78, 0.79, 1e-9) == moveReplace
   doAssert chooseMove(0.70, 0.79, 0.78, 1e-9) == moveAdd
@@ -2858,8 +2906,8 @@ proc main() =
     " progressiveKeep=", cfg.progressiveKeep,
     " fineEvery=1 endpoints=0,N")
   let plotPath = cfg.outDir / "training.dat"
-  writeFile(plotPath, "# step train_nlog1mpearson heldout_nlog1mpearson rules train_pearson heldout_pearson seconds train_ma25_nlog1mpearson heldout_ma25_nlog1mpearson\n")
-  var trainMA, heldoutMA: PearsonMovingAverage
+  writeFile(plotPath, "# step train_nlog1mpearson heldout_nlog1mpearson rules train_pearson heldout_pearson seconds train_forecast_step_x2_nlog1mpearson heldout_forecast_step_x2_nlog1mpearson\n")
+  var trainForecast, heldoutForecast: LogStepForecast
   for step in 0..<cfg.steps:
     let tick = epochTime()
     let rows = makeRows(source, cfg, codec, step, false, coarseCache,
@@ -3011,13 +3059,14 @@ proc main() =
       let elapsed = epochTime() - tick
       let trainMetric = plotMeasure(evaluated.fit.pearson)
       let valMetric = plotMeasure(valPearson)
-      # MA25 is over the last 25 *evaluation checkpoints*, NOT 25 steps.
-      let trainSmoothed = plotMeasure(trainMA.addPearson(evaluated.fit.pearson))
-      let valSmoothed = plotMeasure(heldoutMA.addPearson(valPearson))
+      # Fit against the real step and ln(step+1), even with sparse evals.
+      # The predictions are evaluated at 2*step and logged at current step.
+      let trainFuture = trainForecast.addAndForecastDoubleStep(step, trainMetric)
+      let valFuture = heldoutForecast.addAndForecastDoubleStep(step, valMetric)
       let logLine = $step & " " & $trainMetric & " " & $valMetric & " " &
         $current.rules.len & " " & $evaluated.fit.pearson & " " &
         $valPearson & " " & $elapsed & " " &
-        $trainSmoothed & " " & $valSmoothed & "\n"
+        $trainFuture & " " & $valFuture & "\n"
       let stream = open(plotPath, fmAppend)
       stream.write(logLine)
       stream.close()
@@ -3031,6 +3080,8 @@ proc main() =
           " validationRows=", validation.len)
       echo "[step] ", step, " trainPearson=", evaluated.fit.pearson,
         " validPearson=", valPearson, " -ln(1-rho)=", trainMetric,
+        " forecastAtStep=", 2 * step, " trainForecast=", trainFuture,
+        " validForecast=", valFuture,
         " rules=", current.rules.len, " branch=", current.description,
         " operator=", operatorName(current),
         " evaluation=", cfg.evalPower, " time=", elapsed, "s"
