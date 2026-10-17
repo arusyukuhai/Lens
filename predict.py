@@ -11,8 +11,6 @@ p.add_argument('--integer',action='store_true'); p.add_argument('--soft',action=
 a=p.parse_args()
 device=select_device(a.device)
 ck=torch.load(a.checkpoint,map_location='cpu',weights_only=True)
-if ck['config'].get('format_version')!=2:
-    raise ValueError('legacy growing-vocabulary checkpoint is incompatible: retrain with fixed-256 Lens')
 m=Lens(Config(**ck['config'])).to(device).eval(); m.load_state_dict(ck['model'])
 raw=Path(a.input).read_bytes()
 if not raw: raise ValueError('empty input')
