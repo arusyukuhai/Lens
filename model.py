@@ -1,4 +1,4 @@
-"""Serial differentiable Lens; pure PyTorch CPU/CUDA/MPS implementation.
+"""Serial differentiable Lens with a fixed 256-byte alphabet.
 1500 rules means 1500 dependent rewrites, never parallel banks. See README.
 """
 from dataclasses import dataclass, asdict
@@ -23,21 +23,32 @@ def shift(x, offset):
 
 
 def reach_parallel(events):
-    """Ready-state probabilities for nonoverlapping variable-span events.
-    events[B,L,S]: probability of consuming d tokens in column d-1.
-    Column-stochastic S-state automaton, associative prefix product in O(log L)
-    dependent steps. O(B L S^3 log L) work; no per-position Python loop.
+    """Same automaton as before, with a work-efficient balanced tree.
+    Upward: compose interval transition matrices (right @ left).
+    Downward: propagate only the entering state vector, not prefix matrices.
+    O(B L S^3) work, O(log L) dependency depth, O(B L S^2) storage.
+    Out-of-place torch operations preserve first and second derivatives.
     """
     b, length, spans = events.shape
+    if length == 0:
+        raise ValueError('scan length must be positive')
     first = torch.cat((1-events[..., 1:].sum(-1, keepdim=True), events[..., 1:]), -1)
-    tail = torch.eye(spans, device=events.device, dtype=events.dtype)[:, :-1]
-    tail = tail.expand(b, length, spans, spans-1)
+    eye = torch.eye(spans, device=events.device, dtype=events.dtype)
+    tail = eye[:, :-1].expand(b, length, spans, spans-1)
     a = torch.cat((first[..., None], tail), -1)
-    stride = 1
-    while stride < length:
-        a = torch.cat((a[:, :stride], a[:, stride:] @ a[:, :-stride]), 1)
-        stride *= 2
-    return torch.cat((torch.ones_like(events[:, :1, 0]), a[:, :-1, 0, 0]), 1)
+    size = 1 << (length-1).bit_length()
+    if size != length:
+        a = torch.cat((a, eye.expand(b, size-length, spans, spans)), 1)
+    levels = []
+    while a.shape[1] > 1:
+        # Only left-child products are needed by the downward pass.
+        levels.append(a[:, ::2])
+        a = a[:, 1::2] @ a[:, ::2]
+    state = eye[:, :1].expand(b, 1, spans, 1)
+    for left in reversed(levels):
+        right_state = left @ state
+        state = torch.stack((state, right_state), 2).flatten(1, 2)
+    return state[:, :length, 0, 0]
 
 
 def pack(emission):
@@ -60,27 +71,31 @@ def pack(emission):
 
 
 class SerialRule(nn.Module):
-    """Learn [left, middle|STAR, right] over bytes + preceding markers.
+    """Learn [left, middle|STAR, right] over a fixed symbol alphabet.
     Literal middle consumes 3 symbols. STAR captures 0..max_capture symbols,
-    ending at the FIRST right match. RHS = fresh marker + captured symbols.
+    ending at the FIRST right match. RHS = learned byte + captured symbols.
+    No new token IDs are created; all rules reuse the same vocabulary.
     """
     def __init__(self, alphabet, max_capture):
         super().__init__()
         self.alphabet, self.max_capture = alphabet, max_capture
         self.outer = nn.Parameter(torch.randn(2, alphabet)*.03)
         self.middle = nn.Parameter(torch.randn(alphabet+1)*.03)
+        self.replacement = nn.Parameter(torch.randn(alphabet)*.03)
 
     def distributions(self, temperature=1., hard=False):
         if hard:
             outer = F.one_hot(self.outer.argmax(-1), self.alphabet).to(self.outer.dtype)
             middle = F.one_hot(self.middle.argmax(-1), self.alphabet+1).to(self.middle.dtype)
+            replacement = F.one_hot(self.replacement.argmax(-1), self.alphabet).to(self.replacement.dtype)
         else:
             outer = (self.outer/temperature).softmax(-1)
             middle = (self.middle/temperature).softmax(-1)
-        return outer, middle
+            replacement = (self.replacement/temperature).softmax(-1)
+        return outer, middle, replacement
 
     def forward(self, x, lengths, original_lengths, temperature=1., hard=False):
-        outer, middle = self.distributions(temperature, hard)
+        outer, middle, replacement = self.distributions(temperature, hard)
         # All batch items and positions share one matrix multiplication.
         kernels = torch.cat((outer[:1], middle[None, :-1], outer[1:]), 0)
         matches = x @ kernels.T
@@ -108,13 +123,17 @@ class SerialRule(nn.Module):
         for offset in range(1,self.max_capture+1):
             covering=sum(wild[offset:], torch.zeros_like(literal))
             keep=keep+shift(ready*covering,-offset)
-        emission=torch.cat((x*keep[...,None],fires[...,None]),-1)
+        # The new token is drawn from the same fixed alphabet as the input.
+        # On hard vertices this is exactly one existing byte, not 256 + rule_id.
+        emission=x*keep[...,None]+fires[...,None]*replacement
         y,new_lengths=pack(emission)
         return y,new_lengths,count
 
     def impurity(self, temperature):
-        outer,middle=self.distributions(temperature)
-        return ((1-outer.square().sum(-1)).mean()+1-middle.square().sum())/2
+        outer,middle,replacement=self.distributions(temperature)
+        return ((1-outer.square().sum(-1)).mean()
+                +(1-middle.square().sum())
+                +(1-replacement.square().sum()))/3
 
 
 class SwiGLU(nn.Module):
@@ -132,6 +151,7 @@ class Config:
     max_capture: int = 4
     checkpoint_every: int = 25
     feature_gain: float = 256.
+    format_version: int = 2  # fixed 256-byte replacement, incompatible with old marker models
 
 
 class Lens(nn.Module):
@@ -140,7 +160,9 @@ class Lens(nn.Module):
         c=self.config
         if c.rules < 1 or c.hidden < 1 or c.max_capture < 0 or c.checkpoint_every < 0:
             raise ValueError('invalid architecture')
-        self.rules=nn.ModuleList([SerialRule(256+i,c.max_capture) for i in range(c.rules)])
+        if c.format_version != 2:
+            raise ValueError('only fixed-256 format_version=2 is supported')
+        self.rules=nn.ModuleList([SerialRule(256,c.max_capture) for _ in range(c.rules)])
         self.head=nn.Sequential(SwiGLU(c.rules,c.hidden),SwiGLU(c.hidden,c.hidden),nn.Linear(c.hidden,1))
 
     def _block(self,x,lengths,original,temperature,hard,start,end):
@@ -185,17 +207,19 @@ class Lens(nn.Module):
 
     @torch.no_grad()
     def initialize_from_training(self,chunks,seed=1729,strength=7.):
-        """Training-only ngram initialization; no targets or intermediate labels.
-        All existing markers remain learnable, without correct-marker hints.
+        """Training-only ngram initialization; no intermediate labels.
+        Every replacement remains a learnable distribution over 256 bytes.
         """
         import random
         rng=random.Random(seed)
         for rule in self.rules:
             c=rng.choice(chunks); i=rng.randrange(len(c)-2); tri=c[i:i+3]
             rule.outer.normal_(0,.03); rule.middle.normal_(0,.03)
+            rule.replacement.normal_(0,.03)
             rule.outer[0,tri[0]]=strength; rule.outer[1,tri[2]]=strength
             mid=rule.alphabet if rng.random()<.25 else tri[1]
             rule.middle[mid]=strength
+            rule.replacement[rng.randrange(rule.alphabet)]=strength
 
     def export_rules(self):
         rules=[]
@@ -203,9 +227,10 @@ class Lens(nn.Module):
             left,right=rule.outer.detach().argmax(-1).cpu().tolist()
             mid=int(rule.middle.detach().argmax())
             mid=-1 if mid==rule.alphabet else mid
-            rules.append({'pattern':[left,mid,right],'marker':256+i,
-                          'replacement':[256+i]+([-1] if mid==-1 else [])})
-        return {'semantics':'serial leftmost nonoverlap, STAR captures 0..max_capture at first delimiter',
+            out_byte=int(rule.replacement.detach().argmax())
+            rules.append({'pattern':[left,mid,right], 'replacement_byte':out_byte,
+                          'replacement':[out_byte]+([-1] if mid==-1 else [])})
+        return {'semantics':'serial leftmost nonoverlap, 256-byte fixed alphabet; STAR captures 0..max_capture at first delimiter',
                 'config':asdict(self.config),'rules':rules}
 
 
@@ -215,6 +240,8 @@ def discrete_features(tokens,exported):
     cap=exported['config']['max_capture']
     for rule in exported['rules']:
         left,mid,right=rule['pattern']; output=[]; count=0; i=0
+        out_byte=rule['replacement_byte']
+        if not 0<=out_byte<256: raise ValueError('replacement byte must be in 0..255')
         while i < len(state):
             end=None
             if state[i]==left:
@@ -225,7 +252,7 @@ def discrete_features(tokens,exported):
                 elif i+2 < len(state) and state[i+1]==mid and state[i+2]==right: end=i+2
             if end is None: output.append(state[i]); i+=1
             else:
-                output.append(rule['marker'])
+                output.append(out_byte)
                 if mid==-1: output.extend(state[i+1:end])
                 count+=1; i=end+1
         counts.append(count); state=output

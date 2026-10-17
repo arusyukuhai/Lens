@@ -41,23 +41,41 @@ class Tests(unittest.TestCase):
     def test_hard_serial_semantics(self):
         torch.manual_seed(34)
         m=Lens(Config(4,16,2,0)).double()
-        patterns=[(97,98,99),(256,120,256),(257,-1,100),(98,-1,99)]
+        # Rule 1 can read the ordinary byte emitted by rule 0, without new IDs.
+        patterns=[(97,98,99),(100,120,100),(101,-1,100),(98,-1,99)]
+        output_bytes=[100,101,103,104]
         with torch.no_grad():
-            for r,(a,b,c) in zip(m.rules,patterns):
-                r.outer.fill_(-20); r.middle.fill_(-20)
+            for r,(a,b,c),out_byte in zip(m.rules,patterns,output_bytes):
+                r.outer.fill_(-20); r.middle.fill_(-20); r.replacement.fill_(-20)
                 r.outer[0,a]=20; r.outer[1,c]=20; r.middle[r.alphabet if b==-1 else b]=20
+                r.replacement[out_byte]=20
         samples=[b'abcxabcYd',b'bbcbdcabc',b'abcabcabc',b'aaaa',b'bccbc']
         rng=__import__('random').Random(5)
         samples += [bytes(rng.choices(b'abcdxY',k=rng.randrange(3,25))) for _ in range(60)]
         export=m.export_rules()
+        self.assertTrue(all(0<=r['replacement_byte']<=255 for r in export['rules']))
+        self.assertTrue(all('marker' not in r for r in export['rules']))
+        self.assertTrue(all(r.alphabet==256 for r in m.rules))
         for c in samples:
             x=torch.tensor([list(c)]); l=torch.tensor([len(c)])
             actual=m.features(x,l,hard=True)[0]
-            expected,_=discrete_features(c,export)
+            expected,state=discrete_features(c,export)
             torch.testing.assert_close(actual,torch.tensor(expected,dtype=torch.double),atol=1e-9,rtol=1e-9)
-        # A later rule must see the marker produced by the earlier rule.
+            self.assertTrue(all(0<=byte<256 for byte in state))
+        # A later rule must see the ordinary byte produced by an earlier rule.
         f,_=discrete_features(b'abcxabcYd',export)
         self.assertGreater(f[1],0)
+
+    def test_fixed_alphabet_and_linear_rule_parameters(self):
+        small=Lens(Config(3,16,2,0))
+        large=Lens(Config(7,16,2,0))
+        size=lambda m:sum(p.numel() for p in m.rules.parameters())
+        self.assertEqual(size(large)*3,size(small)*7)
+        self.assertEqual(small.rules[0].outer.shape,(2,256))
+        self.assertEqual(small.rules[-1].outer.shape,(2,256))
+        x=torch.randint(0,256,(2,8)); lengths=torch.tensor([8,6])
+        features=small.features(x,lengths,hard=True)
+        self.assertEqual(features.shape,(2,3))
 
     def test_batch_and_checkpoint_equivalence(self):
         torch.manual_seed(23)
@@ -68,11 +86,15 @@ class Tests(unittest.TestCase):
         singles=torch.cat([m(x[i:i+1],l[i:i+1]) for i in range(2)])
         torch.testing.assert_close(bat,singles)
         m.train(); m(x,l).square().sum().backward()
-        grads=[p.grad.clone() for p in m.parameters()]
-        m.zero_grad(); m.config.checkpoint_every=0
+        grads=[p.grad.clone() if p.grad is not None else None for p in m.parameters()]
+        m.zero_grad(set_to_none=True); m.config.checkpoint_every=0
         m(x,l).square().sum().backward()
-        for a,p in zip(grads,m.parameters()): torch.testing.assert_close(a,p.grad)
-        self.assertTrue(all(g.abs().sum()>0 for g in grads))
+        for a,p in zip(grads,m.parameters()):
+            if a is None: self.assertIsNone(p.grad)
+            else: torch.testing.assert_close(a,p.grad)
+        self.assertTrue(all(g.abs().sum()>0 for g in grads if g is not None))
+        # The final rule's output is intentionally unused by the feature head.
+        self.assertIsNone(m.rules[-1].replacement.grad)
 
     def test_diffusion_and_split(self):
         docs=[b'abcdef',b'fedcba',b'aaaabc',b'bbbabc',b'cccabc',b'dddabc',b'eeeabc',b'fffabc']
