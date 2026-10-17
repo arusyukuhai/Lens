@@ -2,8 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 if ! command -v nim >/dev/null 2>&1; then
-  echo 'Nim compiler not found. Install Nim 1.6+ / 2.x first.' >&2
+  echo 'Nim compiler not found (requires Nim 1.6+)' >&2
   exit 1
 fi
-nim c -d:release --opt:speed -o:lens_train cms.nim
-exec ./lens_train "$@"
+nim c -d:release --opt:speed -o:lens_ga cms.nim
+exec ./lens_ga "$@"

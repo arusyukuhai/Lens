@@ -1,0 +1,48 @@
+{
+  "rules": [
+    {
+      "pattern": [
+        60,
+        -1,
+        62
+      ],
+      "replacement": [
+        91,
+        -1,
+        93
+      ]
+    },
+    {
+      "pattern": [
+        91,
+        -1,
+        93
+      ],
+      "replacement": [
+        123,
+        -1,
+        125
+      ]
+    },
+    {
+      "pattern": [
+        123,
+        -1,
+        125
+      ],
+      "replacement": [
+        33,
+        -1,
+        -1,
+        63
+      ]
+    }
+  ],
+  "min_wildcard_len": 1,
+  "training_capture_lengths": [
+    1,
+    3
+  ],
+  "inference": "corrected discrete semantics; no probability operations",
+  "note": "Longer captures execute discretely but were not covered by the soft training window"
+}
